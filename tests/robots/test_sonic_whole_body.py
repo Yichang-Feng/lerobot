@@ -106,6 +106,7 @@ def make_controller(monkeypatch):
                 NEUTRAL_TOKEN.copy(),
             ),
         )
+        monkeypatch.setattr(swb, "load_planner", lambda **_kwargs: None)
         return swb.SonicWholeBodyController(), decoder
 
     return _factory

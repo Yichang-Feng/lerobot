@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
+import socket
 import threading
 import time
 from dataclasses import dataclass, field
@@ -105,7 +107,9 @@ def make_robot_controller(name: str | None) -> RobotController | None:
         "GrootLocomotionController": "lerobot.robots.unitree_g1.controllers.gr00t_locomotion",
         "HolosomaLocomotionController": "lerobot.robots.unitree_g1.controllers.holosoma_locomotion",
         "SonicWholeBodyController": "lerobot.robots.unitree_g1.controllers.sonic_whole_body",
+        "SonicLocoManipulationController": "lerobot.robots.unitree_g1.controllers.sonic_whole_body",
     }
+
     module_path = controllers.get(name)
     if module_path is None:
         raise ValueError(f"Unknown controller: {name!r}. Available: {list(controllers)}")
@@ -253,7 +257,7 @@ class UnitreeG1(Robot):
                 key = f"{motor.name}.q"
                 if key in action:
                     self.msg.motor_cmd[motor.value].q = action[key]
-                    self.msg.motor_cmd[motor.value].qd = 0
+                    self.msg.motor_cmd[motor.value].dq = 0.0
                     self.msg.motor_cmd[motor.value].kp = (
                         kp[motor.value] if kp is not None else self.kp[motor.value]
                     )
@@ -360,9 +364,38 @@ class UnitreeG1(Robot):
             from lerobot.envs import make_env
 
             self._ChannelFactoryInitialize(0, "lo")
-            self._env_wrapper = make_env("lerobot/unitree-g1-mujoco", trust_remote_code=True)
+            cam_port = 5555
+            for cam in self.config.cameras.values():
+                if hasattr(cam, "port") and cam.port:
+                    cam_port = cam.port
+                    break
+
+            # Check if an external streamer is already bound to cam_port
+            publish_images = True
+            if os.environ.get("UNITREE_G1_DISABLE_SIM_CAMERA", "0").lower() in ("1", "true"):
+                publish_images = False
+            else:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(0.5)
+                        if s.connect_ex(("127.0.0.1", cam_port)) == 0:
+                            logger.info(
+                                f"[UnitreeG1] Port {cam_port} is active with external video/camera stream. "
+                                "Disabling MuJoCo internal image publisher to avoid port collision."
+                            )
+                            publish_images = False
+                except Exception:
+                    pass
+
+            self._env_wrapper = make_env(
+                "lerobot/unitree-g1-mujoco",
+                trust_remote_code=True,
+                camera_port=cam_port,
+                publish_images=publish_images,
+            )
             # Extract the actual gym env from the dict structure
             self.sim_env = self._env_wrapper["hub_env"][0].envs[0]
+
         else:
             self._ChannelFactoryInitialize(0, config=self.config)
 
@@ -412,10 +445,12 @@ class UnitreeG1(Robot):
             self.kd = np.array(self.config.kd, dtype=np.float32)
 
         for joint in G1_29_JointIndex:
-            self.msg.motor_cmd[joint].mode = 1
-            self.msg.motor_cmd[joint].kp = self.kp[joint.value]
-            self.msg.motor_cmd[joint].kd = self.kd[joint.value]
-            self.msg.motor_cmd[joint].q = lowstate.motor_state[joint.value].q
+            self.msg.motor_cmd[joint.value].mode = 1
+            self.msg.motor_cmd[joint.value].kp = self.kp[joint.value]
+            self.msg.motor_cmd[joint.value].kd = self.kd[joint.value]
+            self.msg.motor_cmd[joint.value].q = lowstate.motor_state[joint.value].q
+            self.msg.motor_cmd[joint.value].dq = 0.0
+            self.msg.motor_cmd[joint.value].tau = 0.0
 
         # Ease into the controller's home pose before it takes over, so the first commands
         # don't snap from the connect-time pose. reset() picks that pose up on its own.
@@ -550,11 +585,27 @@ class UnitreeG1(Robot):
         return obs
 
     def send_action(self, action: RobotAction) -> RobotAction:
+        # Diagnostic logging of PI0.5 action output
+        try:
+            from .sonic_io_dumper import SonicIODumper
+
+            SonicIODumper.get_instance().log_pi05_action(action)
+        except Exception:
+            pass
+
         action_to_publish = action
         if self.controller is not None:
-            # Controller thread owns legs/waist. Here we only update joystick inputs
-            # and publish arm targets from the teleoperator.
+            # Controller thread owns legs/waist (and for whole-body controllers, also arms).
+            # Update incoming action for the background controller loop.
             self._update_controller_action(action)
+
+            # Whole-body controllers (e.g. SonicWholeBodyController, SonicLocoManipulationController)
+            # manage and publish all 29 joints at 50Hz with unified gains. Do not double-publish here.
+            from lerobot.robots.unitree_g1.controllers.sonic_whole_body import SonicWholeBodyController
+
+            if isinstance(self.controller, SonicWholeBodyController):
+                return action
+
             arm_prefixes = tuple(j.name for j in G1_29_JointArmIndex)
             action_to_publish = {
                 key: value
@@ -564,7 +615,7 @@ class UnitreeG1(Robot):
             if not action_to_publish:
                 # Nothing here for the arms, so publishing would only re-send the controller
                 # thread's own last command with a fresh CRC, at the caller's rate on top of the
-                # controller's. Token-only actions (a SONIC policy) hit this on every step.
+                # controller's.
                 return action
 
         tau = None
@@ -632,6 +683,13 @@ class UnitreeG1(Robot):
         with self._control_lock:
             if self.config.is_simulation and self.sim_env is not None:
                 self.sim_env.reset()
+                if hasattr(self.sim_env, "mj_data") and hasattr(self.sim_env, "body_joint_index"):
+                    for i, motor in enumerate(G1_29_JointIndex):
+                        qpos_idx = self.sim_env.body_joint_index[i] + 7 - 1
+                        self.sim_env.mj_data.qpos[qpos_idx] = float(default_positions[motor.value])
+                    import mujoco
+
+                    mujoco.mj_forward(self.sim_env.mj_model, self.sim_env.mj_data)
                 self.publish_lowcmd(
                     {f"{motor.name}.q": float(default_positions[motor.value]) for motor in G1_29_JointIndex}
                 )

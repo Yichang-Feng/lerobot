@@ -14,11 +14,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib.util
+import logging
 import os
 import warnings
 from collections.abc import Callable, Mapping, Sequence
 from functools import singledispatch
+from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
 
 import einops
 import gymnasium as gym
@@ -404,7 +409,7 @@ def _download_hub_file(
     hub_cache_dir: str | None,
 ) -> tuple[str, str, str, str]:
     """
-    Parse `cfg_str` (hub URL), enforce `trust_remote_code`, and return
+    Parse `cfg_str` (hub URL or local path), enforce `trust_remote_code`, and return
     (repo_id, file_path, local_file, revision).
     """
     if not trust_remote_code:
@@ -415,7 +420,26 @@ def _download_hub_file(
             "and prefer pinning to a specific revision: 'user/repo@<commit-hash>:env.py'."
         )
 
+    # Check if cfg_str directly points to an existing local file or directory
+    if os.path.exists(cfg_str):
+        if os.path.isdir(cfg_str):
+            local_file = os.path.join(cfg_str, "env.py")
+            return cfg_str, "env.py", local_file, "local"
+        return os.path.dirname(cfg_str), os.path.basename(cfg_str), cfg_str, "local"
+
     repo_id, revision, file_path = _parse_hub_url(cfg_str)
+
+    # Check local candidate directories for offline execution
+    local_candidates = [
+        Path(f"/home/yichangfeng/unitree-g1-mujoco"),
+        Path(f"/home/yichangfeng/lerobot/unitree-g1-mujoco"),
+        Path.cwd() / "unitree-g1-mujoco",
+        Path.home() / f".cache/huggingface/hub/models--{repo_id.replace('/', '--')}",
+    ]
+    for candidate in local_candidates:
+        if candidate.is_dir() and (candidate / file_path).is_file():
+            logger.info(f"Loading local environment definition from: {candidate / file_path}")
+            return repo_id, file_path, str(candidate / file_path), revision or "local"
 
     try:
         local_file = hf_hub_download(
@@ -431,6 +455,7 @@ def _download_hub_file(
             ) from e
 
     return repo_id, file_path, local_file, revision
+
 
 
 def _import_hub_module(local_file: str, repo_id: str) -> Any:
@@ -453,7 +478,7 @@ def _import_hub_module(local_file: str, repo_id: str) -> Any:
     return module
 
 
-def _call_make_env(module: Any, n_envs: int, use_async_envs: bool, cfg: EnvConfig | None) -> Any:
+def _call_make_env(module: Any, n_envs: int, use_async_envs: bool, cfg: EnvConfig | None, **kwargs) -> Any:
     """
     Ensure module exposes make_env and call it.
     """
@@ -464,9 +489,10 @@ def _call_make_env(module: Any, n_envs: int, use_async_envs: bool, cfg: EnvConfi
     entry_fn = module.make_env
     # Only pass cfg if it's not None (i.e., when an EnvConfig was provided, not a string hub ID)
     if cfg is not None:
-        return entry_fn(n_envs=n_envs, use_async_envs=use_async_envs, cfg=cfg)
+        return entry_fn(n_envs=n_envs, use_async_envs=use_async_envs, cfg=cfg, **kwargs)
     else:
-        return entry_fn(n_envs=n_envs, use_async_envs=use_async_envs)
+        return entry_fn(n_envs=n_envs, use_async_envs=use_async_envs, **kwargs)
+
 
 
 def _normalize_hub_result(result: Any) -> dict[str, dict[int, gym.vector.VectorEnv]]:

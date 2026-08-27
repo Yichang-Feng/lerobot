@@ -16,6 +16,7 @@
 
 import logging
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
@@ -48,26 +49,42 @@ CMD_SCALE: list[float] = [2.0, 2.0, 0.25]
 
 DEFAULT_GROOT_REPO_ID = "nepyope/GR00T-WholeBodyControl_g1"
 
+LOCAL_GROOT_CANDIDATES = [
+    Path.home() / "GR00T-WholeBodyControl/decoupled_wbc/sim2mujoco/resources/robots/g1/policy",
+    Path.home() / "DiT4DiT/decoupled_wbc/gr00t_wbc/sim2mujoco/resources/robots/g1/policy",
+    Path.home() / "Psi0/third_party/GR00T-WholeBodyControl/decoupled_wbc/sim2mujoco/resources/robots/g1/policy",
+]
+
 
 def load_groot_policies(
     repo_id: str = DEFAULT_GROOT_REPO_ID,
 ) -> tuple[ort.InferenceSession, ort.InferenceSession]:
-    """Load GR00T dual-policy system (Balance + Walk) from the hub.
+    """Load GR00T dual-policy system (Balance + Walk) from local disk or Hugging Face Hub.
 
     Args:
         repo_id: Hugging Face Hub repository ID containing the ONNX policies.
     """
-    logger.info(f"Loading GR00T dual-policy system from the hub ({repo_id})...")
+    balance_filename = "GR00T-WholeBodyControl-Balance.onnx"
+    walk_filename = "GR00T-WholeBodyControl-Walk.onnx"
 
-    # Download ONNX policies from Hugging Face Hub
-    balance_path = hf_hub_download(
-        repo_id=repo_id,
-        filename="GR00T-WholeBodyControl-Balance.onnx",
-    )
-    walk_path = hf_hub_download(
-        repo_id=repo_id,
-        filename="GR00T-WholeBodyControl-Walk.onnx",
-    )
+    balance_path = None
+    walk_path = None
+
+    # Check local candidates first
+    for candidate_dir in LOCAL_GROOT_CANDIDATES:
+        b_p = candidate_dir / balance_filename
+        w_p = candidate_dir / walk_filename
+        if b_p.is_file() and w_p.is_file():
+            balance_path = str(b_p)
+            walk_path = str(w_p)
+            logger.info(f"Loaded GR00T policies from local path: {candidate_dir}")
+            break
+
+    # Fallback to Hugging Face Hub download
+    if balance_path is None or walk_path is None:
+        logger.info(f"Loading GR00T dual-policy system from Hugging Face Hub ({repo_id})...")
+        balance_path = hf_hub_download(repo_id=repo_id, filename=balance_filename)
+        walk_path = hf_hub_download(repo_id=repo_id, filename=walk_filename)
 
     # Load ONNX policies
     policy_balance = ort.InferenceSession(balance_path)
@@ -141,8 +158,15 @@ class GrootLocomotionController(RobotController):
             self.groot_height_cmd -= 0.001
             self.groot_height_cmd = np.clip(self.groot_height_cmd, 0.50, 1.00)
 
-        lx, ly, rx, _ry = (action.get(k, 0.0) for k in REMOTE_AXES)
-        self.cmd[0] = ly  # Forward/backward
+        lx, ly, rx, _ry = (float(action.get(k, 0.0)) for k in REMOTE_AXES)
+        
+        # Direction alignment:
+        # Standard gamepad Y-axis (Pygame / Linux joystick): pushing stick forward produces negative ly.
+        # GR00T walk policy expects cmd[0] > 0 for forward walking.
+        # INVERT_FORWARD environment variable allows runtime override (default: 1 / True).
+        import os
+        invert_forward = os.environ.get("INVERT_FORWARD", "1") == "1"
+        self.cmd[0] = -ly if invert_forward else ly  # Forward/backward
         self.cmd[1] = -lx  # Left/right (negated)
         self.cmd[2] = -rx  # Rotation rate (negated)
 
@@ -186,9 +210,10 @@ class GrootLocomotionController(RobotController):
             self.groot_obs_stacked[start_idx:end_idx] = obs_frame
 
         cmd_magnitude = np.linalg.norm(self.cmd)
+        selected_policy_name = "balance" if cmd_magnitude < 0.05 else "walk"
         selected_policy = (
-            self.policy_balance if cmd_magnitude < 0.05 else self.policy_walk
-        )  # Balance/standing policy for small commands, walking policy for movement commands
+            self.policy_balance if selected_policy_name == "balance" else self.policy_walk
+        )
 
         # Run policy inference
         ort_inputs = {selected_policy.get_inputs()[0].name: np.expand_dims(self.groot_obs_stacked, axis=0)}
@@ -203,5 +228,18 @@ class GrootLocomotionController(RobotController):
         for i in range(15):
             motor_name = G1_29_JointIndex(i).name
             action_dict[f"{motor_name}.q"] = float(target_dof_pos_15[i])
+
+        # Log diagnostics to sonic_io_dump.txt
+        try:
+            from ..sonic_io_dumper import SonicIODumper
+            SonicIODumper.get_instance().log_groot_step(
+                cmd=self.cmd,
+                selected_policy_name=selected_policy_name,
+                groot_action=self.groot_action,
+                target_dict=action_dict,
+                lowstate=lowstate,
+            )
+        except Exception:
+            pass
 
         return action_dict

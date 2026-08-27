@@ -159,7 +159,7 @@ class EpisodicStrategy(RolloutStrategy):
                             # engage).
                             if self.config.smooth_handover:
                                 obs = robot.get_observation()
-                                current_pos = {k: v for k, v in obs.items() if k.endswith(".pos")}
+                                current_pos = {k: v for k, v in obs.items() if k.endswith((".pos", ".q"))}
                                 if (
                                     teleop_supports_feedback(teleop)
                                     and self.config.smooth_leader_to_follower_handover

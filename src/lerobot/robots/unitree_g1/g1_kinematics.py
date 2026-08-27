@@ -64,9 +64,23 @@ class G1_29_ArmIK:  # noqa: N801
         self._pin = pin
         self.unit_test = unit_test
 
-        self.repo_path = snapshot_download("lerobot/unitree-g1-mujoco")
+        local_candidates = [
+            "/home/yichangfeng/unitree-g1-mujoco",
+            "/home/yichangfeng/lerobot/unitree-g1-mujoco",
+            "./unitree-g1-mujoco",
+        ]
+        local_found = next(
+            (p for p in local_candidates if os.path.isfile(os.path.join(p, "assets", "g1_body29_hand14.urdf"))),
+            None,
+        )
+        if local_found:
+            self.repo_path = local_found
+        else:
+            self.repo_path = snapshot_download("lerobot/unitree-g1-mujoco")
+
         urdf_path = os.path.join(self.repo_path, "assets", "g1_body29_hand14.urdf")
         mesh_dir = os.path.join(self.repo_path, "assets")
+
 
         self.robot = self._pin.RobotWrapper.BuildFromURDF(urdf_path, mesh_dir)
 

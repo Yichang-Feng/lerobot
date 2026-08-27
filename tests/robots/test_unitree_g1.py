@@ -530,6 +530,25 @@ class TestSendAction:
         mocks["publisher_mock"].Write.assert_called_once_with(robot.msg)
         assert all(q == pytest.approx(0.2) for q in published_targets(robot).values())
 
+    def test_sonic_whole_body_delegates_publishing_to_controller_loop(self, make_robot):
+        """SonicWholeBodyController manages whole-body commands at 50Hz, so send_action stays off the wire."""
+        from unittest.mock import MagicMock
+        from lerobot.robots.unitree_g1.controllers.sonic_whole_body import SonicWholeBodyController
+
+        mock_sonic = MagicMock(spec=SonicWholeBodyController)
+        mock_sonic.control_dt = 0.02
+
+        factory, mocks = make_robot
+        robot = arm_for_publish(factory(controller=mock_sonic), mocks)
+        shoulder = G1_29_JointArmIndex.kLeftShoulderPitch
+        mocks["publisher_mock"].Write.reset_mock()
+
+        robot.send_action({f"{shoulder.name}.q": 0.3, "remote.lx": 0.1})
+
+        mocks["publisher_mock"].Write.assert_not_called()
+        assert robot.controller_input[f"{shoulder.name}.q"] == 0.3
+        assert robot.controller_input["remote.lx"] == 0.1
+
 
 # ---------------------------------------------------------------------------
 # Reset

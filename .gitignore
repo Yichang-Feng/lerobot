@@ -176,3 +176,11 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+# Training datasets & models
+datasets/
+model/
+paligemma_tokenizer/
+MUJOCO_LOG.TXT
+*.rrd
+unitree-g1-mujoco/

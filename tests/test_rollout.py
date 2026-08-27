@@ -1124,3 +1124,59 @@ def test_episodic_run_reports_a_summary_per_episode_and_for_the_run(caplog):
     # Recording still lands once per interpolation cycle over the 8 ticks.
     assert _recorded_actions(dataset) == [1.0, 2.0, 3.0, 4.0]
     assert not _timer_warnings(caplog)
+
+
+def test_rollout_context_preserves_q_and_remote_features():
+    """Verify that observation and action features with .q and remote.* are preserved in rollout."""
+    from lerobot.configs import FeatureType, PolicyFeature
+    from lerobot.datasets import aggregate_pipeline_dataset_features, create_initial_features
+    from lerobot.processor import make_default_processors
+    from lerobot.utils.constants import ACTION, OBS_STR
+    from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dicts
+
+    all_obs_features = {
+        "joint_0.q": float,
+        "joint_1.q": float,
+        "cam_head": (480, 640, 3),
+    }
+    all_act_features = {
+        "joint_0.q": float,
+        "remote.lx": float,
+        "remote.ly": float,
+    }
+
+    obs_hw = {
+        k: v
+        for k, v in all_obs_features.items()
+        if isinstance(v, tuple) or v is float or (isinstance(v, PolicyFeature) and v.type != FeatureType.VISUAL)
+    }
+    act_hw = {
+        k: v
+        for k, v in all_act_features.items()
+        if v is float or (isinstance(v, PolicyFeature) and v.type != FeatureType.VISUAL)
+    }
+
+    teleop_proc, robot_act_proc, robot_obs_proc = make_default_processors()
+    act_ds = aggregate_pipeline_dataset_features(
+        pipeline=teleop_proc,
+        initial_features=create_initial_features(action=act_hw),
+        use_videos=True,
+    )
+    obs_ds = aggregate_pipeline_dataset_features(
+        pipeline=robot_obs_proc,
+        initial_features=create_initial_features(observation=obs_hw),
+        use_videos=True,
+    )
+    ds_features = combine_feature_dicts(act_ds, obs_ds)
+
+    assert "observation.state" in ds_features
+    assert ds_features["observation.state"]["names"] == ["joint_0.q", "joint_1.q"]
+    assert "observation.images.cam_head" in ds_features
+    assert ACTION in ds_features
+    assert ds_features[ACTION]["names"] == ["joint_0.q", "remote.lx", "remote.ly"]
+
+    raw_obs = {"joint_0.q": 1.23, "joint_1.q": 4.56, "cam_head": np.zeros((480, 640, 3), dtype=np.uint8)}
+    frame = build_dataset_frame(ds_features, raw_obs, prefix=OBS_STR)
+    np.testing.assert_allclose(frame["observation.state"], [1.23, 4.56])
+    assert frame["observation.images.cam_head"].shape == (480, 640, 3)
+

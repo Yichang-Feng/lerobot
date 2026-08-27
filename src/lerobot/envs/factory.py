@@ -61,7 +61,9 @@ def make_env(
     use_async_envs: bool = False,
     hub_cache_dir: str | None = None,
     trust_remote_code: bool = False,
+    **kwargs,
 ) -> dict[str, dict[int, gym.vector.VectorEnv]]:
+
     """Makes a gym vector environment according to the config or Hub reference.
 
     Args:
@@ -107,10 +109,11 @@ def make_env(
 
         # call the hub-provided make_env
         env_cfg = None if isinstance(cfg, str) else cfg
-        raw_result = _call_make_env(module, n_envs=n_envs, use_async_envs=use_async_envs, cfg=env_cfg)
+        raw_result = _call_make_env(module, n_envs=n_envs, use_async_envs=use_async_envs, cfg=env_cfg, **kwargs)
 
         # normalize the return into {suite: {task_id: vec_env}}
         return _normalize_hub_result(raw_result)
+
 
     # At this point, cfg must be an EnvConfig (not a string) since hub_path would have been set otherwise
     if isinstance(cfg, str):

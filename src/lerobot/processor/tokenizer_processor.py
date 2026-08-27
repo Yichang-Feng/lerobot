@@ -24,9 +24,11 @@ token IDs and attention masks, which are then added to the observation dictionar
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
 
 import torch
 
@@ -110,12 +112,29 @@ class TokenizerProcessorStep(ObservationProcessorStep):
         elif self.tokenizer_name is not None:
             if AutoTokenizer is None:
                 raise ImportError("AutoTokenizer is not available")
-            self.input_tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
+            candidate_paths = [
+                self.tokenizer_name,
+                "/home/yichangfeng/lerobot/paligemma_tokenizer",
+                "/home/yichangfeng/paligemma_tokenizer",
+                os.path.expanduser(f"~/.cache/huggingface/hub/models--{self.tokenizer_name.replace('/', '--')}"),
+            ]
+            loaded = False
+            for cand in candidate_paths:
+                if os.path.isdir(cand) and (
+                    os.path.isfile(os.path.join(cand, "tokenizer.json"))
+                    or os.path.isfile(os.path.join(cand, "tokenizer_config.json"))
+                ):
+                    self.input_tokenizer = AutoTokenizer.from_pretrained(cand)
+                    loaded = True
+                    break
+            if not loaded:
+                self.input_tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
         else:
             raise ValueError(
                 "Either 'tokenizer' or 'tokenizer_name' must be provided. "
                 "Pass a tokenizer object directly or a tokenizer name to auto-load."
             )
+
 
     def get_task(self, transition: EnvTransition) -> list[str] | None:
         """
