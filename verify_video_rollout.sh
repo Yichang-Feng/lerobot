@@ -13,6 +13,7 @@ LEROBOT_ROLLOUT="/home/yichangfeng/miniforge3/envs/lerobot/bin/lerobot-rollout"
 VIDEO_PATH="${1:-datasets/box_pick/videos/observation.images.global_view/chunk-000/file-002.mp4}"
 START_TIME="${2:-3:10}"
 CONTROLLER="${3:-GrootLocomotionController}"
+LOCOMOTION_MODE="${4:-stand}"
 PORT=5556
 FPS=30
 
@@ -56,6 +57,7 @@ $LEROBOT_ROLLOUT \
     --robot.type=unitree_g1 \
     --robot.is_simulation=true \
     --robot.controller="${CONTROLLER}" \
+    --robot.locomotion_mode="${LOCOMOTION_MODE}" \
     --robot.cameras='{"global_view": {"type": "zmq", "server_address": "localhost", "port": 5556, "camera_name": "head_camera", "width": 640, "height": 480, "fps": 30, "warmup_s": 5}}' \
     --task="move blue box" \
     --duration=1000 \

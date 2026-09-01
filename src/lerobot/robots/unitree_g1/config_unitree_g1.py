@@ -71,3 +71,17 @@ class UnitreeG1Config(RobotConfig):
     # Controller class name, e.g. GrootLocomotionController / HolosomaLocomotionController /
     # SonicWholeBodyController. None disables it.
     controller: str | None = None
+
+    # Robot scene XML for MuJoCo simulation (e.g. assets/scene_29dof.xml for rubberhand)
+    robot_scene: str = "assets/scene_29dof.xml"
+
+    # Locomotion mode: 'stand' (in-place standing / 原地保持) or 'walk' (walking / 允许行走)
+    locomotion_mode: str = "stand"
+
+    # Zero all locomotion/velocity commands to WBC (alias/override for stand mode)
+    zero_locomotion_cmd: bool = False
+
+    # Enable interactive keyboard listener in terminal for dynamic stand/walk switching ('s' / 'w' / 'space')
+    enable_keyboard_locomotion_toggle: bool = True
+
+

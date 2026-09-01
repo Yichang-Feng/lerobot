@@ -160,15 +160,22 @@ class GrootLocomotionController(RobotController):
 
         lx, ly, rx, _ry = (float(action.get(k, 0.0)) for k in REMOTE_AXES)
         
-        # Direction alignment:
-        # Standard gamepad Y-axis (Pygame / Linux joystick): pushing stick forward produces negative ly.
-        # GR00T walk policy expects cmd[0] > 0 for forward walking.
-        # INVERT_FORWARD environment variable allows runtime override (default: 1 / True).
         import os
-        invert_forward = os.environ.get("INVERT_FORWARD", "1") == "1"
-        self.cmd[0] = -ly if invert_forward else ly  # Forward/backward
-        self.cmd[1] = -lx  # Left/right (negated)
-        self.cmd[2] = -rx  # Rotation rate (negated)
+        zero_cmd = (
+            os.environ.get("UNITREE_G1_ZERO_VELOCITY", "0").lower() in ("1", "true")
+            or os.environ.get("ZERO_LOCOMOTION_CMD", "0").lower() in ("1", "true")
+            or os.environ.get("STAND_ONLY", "0").lower() in ("1", "true")
+        )
+        if zero_cmd:
+            self.cmd[:] = 0.0
+        else:
+            # Direction alignment:
+            # Policy/dataset outputs positive ly for forward movement.
+            # INVERT_FORWARD environment variable allows reversing if needed (default: 0 / False).
+            invert_forward = os.environ.get("INVERT_FORWARD", "0") == "1"
+            self.cmd[0] = -ly if invert_forward else ly  # Forward/backward (positive = forward)
+            self.cmd[1] = -lx  # Left/right (negated)
+            self.cmd[2] = -rx  # Rotation rate (negated)
 
         # Get joint positions and velocities from lowstate
         for motor in G1_29_JointIndex:

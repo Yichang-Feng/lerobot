@@ -194,7 +194,6 @@ class UnitreeG1(Robot):
         self._control_lock = threading.Lock()
         self._shutdown_event = threading.Event()
         self.subscribe_thread = None
-
         self.arm_ik = G1_29_ArmIK() if config.gravity_compensation else None
 
         # Controller loaded dynamically
@@ -205,13 +204,32 @@ class UnitreeG1(Robot):
         self.controller_input = default_remote_input()
         self.controller_output = {}
 
+        # Determine initial locomotion mode (stand vs walk)
+        mode = getattr(config, "locomotion_mode", "stand").lower()
+        self.zero_locomotion_cmd = (
+            getattr(config, "zero_locomotion_cmd", False)
+            or mode in ("stand", "idle", "stop", "balance")
+            or os.environ.get("UNITREE_G1_ZERO_VELOCITY", "0").lower() in ("1", "true")
+            or os.environ.get("ZERO_LOCOMOTION_CMD", "0").lower() in ("1", "true")
+            or os.environ.get("STAND_ONLY", "0").lower() in ("1", "true")
+        )
+        if mode == "walk" and not getattr(config, "zero_locomotion_cmd", False):
+            if (
+                os.environ.get("ZERO_LOCOMOTION_CMD", "0").lower() not in ("1", "true")
+                and os.environ.get("UNITREE_G1_ZERO_VELOCITY", "0").lower() not in ("1", "true")
+            ):
+                self.zero_locomotion_cmd = False
+
+        self._key_listener = None
+
     def _subscribe_lowstate(self):  # polls robot state @ 250Hz
         while not self._shutdown_event.is_set():
             start_time = time.time()
 
             # Step simulation if in simulation mode
             if self.config.is_simulation and self.sim_env is not None:
-                self.sim_env.step()
+                with self._control_lock:
+                    self.sim_env.step()
 
             msg = self.lowstate_subscriber.Read()
             if msg is not None:
@@ -392,6 +410,7 @@ class UnitreeG1(Robot):
                 trust_remote_code=True,
                 camera_port=cam_port,
                 publish_images=publish_images,
+                robot_scene=getattr(self.config, "robot_scene", "assets/scene_29dof.xml"),
             )
             # Extract the actual gym env from the dict structure
             self.sim_env = self._env_wrapper["hub_env"][0].envs[0]
@@ -464,6 +483,38 @@ class UnitreeG1(Robot):
             fps = int(1.0 / self.controller.control_dt)
             logger.info(f"Controller thread started ({fps}Hz)")
 
+        # Start interactive keyboard listener for real-time stand/walk switching
+        if getattr(self.config, "enable_keyboard_locomotion_toggle", True):
+            try:
+                from lerobot.utils.keyboard_input import create_key_listener
+
+                self._key_listener = create_key_listener(self._on_locomotion_key)
+                mode_name = "STAND (原地保持)" if self.zero_locomotion_cmd else "WALK (允许行走)"
+                print(
+                    f"\n======================================================================\n"
+                    f" [UnitreeG1 Locomotion Controls]\n"
+                    f"   Press 's' -> STAND (原地模式: 速度指令置零, 稳定平衡)\n"
+                    f"   Press 'w' -> WALK  (行走模式: 允许策略下发移动速度)\n"
+                    f"   Press 'Space' / 't' -> TOGGLE (在原地与行走之间切换)\n"
+                    f"   Current initial mode: {mode_name}\n"
+                    f"======================================================================\n",
+                    flush=True,
+                )
+            except Exception as e:
+                logger.warning(f"Could not start keyboard listener for locomotion toggle: {e}")
+
+    def _on_locomotion_key(self, key: str) -> None:
+        if key in ("s", "S"):
+            self.zero_locomotion_cmd = True
+            print("\n>>> [G1 Locomotion] Switched to STAND mode (原地保持: 速度指令已置零) <<<\n", flush=True)
+        elif key in ("w", "W"):
+            self.zero_locomotion_cmd = False
+            print("\n>>> [G1 Locomotion] Switched to WALK mode (允许行走: 恢复策略速度指令) <<<\n", flush=True)
+        elif key in ("space", "t", "T"):
+            self.zero_locomotion_cmd = not self.zero_locomotion_cmd
+            mode_str = "STAND (原地保持)" if self.zero_locomotion_cmd else "WALK (允许行走)"
+            print(f"\n>>> [G1 Locomotion] Toggled mode: {mode_str} <<<\n", flush=True)
+
     def _send_zero_torque(self) -> None:
         """Send a zero-gain command to make joints passive before shutting down."""
         try:
@@ -479,6 +530,15 @@ class UnitreeG1(Robot):
             logger.warning(f"Failed to send zero-torque on disconnect: {e}")
 
     def disconnect(self):
+        # Stop keyboard listener
+        if self._key_listener is not None:
+            try:
+                if hasattr(self._key_listener, "stop"):
+                    self._key_listener.stop()
+            except Exception as e:
+                logger.debug(f"Error stopping key listener: {e}")
+            self._key_listener = None
+
         # Signal threads to stop and unblock any waits
         self._shutdown_event.set()
 
@@ -640,10 +700,14 @@ class UnitreeG1(Robot):
     def _update_controller_action(self, action: RobotAction) -> None:
         """Forward incoming teleop action values into ``controller_input``; each controller
         reads only the keys it understands."""
+        zero_loco = self.zero_locomotion_cmd
         with self._controller_action_lock:
             for key, value in action.items():
                 if isinstance(key, str) and value is not None:
-                    self.controller_input[key] = value
+                    if zero_loco and key in REMOTE_AXES:
+                        self.controller_input[key] = 0.0
+                    else:
+                        self.controller_input[key] = value
 
     @property
     def is_calibrated(self) -> bool:
@@ -683,13 +747,14 @@ class UnitreeG1(Robot):
         with self._control_lock:
             if self.config.is_simulation and self.sim_env is not None:
                 self.sim_env.reset()
-                if hasattr(self.sim_env, "mj_data") and hasattr(self.sim_env, "body_joint_index"):
+                raw_sim = getattr(self.sim_env, "sim_env", self.sim_env)
+                if hasattr(raw_sim, "mj_data") and hasattr(raw_sim, "body_joint_index"):
                     for i, motor in enumerate(G1_29_JointIndex):
-                        qpos_idx = self.sim_env.body_joint_index[i] + 7 - 1
-                        self.sim_env.mj_data.qpos[qpos_idx] = float(default_positions[motor.value])
+                        qpos_idx = raw_sim.body_joint_index[i] + 7 - 1
+                        raw_sim.mj_data.qpos[qpos_idx] = float(default_positions[motor.value])
                     import mujoco
 
-                    mujoco.mj_forward(self.sim_env.mj_model, self.sim_env.mj_data)
+                    mujoco.mj_forward(raw_sim.mj_model, raw_sim.mj_data)
                 self.publish_lowcmd(
                     {f"{motor.name}.q": float(default_positions[motor.value]) for motor in G1_29_JointIndex}
                 )

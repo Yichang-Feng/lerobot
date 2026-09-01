@@ -144,13 +144,22 @@ class HolosomaLocomotionController(RobotController):
         if lowstate is None:
             return {}
 
-        lx, ly, rx, _ry = (action.get(k, 0.0) for k in REMOTE_AXES)
-        ly = ly if abs(ly) > 0.1 else 0.0
-        lx = lx if abs(lx) > 0.1 else 0.0
-        rx = rx if abs(rx) > 0.1 else 0.0
-        ly = np.clip(ly, -0.3, 0.3)
-        lx = np.clip(lx, -0.3, 0.3)
-        self.cmd[:] = [ly, -lx, -rx]
+        import os
+        zero_cmd = (
+            os.environ.get("UNITREE_G1_ZERO_VELOCITY", "0").lower() in ("1", "true")
+            or os.environ.get("ZERO_LOCOMOTION_CMD", "0").lower() in ("1", "true")
+            or os.environ.get("STAND_ONLY", "0").lower() in ("1", "true")
+        )
+        if zero_cmd:
+            self.cmd[:] = [0.0, 0.0, 0.0]
+        else:
+            lx, ly, rx, _ry = (action.get(k, 0.0) for k in REMOTE_AXES)
+            ly = ly if abs(ly) > 0.1 else 0.0
+            lx = lx if abs(lx) > 0.1 else 0.0
+            rx = rx if abs(rx) > 0.1 else 0.0
+            ly = np.clip(ly, -0.3, 0.3)
+            lx = np.clip(lx, -0.3, 0.3)
+            self.cmd[:] = [ly, -lx, -rx]
 
         # Get joint positions and velocities from lowstate
         for motor in G1_29_JointIndex:

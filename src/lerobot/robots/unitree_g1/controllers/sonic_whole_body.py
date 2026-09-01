@@ -325,11 +325,18 @@ class SonicWholeBodyController(RobotController):
                 (float(action[k]) for k in token_keys), dtype=np.float32, count=TOKEN_DIM
             )
         else:
-            # Mode B: Velocity & Arm Joint Targets (18-D action space)
-            lx, ly, rx, _ry = (float(action.get(k, 0.0)) for k in REMOTE_AXES)
-            self.cmd_vel[0] = ly   # Forward / Backward
-            self.cmd_vel[1] = -lx  # Left / Right
-            self.cmd_vel[2] = -rx  # Yaw rate
+            zero_cmd = (
+                os.environ.get("UNITREE_G1_ZERO_VELOCITY", "0").lower() in ("1", "true")
+                or os.environ.get("ZERO_LOCOMOTION_CMD", "0").lower() in ("1", "true")
+                or os.environ.get("STAND_ONLY", "0").lower() in ("1", "true")
+            )
+            if zero_cmd:
+                self.cmd_vel[:] = 0.0
+            else:
+                lx, ly, rx, _ry = (float(action.get(k, 0.0)) for k in REMOTE_AXES)
+                self.cmd_vel[0] = ly   # Forward / Backward
+                self.cmd_vel[1] = -lx  # Left / Right
+                self.cmd_vel[2] = -rx  # Yaw rate
 
             # Adjust height via buttons if present
             buttons = [int(action.get(k, 0)) for k in REMOTE_BUTTONS]
