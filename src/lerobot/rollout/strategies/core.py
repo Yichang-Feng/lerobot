@@ -137,6 +137,12 @@ class RolloutStrategy(abc.ABC):
         if not use_torch_compile:
             return False
         if not engine.ready:
+            if not getattr(self, "_warmup_logged", False):
+                logger.info(
+                    "torch.compile is compiling the policy model in background (typically takes 40~90s on first run). "
+                    "Robot will maintain safe stand position until compilation completes..."
+                )
+                self._warmup_logged = True
             timer.wait()
             return True
         if not self._warmup_flushed:
