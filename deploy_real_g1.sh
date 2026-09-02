@@ -34,21 +34,10 @@ fi
 # 2. 执行实机 Rollout
 echo "启动实机 Rollout 进程..."
 $LEROBOT_ROLLOUT \
-    --strategy.type=base \
-    --inference.type=rtc \
-    --inference.queue_threshold=35 \
-    --interpolation_multiplier=2 \
     --policy.path="${POLICY_PATH}" \
-    --policy.device=cuda \
-    --policy.dtype=bfloat16 \
-    --robot.type=unitree_g1 \
+    --task="${TASK_DESC}" \
     --robot.is_simulation=false \
     --robot.robot_ip="${ROBOT_IP}" \
-    --robot.controller=GrootLocomotionController \
     --robot.zero_locomotion_cmd=true \
-    --robot.locomotion_mode=stand \
     --robot.cameras="{\"global_view\": {\"type\": \"zmq\", \"server_address\": \"${ROBOT_IP}\", \"port\": ${CAMERA_PORT}, \"camera_name\": \"head_camera\", \"width\": 640, \"height\": 480, \"fps\": 30, \"warmup_s\": 5}}" \
-    --task="${TASK_DESC}" \
-    --duration=1000 \
-    --fps=25 \
     --display_data=true

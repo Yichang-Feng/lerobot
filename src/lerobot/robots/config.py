@@ -35,6 +35,10 @@ class RobotConfig(draccus.ChoiceRegistry, abc.ABC):
                             f"Specifying '{attr}' is required for the camera to be used in a robot"
                         )
 
+    @classmethod
+    def default_choice_name(cls) -> str | None:
+        return "unitree_g1"
+
     @property
     def type(self) -> str:
         return self.get_choice_name(self.__class__)

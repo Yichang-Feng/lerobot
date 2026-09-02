@@ -51,19 +51,7 @@ echo " Diagnostic logs written to outputs/sonic_io_dump.txt"
 echo "================================================================================"
 
 $LEROBOT_ROLLOUT \
-    --strategy.type=base \
-    --inference.type=rtc \
-    --inference.queue_threshold=35 \
-    --interpolation_multiplier=2 \
-    --policy.path=model/box_pick \
-    --policy.device=cuda \
-    --policy.dtype=bfloat16 \
-    --robot.type=unitree_g1 \
-    --robot.is_simulation=true \
-    --robot.controller="${CONTROLLER}" \
-    --robot.locomotion_mode="${LOCOMOTION_MODE}" \
-    --robot.cameras='{"global_view": {"type": "zmq", "server_address": "localhost", "port": 5556, "camera_name": "head_camera", "width": 640, "height": 480, "fps": 30, "warmup_s": 5}}' \
+    --policy.path=model/box_move_blue \
     --task="move blue box" \
-    --duration=1000 \
-    --fps=25 \
-    --display_data=true
+    --robot.is_simulation=true \
+    --display_data=false

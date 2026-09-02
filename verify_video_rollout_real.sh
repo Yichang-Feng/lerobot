@@ -71,21 +71,9 @@ echo " 提示: 默认处于零速度原地平衡模式，在终端中输入 's' 
 echo "================================================================================"
 
 $LEROBOT_ROLLOUT \
-    --strategy.type=base \
-    --inference.type=rtc \
-    --inference.queue_threshold=35 \
-    --interpolation_multiplier=2 \
     --policy.path=model/box_move_blue \
-    --policy.device=cuda \
-    --policy.dtype=bfloat16 \
-    --robot.type=unitree_g1 \
+    --task="move blue box back and forth between tables" \
     --robot.is_simulation=false \
     --robot.robot_ip="${ROBOT_IP}" \
-    --robot.controller="${CONTROLLER}" \
-    --robot.locomotion_mode="${LOCOMOTION_MODE}" \
     --robot.zero_locomotion_cmd=true \
-    --robot.cameras="{\"global_view\": {\"type\": \"zmq\", \"server_address\": \"localhost\", \"port\": ${PORT}, \"camera_name\": \"head_camera\", \"width\": 640, \"height\": 480, \"fps\": 30, \"warmup_s\": 5}}" \
-    --task="move blue box back and forth between tables" \
-    --duration=1000 \
-    --fps=25 \
     --display_data=true

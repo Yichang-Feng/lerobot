@@ -167,49 +167,32 @@ ping -c 3 192.168.123.164
 
 ### 【终端 3】（上位机）执行实机 Rollout 推理
 
-在上位机打开主控制终端，根据选择的模式执行对应命令：
+在上位机打开主控制终端，根据选择的模式执行对应命令（已全面固化默认参数，仅需指定必要差异参数）：
 
 #### 模式 A：实机真实相机闭环部署（Real Camera Mode）
 连接 G1 机器人机载推流端口 `192.168.123.164:5555`：
 
 ```bash
 /home/yichangfeng/miniforge3/envs/lerobot/bin/lerobot-rollout \
-    --strategy.type=base \
     --policy.path=model/box_move_blue \
-    --policy.device=cuda \
-    --robot.type=unitree_g1 \
-    --robot.is_simulation=false \
-    --robot.robot_ip=192.168.123.164 \
-    --robot.controller=GrootLocomotionController \
-    --robot.zero_locomotion_cmd=true \
-    --robot.locomotion_mode=stand \
-    --robot.cameras='{"global_view": {"type": "zmq", "server_address": "192.168.123.164", "port": 5555, "camera_name": "head_camera", "width": 640, "height": 480, "fps": 30, "warmup_s": 5}}' \
     --task="move blue box back and forth between tables" \
-    --duration=1000 \
-    --fps=25 \
+    --robot.is_simulation=false \
+    --robot.zero_locomotion_cmd=true \
+    --robot.cameras='{"global_view": {"type": "zmq", "server_address": "192.168.123.164", "port": 5555, "camera_name": "head_camera", "width": 640, "height": 480, "fps": 30, "warmup_s": 5}}' \
     --display_data=true
 ```
 
 ---
 
 #### 模式 B：实机动作 + 训练视频回放模式（Video Replay Mode）
-机器人本体为物理实机（`is_simulation=false`），但视觉连接上位机本地推流端口 `localhost:5556`：
+机器人本体为物理实机（`is_simulation=false`），视觉连接上位机本地推流端口 `localhost:5556`（相机已作为默认配置，无需再传 `--robot.cameras`）：
 
 ```bash
 /home/yichangfeng/miniforge3/envs/lerobot/bin/lerobot-rollout \
-    --strategy.type=base \
     --policy.path=model/box_move_blue \
-    --policy.device=cuda \
-    --robot.type=unitree_g1 \
-    --robot.is_simulation=false \
-    --robot.robot_ip=192.168.123.164 \
-    --robot.controller=GrootLocomotionController \
-    --robot.zero_locomotion_cmd=true \
-    --robot.locomotion_mode=stand \
-    --robot.cameras='{"global_view": {"type": "zmq", "server_address": "localhost", "port": 5556, "camera_name": "head_camera", "width": 640, "height": 480, "fps": 30, "warmup_s": 5}}' \
     --task="move blue box back and forth between tables" \
-    --duration=1000 \
-    --fps=25 \
+    --robot.is_simulation=false \
+    --robot.zero_locomotion_cmd=true \
     --display_data=true
 ```
 
@@ -217,29 +200,40 @@ ping -c 3 192.168.123.164
 
 ## 4. 核心实机执行命令详解与对比
 
-| 参数 | 真实相机模式 (模式 A) | 视频回放实机模式 (模式 B) | 作用原理 |
+| 参数 | 真实相机模式 (模式 A) | 视频回放实机模式 (模式 B) | 默认值说明与作用 |
 | :--- | :--- | :--- | :--- |
 | `--robot.is_simulation` | `false` | `false` | **关闭仿真**，通过 `unitree_sdk2_socket.py` 连接物理电机 |
-| `--robot.robot_ip` | `192.168.123.164` | `192.168.123.164` | G1 机载电脑 IP，建立 DDS 桥接通道（6000 动作 / 6001 状态） |
-| `--robot.controller` | `GrootLocomotionController` | `GrootLocomotionController` | 启动 50Hz 神经网络下半身直立平衡控制器 |
-| `--robot.zero_locomotion_cmd`| `true` | `true` | **默认置零移动速度**，防止机器人失稳移动 |
-| `--robot.locomotion_mode` | `stand` | `stand` | 初始模式设为原地保持 |
-| `--robot.cameras` | `server_address: 192.168.123.164`<br>`port: 5555` | `server_address: localhost`<br>`port: 5556` | 切换图像获取来源（机载 RealSense vs 本地 ZMQ 录像推流） |
+| `--robot.zero_locomotion_cmd`| `true` | `true` | **默认置零移动速度**，防止机器人失稳移动（终端按 'w' 恢复行走） |
+| `--robot.cameras` | `server_address: 192.168.123.164`<br>`port: 5555` | 默认 `localhost:5556`（可省略） | 切换图像获取来源（机载 RealSense vs 本地 ZMQ 录像推流） |
 | `--policy.path` | `model/box_move_blue` | `model/box_move_blue` | 训练好的 PI0.5 策略模型权重路径 |
-| `--display_data` | `true` | `true` | 实时弹出可视化窗口监控相机输入与关节动作 |
+| `--display_data` | `true` | `true` | 实时弹出可视化窗口监控相机输入与关节动作（默认 `false`） |
+| *--strategy.type* | *base* | *base* | 默认值：`base` |
+| *--inference.type* | *rtc* | *rtc* | 默认值：`rtc`（Real-Time Chunking 异步推理） |
+| *--inference.queue_threshold* | *40* | *40* | 默认值：`40` |
+| *--interpolation_multiplier* | *3* | *3* | 默认值：`3`（底层 75Hz/50Hz 高频平滑插值） |
+| *--policy.device* / *dtype* | *cuda* / *bfloat16* | *cuda* / *bfloat16* | 默认值：`cuda` + `bfloat16` |
+| *--robot.type* | *unitree_g1* | *unitree_g1* | 默认值：`unitree_g1` |
+| *--robot.controller* | *GrootLocomotionController* | *GrootLocomotionController* | 默认值：`GrootLocomotionController` (50Hz 全身平衡) |
+| *--fps* / *--duration* | *25* / *1000* | *25* / *1000* | 默认值：`25` FPS，`1000` 秒 |
 
 ---
 
 ## 5. 一键自动化实机启动脚本使用说明
 
-项目根目录下已为您配置并优化了启动脚本 [**`deploy_real_g1.sh`**](file:///home/yichangfeng/lerobot/deploy_real_g1.sh) 和专门用于视频回放测试的 [**`verify_video_rollout_real.sh`**](file:///home/yichangfeng/lerobot/verify_video_rollout_real.sh)。
+项目根目录下为您配置了快捷调试脚本 [**`run_rollout.sh`**](file:///home/yichangfeng/lerobot/run_rollout.sh)、配置文件 [**`rollout_config.yaml`**](file:///home/yichangfeng/lerobot/rollout_config.yaml)、实机闭环启动脚本 [**`deploy_real_g1.sh`**](file:///home/yichangfeng/lerobot/deploy_real_g1.sh) 以及视频回放测试脚本 [**`verify_video_rollout_real.sh`**](file:///home/yichangfeng/lerobot/verify_video_rollout_real.sh)。
 
-### 1. 真实机载相机模式启动：
+### 1. 通用快捷调试启动（支持仿真/实机一键切换与传参覆盖）：
+```bash
+# 直接运行（读取 run_rollout.sh 顶部配置）
+./run_rollout.sh --policy.path=model/box_move_blue --task="move blue box" --display_data=true  --robot.is_simulation=true
+```
+
+### 2. 真实机载相机模式启动（模式 A）：
 ```bash
 ./deploy_real_g1.sh
 ```
 
-### 2. 实机动作 + 视频回放模式一键启动：
+### 3. 实机动作 + 视频回放模式一键启动（模式 B）：
 ```bash
 ./verify_video_rollout_real.sh datasets/box_pick/videos/observation.images.global_view/chunk-000/file-003.mp4
 ```

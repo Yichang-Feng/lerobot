@@ -44,6 +44,22 @@ def _build_gains() -> tuple[list[float], list[float]]:
 _DEFAULT_KP, _DEFAULT_KD = _build_gains()
 
 
+def _default_unitree_g1_cameras() -> dict[str, CameraConfig]:
+    from lerobot.cameras.zmq import ZMQCameraConfig
+
+    return {
+        "global_view": ZMQCameraConfig(
+            server_address="localhost",
+            port=5556,
+            camera_name="head_camera",
+            width=640,
+            height=480,
+            fps=30,
+            warmup_s=5,
+        )
+    }
+
+
 @RobotConfig.register_subclass("unitree_g1")
 @dataclass
 class UnitreeG1Config(RobotConfig):
@@ -63,14 +79,14 @@ class UnitreeG1Config(RobotConfig):
     robot_ip: str = "192.168.123.164"  # default G1 IP
 
     # Cameras (ZMQ-based remote cameras)
-    cameras: dict[str, CameraConfig] = field(default_factory=dict)
+    cameras: dict[str, CameraConfig] = field(default_factory=_default_unitree_g1_cameras)
 
     # Compensates for gravity on the unitree's arms using the arm ik solver
     gravity_compensation: bool = False
 
     # Controller class name, e.g. GrootLocomotionController / HolosomaLocomotionController /
     # SonicWholeBodyController. None disables it.
-    controller: str | None = None
+    controller: str | None = "GrootLocomotionController"
 
     # Robot scene XML for MuJoCo simulation (e.g. assets/scene_29dof.xml for rubberhand)
     robot_scene: str = "assets/scene_29dof.xml"

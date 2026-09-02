@@ -26,10 +26,11 @@ import draccus
 from lerobot.configs import PreTrainedConfig, parser
 from lerobot.configs.dataset import DatasetRecordConfig
 from lerobot.robots.config import RobotConfig
+from lerobot.robots.unitree_g1 import UnitreeG1Config
 from lerobot.teleoperators.config import TeleoperatorConfig
 from lerobot.utils.device_utils import auto_select_torch_device, is_torch_device_available
 
-from .inference import InferenceEngineConfig, SyncInferenceConfig
+from .inference import InferenceEngineConfig, RTCInferenceConfig, SyncInferenceConfig
 
 logger = logging.getLogger(__name__)
 
@@ -228,7 +229,7 @@ class RolloutConfig:
     """
 
     # Hardware
-    robot: RobotConfig | None = None
+    robot: RobotConfig | None = field(default_factory=UnitreeG1Config)
     teleop: TeleoperatorConfig | None = None
 
     # Policy (loaded from --policy.path via __post_init__)
@@ -238,16 +239,16 @@ class RolloutConfig:
     strategy: RolloutStrategyConfig = field(default_factory=BaseStrategyConfig)
 
     # Inference backend (polymorphic: --inference.type=sync|rtc)
-    inference: InferenceEngineConfig = field(default_factory=SyncInferenceConfig)
+    inference: InferenceEngineConfig = field(default_factory=RTCInferenceConfig)
 
     # Dataset (required for sentry, highlight, dagger; None for base)
     dataset: DatasetRecordConfig | None = None
 
     # Runtime
-    fps: float = 30.0
+    fps: float = 25.0
     # Run time in seconds; 0 = infinite (24/7 mode).  In interactive mode this
     # bounds each /start segment, not the whole session.
-    duration: float = 0.0
+    duration: float = 1000.0
     # Control the rollout from stdin with chat-style commands (/start, /subtask,
     # /vqa, /autosteer, /reset, /stop) while hardware and policy stay warm.  The
     # robot does not move until /start, and logs below ERROR are muted for the
@@ -261,7 +262,7 @@ class RolloutConfig:
     # between consecutive policy actions for smoother motion: commands go to
     # the robot at ``fps × multiplier`` Hz while policy inference and dataset
     # recording stay at ``fps`` Hz.
-    interpolation_multiplier: int = 1
+    interpolation_multiplier: int = 3
     device: str | None = None
     task: str = ""
     display_data: bool = False

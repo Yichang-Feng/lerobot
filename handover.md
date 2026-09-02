@@ -40,6 +40,8 @@
 ## 2. 仓库核心文件与目录结构
 
 ### 2.1 上位机核心文件
+- **`run_rollout.sh`**: **快捷调试与参数调优启动脚本**（顶部集中定义了模型、任务、仿真/实机、RTC 队列、插值倍率等全部常用参数，开箱即用）。
+- **`rollout_config.yaml`**: **YAML 格式统一配置文件**（支持 `lerobot-rollout --config_path=rollout_config.yaml` 一键启动与调参）。
 - **`REAL_Deploy.md`**: 实机多终端部署 SOP 与网络配置说明文档。
 - **`deploy_real_g1.sh`**: 真实机载相机模式（模式 A）一键启动脚本。
 - **`verify_video_rollout_real.sh`**: 实机动作 + 视频回放模式（模式 B）一键启动脚本。
@@ -58,28 +60,55 @@
 
 ## 3. 当前运行状态与效果对比
 
-### 3.1 默认执行命令
-在上位机终端执行（已作为仓库脚本 `verify_video_rollout.sh`、`verify_video_rollout_real.sh`、`deploy_real_g1.sh` 的默认配置）：
+### 3.1 快捷调试与执行命令（已全面精简）
+
+#### 方式 1：使用快捷调试脚本 `run_rollout.sh`（推荐，最省心）
+直接打开 [**`run_rollout.sh`**](file:///home/yichangfeng/lerobot/run_rollout.sh) 修改顶部参数，或在命令行直接传参覆盖：
 ```bash
-LD_LIBRARY_PATH=/home/yichangfeng/miniforge3/envs/lerobot/lib:$LD_LIBRARY_PATH \
-/home/yichangfeng/miniforge3/envs/lerobot/bin/lerobot-rollout \
-    --strategy.type=base \
-    --inference.type=rtc \
-    --inference.queue_threshold=35 \
-    --interpolation_multiplier=2 \
-    --policy.path=model/box_pick \
-    --policy.device=cuda \
-    --policy.dtype=bfloat16 \
-    --robot.type=unitree_g1 \
-    --robot.is_simulation=true \
-    --robot.controller=GrootLocomotionController \
-    --robot.locomotion_mode=stand \
-    --robot.cameras='{"global_view": {"type": "zmq", "server_address": "localhost", "port": 5556, "camera_name": "head_camera", "width": 640, "height": 480, "fps": 30, "warmup_s": 5}}' \
-    --task="move blue box" \
-    --duration=1000 \
-    --fps=25 \
-    --display_data=true
+# 默认启动（仿真 + 任务 "move blue box"）
+./run_rollout.sh
+
+# 命令行快速覆盖参数（例如切换任务、开启可视化或切换实机）
+./run_rollout.sh --task="pick up blue box" --display_data=true
+./run_rollout.sh --robot.is_simulation=false --robot.zero_locomotion_cmd=true
 ```
+
+#### 方式 2：使用 YAML 配置文件 `rollout_config.yaml`
+在 [**`rollout_config.yaml`**](file:///home/yichangfeng/lerobot/rollout_config.yaml) 中集中修改参数，然后运行：
+```bash
+/home/yichangfeng/miniforge3/envs/lerobot/bin/lerobot-rollout --config_path=rollout_config.yaml
+```
+
+#### 方式 3：精简 CLI 命令行直调
+由于已将所有通用参数固化为默认配置，直接调用 CLI 时仅需指定必要参数：
+```bash
+/home/yichangfeng/miniforge3/envs/lerobot/bin/lerobot-rollout \
+    --policy.path=model/box_move_blue \
+    --task="move blue box" \
+    --robot.is_simulation=true \
+    --display_data=false
+```
+
+> **全量参数展开（系统内部默认等价于）：**
+> ```bash
+> lerobot-rollout \
+>     --strategy.type=base \
+>     --inference.type=rtc \
+>     --inference.queue_threshold=40 \
+>     --interpolation_multiplier=3 \
+>     --policy.path=model/box_move_blue \
+>     --policy.device=cuda \
+>     --policy.dtype=bfloat16 \
+>     --robot.type=unitree_g1 \
+>     --robot.is_simulation=true \
+>     --robot.controller=GrootLocomotionController \
+>     --robot.locomotion_mode=stand \
+>     --robot.cameras='{"global_view": {"type": "zmq", "server_address": "localhost", "port": 5556, "camera_name": "head_camera", "width": 640, "height": 480, "fps": 30, "warmup_s": 5}}' \
+>     --task="move blue box" \
+>     --duration=1000 \
+>     --fps=25 \
+>     --display_data=false
+> ```
 
 ### 3.2 优化前后性能与运行指标对比
 
@@ -130,12 +159,16 @@ INFO 2026-09-02 14:18:02 le_timer.py:606 Cadence summary — whole run · target
 | **`src/lerobot/policies/rtc/action_queue.py`** | `_check_and_resolve_delays()` 在差值不一致时仍返回 `real_delay` | 改为优先返回实际消费步数 `indexes_diff` | 消除估算延迟偏差导致的跳步 |
 | **`src/lerobot/policies/rtc/latency_tracker.py`** | `max()` 返回全局单调递增的历史最大峰值 | 改为基于滑动窗口 `_values` 动态计算 `max()`，添加 `mean()` | 避免单次偶发毛刺永久放大延迟估算 |
 | **`src/lerobot/rollout/inference/rtc.py`** | 使用 `latency_tracker.max()` 估算延迟 | 改用 `latency_tracker.p95()` 获取 95 分位延迟 | 过滤极端异常延迟毛刺 |
-| **`src/lerobot/rollout/inference/factory.py`** | RTC `queue_threshold` 默认为 30 | 默认值调整为 35 | 优化后台触发时机，平衡余量与感知时效 |
+| **`src/lerobot/rollout/inference/factory.py`** | RTC `queue_threshold` 默认为 30 | 默认值调整为 `40` | 增大队列安全水位，彻底避免消费速度超过推理时饥饿停顿 |
+| **`src/lerobot/robots/unitree_g1/config_unitree_g1.py`** | 1. `controller: None`<br>2. `cameras: dict()` | 1. `controller = "GrootLocomotionController"`<br>2. 默认配置 `global_view` (ZMQ `localhost:5556`) | 固化 G1 机器人的默认全身平衡控制器与机载推流配置 |
+| **`src/lerobot/rollout/configs.py`** | 1. `robot: None`<br>2. `inference: sync`<br>3. `fps: 30`<br>4. `duration: 0`<br>5. `interpolation_multiplier: 1` | 1. `robot = UnitreeG1Config()`<br>2. `inference = RTCInferenceConfig()`<br>3. `fps = 25.0`<br>4. `duration = 1000.0`<br>5. `interpolation_multiplier = 3` | 全面固化 G1 + PI0.5 默认运行参数，命令行大幅精简为仅需 2~4 个参数 |
+| **`src/lerobot/policies/pi05/configuration_pi05.py` / `pi0`** | `dtype: float32` | 默认改为 `bfloat16` | 默认采用半精度节省显存并加速 |
+| **`src/lerobot/configs/policies.py`** | `device: None` | 默认改为 `cuda` | 默认采用 GPU 运行推理 |
 | **`src/lerobot/rollout/strategies/core.py`** | 1. 队列饥饿时返回 `None`<br>2. 每帧无条件推流<br>3. 无异常保护 | 1. 饥饿时保持 `_prev` 动作<br>2. 限制仅在 Policy 决策周期推流<br>3. 增加 `try-except` 异常保护与编译日志 | 防止动作悬空，降低推流频次，杜绝推流异常中断主控循环 |
 | **`src/lerobot/rollout/configs.py`** | `display_compressed_images: False` | 默认改为 `True` | 开启 JPEG 压缩，减小图像传输体积 |
 | **`src/lerobot/utils/rerun_visualization.py`** | 1. 仅支持 `np.ndarray`，丢弃 `torch.Tensor`<br>2. 图像推流误设 `static=True`<br>3. `$PATH` 缺少 conda 环境 `bin` | 1. 增加 `_to_numpy()` 支持 CPU/CUDA `torch.Tensor`、维度 Squeeze 与通道转换<br>2. 移除 `static=True` 恢复时序流式展示<br>3. 自动注入 `sys.prefix/bin` 到 `$PATH` | 彻底修复 Rerun 无画面问题，确保 29 维状态与 18 维动作时序流正常渲染 |
 | **`src/lerobot/scripts/lerobot_rollout.py`** | PyTorch 默认占用全部 32 核 CPU 线程 | 设置 PyTorch 最大 CPU 线程数为 8 | 防止推理占满 CPU 饿死主控制循环 |
-| **`verify_video_rollout.sh` / `verify_video_rollout_real.sh` / `deploy_real_g1.sh`** | 缺省参数 | 统一增加 `--inference.queue_threshold=35` 与 `--policy.dtype=bfloat16` | 统一默认运行环境与参数 |
+| **`verify_video_rollout.sh` / `verify_video_rollout_real.sh` / `deploy_real_g1.sh`** | 冗长全量参数 | 全面精简为仅传递差异参数（`policy.path`, `task`, `is_simulation`, `display_data` 等） | 脚本代码极为精炼清晰 |
 
 ---
 
