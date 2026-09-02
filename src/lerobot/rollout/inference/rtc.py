@@ -101,6 +101,8 @@ def _normalize_prev_actions_length(prev_actions: torch.Tensor, target_steps: int
         return prev_actions[:target_steps]
     padded = torch.zeros((target_steps, action_dim), dtype=prev_actions.dtype, device=prev_actions.device)
     padded[:steps] = prev_actions
+    if steps > 0:
+        padded[steps:] = prev_actions[-1:]
     return padded
 
 
@@ -446,7 +448,7 @@ class RTCInferenceEngine(InferenceEngine):
 
                         policy_config = getattr(self._policy, "config", None)
                         training_max_delay = int(getattr(policy_config, "rtc_training_max_delay", 0))
-                        latency = latency_tracker.max()
+                        latency = latency_tracker.p95() or latency_tracker.max() or 0.0
                         delay = _estimate_rtc_delay(
                             latency=latency,
                             time_per_step=time_per_chunk,
@@ -493,13 +495,18 @@ class RTCInferenceEngine(InferenceEngine):
                                         policy_device=policy_device,
                                     )
 
+                        effective_horizon = self._rtc_config.execution_horizon
                         if prev_actions is not None:
+                            effective_horizon = min(self._rtc_config.execution_horizon, prev_actions.shape[0])
                             prev_actions = _normalize_prev_actions_length(
                                 prev_actions, target_steps=self._rtc_config.execution_horizon
                             )
 
                         actions = self._policy.predict_action_chunk(
-                            preprocessed, inference_delay=delay, prev_chunk_left_over=prev_actions
+                            preprocessed,
+                            inference_delay=delay,
+                            prev_chunk_left_over=prev_actions,
+                            execution_horizon=effective_horizon,
                         )
 
                         original = actions.squeeze(0).clone()

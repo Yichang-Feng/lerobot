@@ -51,9 +51,17 @@ class LatencyTracker:
     def __len__(self) -> int:
         return len(self._values)
 
-    def max(self) -> float | None:
-        """Return the maximum latency or None if empty."""
-        return self.max_latency
+    def max(self) -> float:
+        """Return the maximum latency in the sliding window or 0.0 if empty."""
+        if not self._values:
+            return 0.0
+        return max(self._values)
+
+    def mean(self) -> float | None:
+        """Return the mean latency in the sliding window or None if empty."""
+        if not self._values:
+            return None
+        return float(np.mean(list(self._values)))
 
     def percentile(self, q: float) -> float | None:
         """Return the q-quantile (q in [0,1]) of recorded latencies or None if empty."""
@@ -63,7 +71,7 @@ class LatencyTracker:
         if q <= 0.0:
             return min(self._values)
         if q >= 1.0:
-            return self.max_latency
+            return max(self._values)
         vals = np.array(list(self._values), dtype=np.float32)
         return float(np.quantile(vals, q))
 

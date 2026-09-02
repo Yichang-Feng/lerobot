@@ -221,6 +221,10 @@ def rollout(cfg: RolloutConfig):
     """Main entry point for policy deployment."""
     init_logging()
 
+    import torch
+    if torch.get_num_threads() > 8:
+        torch.set_num_threads(8)
+
     if cfg.display_data:
         logger.info(
             "Initializing %s visualization (ip=%s, port=%s)",

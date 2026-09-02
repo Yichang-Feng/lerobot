@@ -163,18 +163,19 @@ def test_max_returns_maximum_value(tracker):
     assert tracker.max() == 0.8
 
 
-def test_max_persists_after_sliding_window(small_tracker):
-    """Test max() persists even after values slide out of window."""
+def test_max_updates_with_sliding_window(small_tracker):
+    """Test max() updates dynamically as old values slide out of window."""
     # Add values that will exceed maxlen=5
-    small_tracker.add(0.1)
-    small_tracker.add(0.9)  # This is max
+    small_tracker.add(0.9)  # Old spike
     small_tracker.add(0.2)
     small_tracker.add(0.3)
     small_tracker.add(0.4)
-    small_tracker.add(0.5)  # This pushes out 0.1
-
-    # Max should still be 0.9 even though only last 5 values kept
+    small_tracker.add(0.5)
     assert small_tracker.max() == 0.9
+
+    small_tracker.add(0.1)  # This pushes out 0.9
+    # Max should now be 0.5 (maximum of [0.2, 0.3, 0.4, 0.5, 0.1])
+    assert small_tracker.max() == 0.5
 
 
 def test_max_after_reset(tracker):

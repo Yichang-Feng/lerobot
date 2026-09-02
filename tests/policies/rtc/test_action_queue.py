@@ -540,6 +540,32 @@ def test_merge_skips_validation_when_action_index_none(action_queue_rtc_enabled,
     assert "Indexes diff is not equal to real delay" not in caplog.text
 
 
+def test_merge_uses_indexes_diff_for_seamless_continuity(action_queue_rtc_enabled, sample_actions):
+    """Test merge() uses indexes_diff instead of real_delay to avoid skipping actions."""
+    # Initialize queue
+    action_queue_rtc_enabled.merge(sample_actions["short"], sample_actions["short"], real_delay=0)
+
+    # Consume 5 actions (indices 0..4)
+    for _ in range(5):
+        action_queue_rtc_enabled.get()
+
+    # Merge new chunk with real_delay=8, but indexes_diff is 5
+    action_queue_rtc_enabled.merge(
+        sample_actions["original"],
+        sample_actions["processed"],
+        real_delay=8,
+        action_index_before_inference=0,
+    )
+
+    # Queue should slice at indexes_diff (5), NOT real_delay (8)
+    expected_size = len(sample_actions["original"]) - 5
+    assert action_queue_rtc_enabled.qsize() == expected_size
+
+    # Next action popped must be index 5, ensuring smooth continuity
+    next_action = action_queue_rtc_enabled.get()
+    assert torch.equal(next_action, sample_actions["processed"][5])
+
+
 # Thread safety tests
 
 

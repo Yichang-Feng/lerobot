@@ -21,6 +21,7 @@ importing from here directly. Requires the ``viz`` extra (``pip install 'lerobot
 
 import numbers
 import os
+import sys
 
 import numpy as np
 
@@ -31,9 +32,19 @@ from .constants import ACTION, ACTION_PREFIX, OBS_PREFIX, OBS_STR
 from .import_utils import require_package
 
 
+def _to_numpy(x):
+    """Convert input (e.g. torch.Tensor, list, tuple, np.ndarray) to numpy.ndarray or scalar."""
+    if hasattr(x, "detach"):
+        return x.detach().cpu().numpy()
+    if isinstance(x, (list, tuple)):
+        return np.array(x)
+    return x
+
+
 def _is_scalar(x):
-    return isinstance(x, (float | numbers.Real | np.integer | np.floating)) or (
-        isinstance(x, np.ndarray) and x.ndim == 0
+    arr = _to_numpy(x)
+    return isinstance(arr, (float | numbers.Real | np.integer | np.floating)) or (
+        isinstance(arr, np.ndarray) and arr.size == 1
     )
 
 
@@ -56,6 +67,14 @@ def init_rerun(
 
     batch_size = os.getenv("RERUN_FLUSH_NUM_BYTES", "8000")
     os.environ["RERUN_FLUSH_NUM_BYTES"] = batch_size
+
+    # Ensure the active environment's bin directory is in PATH so rr.spawn() finds the rerun executable
+    env_bin = os.path.join(sys.prefix, "bin")
+    exec_bin = os.path.dirname(sys.executable)
+    for b in (env_bin, exec_bin):
+        if b and b not in os.environ.get("PATH", "").split(os.pathsep):
+            os.environ["PATH"] = b + os.pathsep + os.environ.get("PATH", "")
+
     rr.init(session_name)
     memory_limit = os.getenv("LEROBOT_RERUN_MEMORY_LIMIT", "10%")
     if ip and port:
@@ -119,21 +138,13 @@ def log_rerun_data(
     This function iterates through the provided observation and action dictionaries and sends their contents
     to the Rerun viewer. It handles different data types appropriately:
     - Scalars values (floats, ints) are logged as `rr.Scalars`.
-    - 3D NumPy arrays that resemble images (e.g., with 1, 3, or 4 channels first) are transposed
+    - PyTorch Tensors and NumPy arrays are automatically converted and handled.
+    - 3D arrays/tensors that resemble images (e.g., with 1, 3, or 4 channels first) are transposed
       from CHW to HWC format, (optionally) compressed to JPEG and logged as `rr.Image` or `rr.EncodedImage`.
-    - 1D NumPy arrays are logged as a single `rr.Scalars` batch under one entity path, so that every
-      dimension shares the same view instead of being split across one view per element.
-    - Multi-dimensional **action** arrays are flattened and logged as a single `rr.Scalars` batch.
+    - 1D arrays/tensors are logged as a single `rr.Scalars` batch under one entity path.
+    - Multi-dimensional action arrays are flattened and logged as a single `rr.Scalars` batch.
 
     Keys are automatically namespaced with "observation." or "action." if not already present.
-
-    On the first call, a blueprint is built and sent so observation and action scalars get separate
-    time-series views and each image gets its own spatial view.
-
-    Args:
-        observation: An optional dictionary containing observation data to log.
-        action: An optional dictionary containing action data to log.
-        compress_images: Whether to compress images before logging to save bandwidth & memory in exchange for cpu and quality.
     """
 
     require_package("rerun-sdk", extra="viz", import_name="rerun")
@@ -149,19 +160,26 @@ def log_rerun_data(
                 continue
             key = k if str(k).startswith(OBS_PREFIX) else f"{OBS_STR}.{k}"
 
-            if _is_scalar(v):
-                rr.log(key, rr.Scalars(float(v)))
+            arr = _to_numpy(v)
+            if _is_scalar(arr):
+                rr.log(key, rr.Scalars(float(arr)))
                 observation_paths.add(key)
-            elif isinstance(v, np.ndarray):
-                arr = v
+            elif isinstance(arr, np.ndarray):
+                # Squeeze batch dimensions if present (e.g. [1, C, H, W] -> [C, H, W] or [1, D] -> [D])
+                if arr.ndim == 4 and arr.shape[0] == 1:
+                    arr = arr.squeeze(0)
+                elif arr.ndim == 2 and arr.shape[0] == 1:
+                    arr = arr.squeeze(0)
+
                 # Convert CHW -> HWC when needed
                 if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
                     arr = np.transpose(arr, (1, 2, 0))
+
                 if arr.ndim == 1:
-                    rr.log(key, rr.Scalars(arr.astype(float)))
+                    rr.log(key, rr.Scalars(arr.reshape(-1).astype(float)))
                     observation_paths.add(key)
-                else:
-                    if arr.shape[-1] == 1:
+                elif arr.ndim >= 2:
+                    if arr.ndim == 3 and arr.shape[-1] == 1:
                         # At record time, the depth unit is inferred from the frame type.
                         depth_unit = infer_depth_unit(arr.dtype)
                         img_entity = rr.DepthImage(
@@ -169,9 +187,20 @@ def log_rerun_data(
                             meter=1000.0 if depth_unit == DEPTH_MILLIMETER_UNIT else 1.0,
                             colormap=rr.components.Colormap.Viridis,
                         )
+                    elif arr.ndim == 3 and arr.shape[-1] in (3, 4):
+                        if np.issubdtype(arr.dtype, np.floating) and arr.max() <= 1.0 and arr.min() >= 0.0:
+                            arr_to_log = (arr * 255.0).astype(np.uint8)
+                        else:
+                            arr_to_log = arr.astype(np.uint8) if np.issubdtype(arr.dtype, np.floating) else arr
+                        img_entity = rr.Image(arr_to_log).compress() if compress_images else rr.Image(arr_to_log)
+                    elif arr.ndim == 2:
+                        img_entity = rr.Image(arr)
                     else:
-                        img_entity = rr.Image(arr).compress() if compress_images else rr.Image(arr)
-                    rr.log(key, entity=img_entity, static=True)
+                        rr.log(key, rr.Scalars(arr.reshape(-1).astype(float)))
+                        observation_paths.add(key)
+                        continue
+
+                    rr.log(key, img_entity)
                     image_paths.add(key)
 
     if action:
@@ -180,12 +209,13 @@ def log_rerun_data(
                 continue
             key = k if str(k).startswith(ACTION_PREFIX) else f"{ACTION}.{k}"
 
-            if _is_scalar(v):
-                rr.log(key, rr.Scalars(float(v)))
+            arr = _to_numpy(v)
+            if _is_scalar(arr):
+                rr.log(key, rr.Scalars(float(arr)))
                 action_paths.add(key)
-            elif isinstance(v, np.ndarray):
+            elif isinstance(arr, np.ndarray):
                 # Flatten any (incl. higher-dimensional) array into a single batched Scalars
-                rr.log(key, rr.Scalars(v.reshape(-1).astype(float)))
+                rr.log(key, rr.Scalars(arr.reshape(-1).astype(float)))
                 action_paths.add(key)
 
     _ensure_blueprint(observation_paths, action_paths, image_paths)

@@ -309,3 +309,56 @@ def test_log_rerun_data_blueprint_sent_only_once(mock_rerun):
     # Still only one blueprint, and the cached one is unchanged.
     assert len(blueprints) == 1
     assert rv.log_rerun_data.blueprint is first_blueprint
+
+
+def test_log_rerun_data_torch_tensors(mock_rerun):
+    """Test that PyTorch Tensors (scalars, 1D vectors, 3D/4D images) are properly converted and logged."""
+    import torch
+
+    rv, calls, blueprints = mock_rerun
+
+    obs = {
+        "observation.state": torch.randn(29),  # 29-DoF robot state
+        "observation.image": torch.rand(3, 224, 224),  # CHW float image [0, 1]
+        "observation.batched_image": torch.rand(1, 3, 224, 224),  # 1CHW float image
+        "observation.scalar": torch.tensor(42.0),  # 0D tensor
+    }
+    act = {
+        "action": torch.randn(18),  # 18-DoF robot action
+    }
+
+    rv.log_rerun_data(observation=obs, action=act)
+
+    keys = set(_keys(calls))
+    assert "observation.state" in keys
+    assert "observation.image" in keys
+    assert "observation.batched_image" in keys
+    assert "observation.scalar" in keys
+    assert "action" in keys
+
+    # Check state vector
+    state_obj = _obj_for(calls, "observation.state")
+    assert type(state_obj).__name__ == "DummyScalar"
+    assert len(state_obj.value) == 29
+
+    # Check 3D image: converted from (3, 224, 224) to (224, 224, 3) uint8
+    img_obj = _obj_for(calls, "observation.image")
+    assert type(img_obj).__name__ == "DummyImage"
+    assert img_obj.arr.shape == (224, 224, 3)
+    assert img_obj.arr.dtype == np.uint8
+
+    # Check 4D batched image: squeezed and transposed to (224, 224, 3) uint8
+    bimg_obj = _obj_for(calls, "observation.batched_image")
+    assert type(bimg_obj).__name__ == "DummyImage"
+    assert bimg_obj.arr.shape == (224, 224, 3)
+    assert bimg_obj.arr.dtype == np.uint8
+
+    # Check 0D scalar
+    scalar_obj = _obj_for(calls, "observation.scalar")
+    assert type(scalar_obj).__name__ == "DummyScalar"
+    assert float(scalar_obj.value) == pytest.approx(42.0)
+
+    # Check action vector
+    act_obj = _obj_for(calls, "action")
+    assert type(act_obj).__name__ == "DummyScalar"
+    assert len(act_obj.value) == 18

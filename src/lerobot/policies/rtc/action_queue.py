@@ -252,10 +252,12 @@ class ActionQueue:
     def _check_and_resolve_delays(
         self, real_delay: int, action_index_before_inference: int | None = None
     ) -> int:
-        """Validate that computed delays match expectations.
+        """Validate and resolve delay to use for merging.
 
-        Compares the delay computed from inference latency with the actual
-        number of actions consumed during inference.
+        If action_index_before_inference is provided, the actual number of actions
+        consumed during inference (indexes_diff) represents the exact ground-truth
+        progress of the robot execution. Using indexes_diff guarantees seamless
+        trajectory continuity without skipping or repeating actions.
 
         Args:
             real_delay: Delay computed from inference latency.
@@ -264,16 +266,14 @@ class ActionQueue:
         Returns:
             int: Delay to use.
         """
-        effective_delay = max(0, real_delay)
-
         if action_index_before_inference is not None:
             indexes_diff = max(0, self.last_index - action_index_before_inference)
             if indexes_diff != real_delay:
                 logger.info(
-                    "Indexes diff is not equal to real delay. indexes_diff=%d, real_delay=%d",
+                    "Indexes diff is not equal to real delay. indexes_diff=%d, real_delay=%d; using indexes_diff for seamless trajectory continuity",
                     indexes_diff,
                     real_delay,
                 )
-                return real_delay
+            return indexes_diff
 
-        return effective_delay
+        return max(0, real_delay)

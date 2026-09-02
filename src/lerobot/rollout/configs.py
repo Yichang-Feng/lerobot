@@ -273,7 +273,7 @@ class RolloutConfig:
     # For "rerun": port of the remote server. For "foxglove": port to bind the WebSocket server to.
     display_port: int | None = None
     # Whether to display compressed (JPEG) images instead of raw frames
-    display_compressed_images: bool = False
+    display_compressed_images: bool = True
     # Use vocal synthesis to read events
     play_sounds: bool = True
     resume: bool = False

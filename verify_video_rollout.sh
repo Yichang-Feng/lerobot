@@ -52,6 +52,8 @@ echo "==========================================================================
 
 $LEROBOT_ROLLOUT \
     --strategy.type=base \
+    --inference.type=rtc \
+    --interpolation_multiplier=2 \
     --policy.path=model/box_pick \
     --policy.device=cuda \
     --robot.type=unitree_g1 \

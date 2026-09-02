@@ -200,17 +200,24 @@ class RolloutStrategy(abc.ABC):
         obs_processed: dict | None,
         action_dict: dict | None,
         runtime_ctx: RuntimeContext,
+        interpolator: ActionInterpolator | None = None,
     ) -> None:
         """Log observation/action telemetry to the visualization backend if display_data is enabled."""
         cfg = runtime_ctx.cfg
         if not cfg.display_data:
             return
-        log_visualization_data(
-            cfg.display_mode,
-            observation=obs_processed,
-            action=action_dict,
-            compress_images=cfg.display_compressed_images,
-        )
+        if interpolator is not None and interpolator.enabled and not interpolator.emitted_policy_action:
+            # Skip heavy full-frame image logging on interpolated sub-ticks to protect control loop timing
+            return
+        try:
+            log_visualization_data(
+                cfg.display_mode,
+                observation=obs_processed,
+                action=action_dict,
+                compress_images=cfg.display_compressed_images,
+            )
+        except Exception as e:
+            logger.warning("Failed to log telemetry data: %s", e)
 
     @abc.abstractmethod
     def setup(self, ctx: RolloutContext) -> None:
@@ -359,7 +366,10 @@ def send_next_action(
     if interp is None:
         if timer is not None:
             timer.note_starved_tick()
-        return None
+        if interpolator._prev is not None:
+            interp = interpolator._prev
+        else:
+            return None
 
     if len(interp) != len(ordered_keys):
         raise ValueError(f"Interpolated tensor length ({len(interp)}) != action keys ({len(ordered_keys)})")

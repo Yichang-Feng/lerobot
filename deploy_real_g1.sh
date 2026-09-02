@@ -35,6 +35,8 @@ fi
 echo "启动实机 Rollout 进程..."
 $LEROBOT_ROLLOUT \
     --strategy.type=base \
+    --inference.type=rtc \
+    --interpolation_multiplier=2 \
     --policy.path="${POLICY_PATH}" \
     --policy.device=cuda \
     --robot.type=unitree_g1 \

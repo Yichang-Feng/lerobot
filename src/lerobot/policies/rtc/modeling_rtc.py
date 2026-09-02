@@ -201,6 +201,8 @@ class RTCProcessor:
         if prev_chunk_left_over.shape[1] < action_chunk_size or prev_chunk_left_over.shape[2] < action_dim:
             padded = torch.zeros(batch_size, action_chunk_size, action_dim).to(x_t.device)
             padded[:, : prev_chunk_left_over.shape[1], : prev_chunk_left_over.shape[2]] = prev_chunk_left_over
+            if prev_chunk_left_over.shape[1] > 0 and prev_chunk_left_over.shape[1] < action_chunk_size:
+                padded[:, prev_chunk_left_over.shape[1] :, : prev_chunk_left_over.shape[2]] = prev_chunk_left_over[:, -1:, : prev_chunk_left_over.shape[2]]
             prev_chunk_left_over = padded
 
         assert prev_chunk_left_over.shape == x_t.shape, (
