@@ -71,7 +71,7 @@ class RTCInferenceConfig(InferenceEngineConfig):
     # Eagerly constructed so draccus exposes nested fields directly on the CLI
     # (e.g. ``--inference.rtc.execution_horizon=...``).
     rtc: RTCConfig = field(default_factory=RTCConfig)
-    queue_threshold: int = 40
+    queue_threshold: int = 35
 
 
 # ---------------------------------------------------------------------------

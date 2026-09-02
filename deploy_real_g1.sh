@@ -36,9 +36,11 @@ echo "启动实机 Rollout 进程..."
 $LEROBOT_ROLLOUT \
     --strategy.type=base \
     --inference.type=rtc \
+    --inference.queue_threshold=35 \
     --interpolation_multiplier=2 \
     --policy.path="${POLICY_PATH}" \
     --policy.device=cuda \
+    --policy.dtype=bfloat16 \
     --robot.type=unitree_g1 \
     --robot.is_simulation=false \
     --robot.robot_ip="${ROBOT_IP}" \
