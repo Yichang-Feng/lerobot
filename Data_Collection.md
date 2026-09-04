@@ -11,7 +11,7 @@
 4. [任务范式与短程微调流程](#4-任务范式与短程微调流程)
 5. [数据采集标准作业程序（SOP）](#5-数据采集标准作业程序sop)
 6. [采集数据结构与字段定义](#6-采集数据结构与字段定义)
-7. [数据后处理与格式转换（转为 LeRobot v3.0）](#7-数据后处理与格式转换转为-lerobot-v30)
+7. [遥控速度指令的底层映射机制与真实数据分布](#7-遥控速度指令的底层映射机制与真实数据分布)
 8. [微调模型推荐数据量与训练建议](#8-微调模型推荐数据量与训练建议)
 
 ---
@@ -124,43 +124,92 @@ cd ~/lerobot
 
 ## 6. 采集数据结构与字段定义
 
-### 6.1 Psi0 / 类 Psi0 原始数据结构 (36 维)
-| 维度范围 | 字段名称 | 物理意义 |
-| :--- | :--- | :--- |
-| `[0:7]` | `left_hand_joints` | 左手灵巧手 7 关节（若无需五指可忽略） |
-| `[7:14]` | `right_hand_joints` | 右手灵巧手 7 关节 |
-| `[14:21]` | `left_arm_joints` | **左臂 7 个关节角度**（肩Pitch/Roll/Yaw，肘，腕Roll/Pitch/Yaw） |
-| `[21:28]` | `right_arm_joints` | **右臂 7 个关节角度**（肩Pitch/Roll/Yaw，肘，腕Roll/Pitch/Yaw） |
-| `[28:31]` | `torso_rpy` | 躯干姿态欧拉角（Roll, Pitch, Yaw） |
-| `[31:32]` | `torso_height` | 骨盆/躯干高度（用于蹲起判断） |
-| `[32:36]` | `torso_nav` | **下肢导航速度** $[v_x, v_y, v_{\text{yaw}}, \text{target\_yaw}]$ |
+### 6.1 目标 LeRobot v3.0 格式（用于训练与微调 `model/box_move_blue`）
 
-### 6.2 目标 LeRobot v3.0 格式（用于微调 `model/unitree_box_move`）
-| 字段名称 | 类型与维度 | 说明 |
+依据 [`datasets/unitree_box_move_blue_full/meta/info.json`](file:///home/yichangfeng/lerobot/datasets/unitree_box_move_blue_full/meta/info.json) 与 [`convert_rubberhand_to_g1_v30.py`](file:///home/yichangfeng/lerobot/convert_rubberhand_to_g1_v30.py)，数据集中各字段的定义如下：
+
+| 字段名称 | 数据类型与维度 | 物理定义与关节分布 |
 | :--- | :--- | :--- |
-| **`observation.images.global_view`** | `(480, 640, 3)` MP4 视频流 | G1 头部机载 RealSense RGB 图像（30 FPS） |
-| **`observation.state`** | `float32 [29]` | 全身 29 关节实际状态（双腿 12 + 腰部 3 + 双臂 14） |
-| **`action`** | `float32 [18]` | • **前 14 维**：双臂 14 关节目标角度<br>• **后 4 维**：`[remote.lx, remote.ly, remote.rx, remote.ry]` 遥控速度 |
+| **`observation.images.global_view`** | `(480, 640, 3)` MP4 视频流 | G1 头部机载 RealSense RGB 图像，采样帧率 **30 FPS** |
+| **`observation.state`** | `float32 [29]` | **机器人全身 29 关节当前实际弧度 (q)**：<br>• `[0:12]`：双腿 12 关节（左髋Pitch/Roll/Yaw, 左膝, 左踝Pitch/Roll, 右髋Pitch/Roll/Yaw, 右膝, 右踝Pitch/Roll）<br>• `[12:15]`：腰部 3 关节（Yaw, Roll, Pitch）<br>• `[15:22]`：左臂 7 关节（肩Pitch/Roll/Yaw, 肘, 腕Roll/Pitch/Yaw）<br>• `[22:29]`：右臂 7 关节（肩Pitch/Roll/Yaw, 肘, 腕Roll/Pitch/Yaw） |
+| **`action`** | `float32 [18]` | **模型预测与训练监督动作向量**：<br>• `[0:7]`：左臂 7 关节目标弧度<br>• `[7:14]`：右臂 7 关节目标弧度<br>• `[14:18]`：底盘 4 维遥控速度指令 `[remote.lx, remote.ly, remote.rx, remote.ry]` |
 
 ---
 
-## 7. 数据后处理与格式转换（转为 LeRobot v3.0）
+## 7. 遥控速度指令的底层映射机制与真实数据分布
 
-通过映射脚本将原始 Psi0 / 动捕数据转换为当前项目训练格式：
+### 7.1 采集端：遥控器/外骨骼数据读取与归一化实现
 
-### 7.1 字段映射公式
-$$\text{Action}_{18} = [\underbrace{\text{left\_arm}[0:7], \;\text{right\_arm}[0:7]}_{\text{14 维双臂关节目标}}, \;\underbrace{\text{remote.lx} = -v_y, \;\text{remote.ly} = v_x, \;\text{remote.rx} = -\omega_z, \;\text{remote.ry} = 0.0}_{\text{4 维平滑底盘速度}}]$$
+在 [`src/lerobot/teleoperators/unitree_g1/unitree_g1.py:L125-L155`](file:///home/yichangfeng/lerobot/src/lerobot/teleoperators/unitree_g1/unitree_g1.py#L125-L155) 中，手柄遥控输入被统一归一化为 `[-1.0, 1.0]` 范围：
 
-### 7.2 一键转换脚本
-使用项目根目录下的转换脚本：
-```bash
-python convert_rubberhand_to_g1_v30.py \
-    --src-dir ~/GR00T-WholeBodyControl/outputs/my_psi0_dataset \
-    --dst-dir ./datasets/unitree_box_move_finetune \
-    --repo-id "unitree_g1/unitree_box_move_finetune" \
-    --task "walk to the box, pick it up with both arms, turn around and place it" \
-    --fps 30
+```python
+# 1. 外骨骼手柄 (12-bit ADC，采样范围 0~4095，ADC_HALF = 2047.5):
+self.lx = (raw16[JOYSTICK_X_IDX] - self.left_center_x) / 2047.5
+self.ly = (raw16[JOYSTICK_Y_IDX] - self.left_center_y) / 2047.5
+self.rx = (raw16[JOYSTICK_X_IDX] - self.right_center_x) / 2047.5
+self.ry = (raw16[JOYSTICK_Y_IDX] - self.right_center_y) / 2047.5
+
+# 2. 宇树无线遥控器 (unitree_sdk2py):
+self.lx = self._joystick.lx.data  # 范围 [-1.0, 1.0]
+self.ly = self._joystick.ly.data  # 范围 [-1.0, 1.0]
 ```
+
+### 7.2 控制器端：底盘速度转换公式与缩放系数 (CMD_SCALE)
+
+在 [`src/lerobot/robots/unitree_g1/controllers/gr00t_locomotion.py:L47-L220`](file:///home/yichangfeng/lerobot/src/lerobot/robots/unitree_g1/controllers/gr00t_locomotion.py#L47-L220) 中，底层 Groot WBC 步态控制器接收并处理 `action[14:18]`：
+
+```python
+# 1. 轴向转换映射
+self.cmd[0] = ly   # 前进/后退线速度 (m/s)
+self.cmd[1] = -lx  # 左右横移线速度 (m/s)
+self.cmd[2] = -rx  # 原地旋转角速度 (rad/s)
+
+# 2. 底层步态网络输入缩放系数
+CMD_SCALE = [2.0, 2.0, 0.25]
+self.groot_obs_single[:3] = self.cmd * np.array(CMD_SCALE)
+
+# 3. 步态模式切换判定
+cmd_magnitude = np.linalg.norm(self.cmd)
+# 当合速度模长 < 0.05 时切换为原地站立平衡 (balance)，>= 0.05 时切入双足行走 (walk)
+selected_policy_name = "balance" if cmd_magnitude < 0.05 else "walk"
+```
+
+在 [`src/lerobot/robots/unitree_g1/controllers/holosoma_locomotion.py:L156-L163`](file:///home/yichangfeng/lerobot/src/lerobot/robots/unitree_g1/controllers/holosoma_locomotion.py#L156-L163) 中，控制器配置了速度死区与硬限幅：
+```python
+ly = ly if abs(ly) > 0.1 else 0.0
+lx = lx if abs(lx) > 0.1 else 0.0
+rx = rx if abs(rx) > 0.1 else 0.0
+ly = np.clip(ly, -0.3, 0.3)
+lx = np.clip(lx, -0.3, 0.3)
+self.cmd[:] = [ly, -lx, -rx]
+```
+
+### 7.3 训练数据集真实数值统计（源自 `unitree_box_move_blue_full/meta/stats.json`）
+
+依据训练集元数据 [`datasets/unitree_box_move_blue_full/meta/stats.json:L66-L250`](file:///home/yichangfeng/lerobot/datasets/unitree_box_move_blue_full/meta/stats.json#L66-L250)（共 475,206 帧有效样本），`action` 后 4 维遥控速度指令的真实统计指标如下：
+
+| 字段 | 对应索引 | 最小值 (min) | 10% 分位数 (q10) | 50% 分位数 (q50) | 90% 分位数 (q90) | 99% 分位数 (q99) | 最大值 (max) | 均值 (mean) | 标准差 (std) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`remote.lx`** | 14 | -0.7634 | -0.0246 | -0.0059 | **+0.0041** | +0.2483 | +1.2928 | -0.0134 | 0.1503 |
+| **`remote.ly`** | 15 | -0.7707 | -0.1435 | -0.0221 | **+0.2730** | **+1.1797** | +1.2977 | +0.0285 | 0.3975 |
+| **`remote.rx`** | 16 | -0.7775 | -0.0208 | -0.0048 | **+0.8547** | **+1.1984** | +1.2586 | +0.1279 | 0.4068 |
+| **`remote.ry`** | 17 | -0.7726 | -0.2115 | -0.0435 | -0.0051 | +0.0185 | +1.3382 | -0.0749 | 0.1176 |
+
+### 7.4 原始动捕数据到 LeRobot v3.0 的转换映射
+
+在 [`convert_rubberhand_to_g1_v30.py:L170-L194`](file:///home/yichangfeng/lerobot/convert_rubberhand_to_g1_v30.py#L170-L194) 中执行的转换规则：
+- **State (43-D $\rightarrow$ 29-D)**：
+  ```python
+  state_29 = np.concatenate([raw_state[0:22], raw_state[29:36]])
+  # 包含: [0:12] 双腿 + [12:15] 腰部 + [15:22] 左臂 + [22:29] 右臂 (剔除了 14 维灵巧手)
+  ```
+- **Action (43-D $\rightarrow$ 18-D)**：
+  ```python
+  # 前 14 维为双臂目标关节角度，后 4 维为遥控速度指令
+  action_18 = np.concatenate([raw_action[15:22], raw_action[29:36], [remote.lx, remote.ly, remote.rx, remote.ry]])
+  ```
+  在由空间人体动捕位移提取速度时，映射公式为：
+  $$\text{remote.ly} = v_x, \quad \text{remote.lx} = -v_y, \quad \text{remote.rx} = -\omega_z, \quad \text{remote.ry} = 0.0$$
 
 ---
 
@@ -194,11 +243,10 @@ python src/lerobot/scripts/lerobot_train.py \
 ```
 
 ### 8.3 实机部署闭环验证
-微调完成后，使用 `run_rollout.sh` 或 `REAL_Deploy.md` 中的 SOP 直接部署验证：
 ```bash
 ./run_rollout.sh \
     --policy.path="./outputs/train/unitree_box_move_finetuned/checkpoints/005000/pretrained_model" \
-    --task="walk to the box, pick it up with both arms, turn around and place it" \
+    --task="pick up the box, turn right, and place it on the table" \
     --robot.is_simulation=false \
     --robot.zero_locomotion_cmd=false \
     --display_data=true

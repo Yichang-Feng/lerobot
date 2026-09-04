@@ -1117,8 +1117,9 @@ class PI05Policy(PreTrainedPolicy):
 
         return fixed_state_dict
 
-    def get_optim_params(self) -> dict:
-        return self.parameters()
+    def get_optim_params(self):
+        return [p for p in self.parameters() if p.requires_grad]
+
 
     def reset(self):
         """Reset internal state at the shared boundary of a batched rollout.

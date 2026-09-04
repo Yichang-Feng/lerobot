@@ -265,8 +265,8 @@ def parse_args():
     parser.add_argument(
         "--start_time",
         type=str,
-        default="3:10",
-        help="Start time offset in seconds or MM:SS (default: '3:10' / 190s)",
+        default="0:00",
+        help="Start time offset in seconds or MM:SS (default: '0:00' / 0s)",
     )
     parser.add_argument(
         "--end_time",

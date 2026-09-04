@@ -9,6 +9,7 @@ import argparse
 import shutil
 import sys
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -102,12 +103,44 @@ FEATURES = {
 }
 
 
+def quat_to_yaw(q: np.ndarray | list) -> float:
+    """Extract yaw angle (radians) from quaternion [w, x, y, z]."""
+    w, x, y, z = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    return float(np.arctan2(siny_cosp, cosy_cosp))
+
+
+def compute_episode_yaw_rates(df: Any, fps: int) -> np.ndarray:
+    """Compute yaw rotation rates (rad/s) for each frame in the episode."""
+    n = len(df)
+    # 1. Prefer teleop.delta_heading if available and populated
+    if "teleop.delta_heading" in df.columns:
+        delta_h = np.array(df["teleop.delta_heading"], dtype=np.float32).flatten()
+        if np.any(np.abs(delta_h) > 1e-4):
+            return delta_h * float(fps)
+
+    # 2. Derive from base orientation quaternion (observation.root_orientation)
+    if "observation.root_orientation" in df.columns:
+        try:
+            yaws = np.array([quat_to_yaw(q) for q in df["observation.root_orientation"]], dtype=np.float32)
+            dyaws = np.diff(yaws, prepend=yaws[0])
+            # Wrap to [-pi, pi]
+            dyaws = (dyaws + np.pi) % (2.0 * np.pi) - np.pi
+            yaw_rates = dyaws * float(fps)
+            return np.clip(yaw_rates, -1.5, 1.5)
+        except Exception:
+            pass
+
+    return np.zeros(n, dtype=np.float32)
+
+
 def convert_dataset(
     src_dir: Path,
     dst_dir: Path,
     repo_id: str = "unitree_g1/rubberhand_pickbox_g1",
     fps: int = 30,
-    task_desc: str = "pick the rubber hand box",
+    task_desc: str = "pick up the box, turn right, and place it on the table",
     overwrite: bool = True,
 ):
     src_dir = Path(src_dir).expanduser().resolve()
@@ -129,6 +162,7 @@ def convert_dataset(
 
     print(f"Source dataset: {src_dir}")
     print(f"Destination dataset: {dst_dir}")
+    print(f"Task description: \"{task_desc}\"")
     print(f"Found {len(parquet_files)} episodes to convert at {fps} FPS...")
 
     # Create destination LeRobot v3.0 dataset
@@ -166,6 +200,9 @@ def convert_dataset(
             print(f"Warning: Episode {ep_idx} has 0 frames, skipping.")
             continue
 
+        # Compute turning rates for the episode
+        yaw_rates = compute_episode_yaw_rates(df, fps)
+
         for i in range(num_frames):
             raw_state = np.array(df["observation.state"].iloc[i], dtype=np.float32)
             raw_action = np.array(df["action.wbc"].iloc[i], dtype=np.float32)
@@ -182,7 +219,9 @@ def convert_dataset(
             # [15:22] left arm target angles (7)
             # [29:36] right arm target angles (7)
             # 4-D remote velocity commands [remote.lx, remote.ly, remote.rx, remote.ry]
-            remote_vel = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+            # In G1 locomotion controller: cmd_vel[2] = -remote.rx -> remote.rx = -yaw_rate
+            rx = float(-yaw_rates[i]) if i < len(yaw_rates) else 0.0
+            remote_vel = np.array([0.0, 0.0, rx, 0.0], dtype=np.float32)
             action_18 = np.concatenate([raw_action[15:22], raw_action[29:36], remote_vel])
 
             frame_data = {
@@ -231,8 +270,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task",
         type=str,
-        default="pick the rubber hand box",
-        help="Task description string",
+        default="pick up the box, turn right, and place it on the table",
+        help="Task description string (default: 'pick up the box, turn right, and place it on the table')",
     )
     parser.add_argument(
         "--no-overwrite",
