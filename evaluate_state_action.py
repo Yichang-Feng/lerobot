@@ -430,69 +430,93 @@ def plot_figure_3_cross_comparison(
 
     fig, axes = plt.subplots(2, 2, figsize=(16, 11))
 
-    # 1. Action/State Jitter Ratio Bar Chart across 14 arm joints
+    # 1. Figure 3A: Action Absolute Jitter Magnitude (mrad) across all 14 joints
     ax1 = axes[0, 0]
     x = np.arange(14)
     width = 0.38
     ax1.bar(
         x - width / 2,
-        ratio_ours,
+        mean_jit_act_ours * 1000,
         width,
-        label=f"Our Dataset (g1_box_pick_turn, Ep {ep_ours_idx})",
+        label=f"Our Dataset Action (Ep {ep_ours_idx})",
         color="#d95f02",
         alpha=0.9,
     )
     ax1.bar(
         x + width / 2,
-        ratio_open,
+        mean_jit_act_open * 1000,
         width,
-        label=f"Open Baseline (unitree_box_move_blue, Ep {ep_open_idx})",
+        label=f"Open Baseline Action (Ep {ep_open_idx})",
         color="#2b5c8f",
         alpha=0.9,
     )
-    ax1.axhline(
-        1.0, color="gray", linestyle="--", linewidth=1.2, label="Ratio = 1.0 (No Added Jitter)"
-    )
     ax1.set_title(
-        "Figure 3A: Action-to-State Jitter Ratio Comparison (Jitter Multiplier)",
+        "Figure 3A: Action Absolute Jitter Magnitude Comparison ($10^{-3}$ rad)\n"
+        r"(Direct Physical Tremor: $\mathbb{E}[|a_{t+1} - 2a_t + a_{t-1}|]$)",
         fontsize=12,
         fontweight="bold",
     )
     ax1.set_xticks(x)
     ax1.set_xticklabels(ARM_SHORT_NAMES, rotation=35, ha="right", fontsize=9)
-    ax1.set_ylabel("Jitter Ratio (Action / State)", fontsize=11)
+    ax1.set_ylabel("Action Jitter ($10^{-3}$ rad)", fontsize=11)
     ax1.grid(axis="y", linestyle="--", alpha=0.5)
     ax1.legend(fontsize=9, loc="upper right")
 
-    # 2. Overall Jitter Summary (Box / Bar metric)
+    # Annotate absolute values and multipliers on active joints
+    for i in range(14):
+        if mean_jit_act_open[i] > 1e-4:
+            ratio_abs = mean_jit_act_ours[i] / mean_jit_act_open[i]
+            ax1.text(
+                x[i] - width / 2,
+                mean_jit_act_ours[i] * 1000 + 0.3,
+                f"{ratio_abs:.1f}x",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color="#b33000",
+                fontweight="bold",
+            )
+
+    # 2. Figure 3B: Jitter Inflation Factor (Action / State) on Active Joints
     ax2 = axes[0, 1]
-    datasets = ["Our Dataset\n(g1_box_pick_turn)", "Open Baseline\n(box_move_blue)"]
-    overall_ratio_ours = np.mean(mean_jit_act_ours) / np.mean(mean_jit_st_ours)
-    overall_ratio_open = np.mean(mean_jit_act_open) / np.mean(mean_jit_st_open)
-    bars = ax2.bar(
-        datasets,
-        [overall_ratio_ours, overall_ratio_open],
-        color=["#d95f02", "#2b5c8f"],
-        width=0.45,
+    # In open-source dataset, WrPitch & WrYaw (indices 5, 6, 12, 13) are fixed 0 in state
+    active_indices = [0, 1, 2, 3, 4, 7, 8, 9, 10, 11]
+    active_labels = [ARM_SHORT_NAMES[i] for i in active_indices]
+    x_act = np.arange(len(active_indices))
+
+    ratio_ours_active = [mean_jit_act_ours[i] / max(mean_jit_st_ours[i], 1e-6) for i in active_indices]
+    ratio_open_active = [mean_jit_act_open[i] / max(mean_jit_st_open[i], 1e-6) for i in active_indices]
+
+    ax2.bar(
+        x_act - width / 2,
+        ratio_ours_active,
+        width,
+        label=f"Our Dataset Ratio (Avg: {np.mean(ratio_ours_active):.1f}x)",
+        color="#d95f02",
         alpha=0.9,
     )
+    ax2.bar(
+        x_act + width / 2,
+        ratio_open_active,
+        width,
+        label=f"Open Baseline Ratio (Avg: {np.mean(ratio_open_active):.1f}x)",
+        color="#2b5c8f",
+        alpha=0.9,
+    )
+    ax2.axhline(
+        1.0, color="green", linestyle="--", linewidth=1.5, label="Ratio = 1.0 (Ideal: Action tracks State smoothly)"
+    )
     ax2.set_title(
-        "Figure 3B: Mean Action Jitter Inflation Factor",
+        "Figure 3B: Action-to-State Jitter Inflation Ratio (Active Joints)\n"
+        "(Excludes Open-Source Inactive WrPitch & WrYaw)",
         fontsize=12,
         fontweight="bold",
     )
-    ax2.set_ylabel("Overall Jitter Ratio (Action / State)", fontsize=11)
+    ax2.set_xticks(x_act)
+    ax2.set_xticklabels(active_labels, rotation=35, ha="right", fontsize=9)
+    ax2.set_ylabel("Jitter Multiplier (Action / State)", fontsize=11)
     ax2.grid(axis="y", linestyle="--", alpha=0.5)
-    for b, val in zip(bars, [overall_ratio_ours, overall_ratio_open]):
-        ax2.text(
-            b.get_x() + b.get_width() / 2,
-            b.get_height() + 0.2,
-            f"{val:.2f}x",
-            ha="center",
-            va="bottom",
-            fontweight="bold",
-            fontsize=13,
-        )
+    ax2.legend(fontsize=9, loc="upper right")
 
     # 3. End-of-Episode Arm Rest Angles (Surrender Pose Check)
     ax3 = axes[1, 0]

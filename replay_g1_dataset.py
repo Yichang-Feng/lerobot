@@ -193,12 +193,24 @@ def main():
     print(f"[Replay] Loaded Episode {args.episode} with {total_frames} frames.")
 
     has_state = "observation.state" in df.columns
-    has_action = "action" in df.columns
+    has_action = ("action" in df.columns) or ("action.wbc" in df.columns)
 
     states = np.vstack(df["observation.state"].values) if has_state else None
-    actions = np.vstack(df["action"].values) if has_action else None
+    if states is not None and states.shape[1] == 43:
+        # Extract 29-DoF from 43-DoF raw SonicStar state (discard fingers 22:29 and 36:43)
+        states = np.concatenate([states[:, 0:22], states[:, 29:36]], axis=1)
 
-    # Precompute base yaw trajectory from remote.rx
+    if "action" in df.columns:
+        actions = np.vstack(df["action"].values)
+    elif "action.wbc" in df.columns:
+        raw_act = np.vstack(df["action.wbc"].values)
+        # Extract 14-DoF arm action from 43-DoF raw action.wbc
+        arm_act = np.concatenate([raw_act[:, 15:22], raw_act[:, 29:36]], axis=1)
+        actions = arm_act
+    else:
+        actions = None
+
+    # Precompute base yaw trajectory
     dt = 1.0 / args.fps
     base_yaws = np.zeros(total_frames, dtype=np.float64)
     if actions is not None and actions.shape[1] >= 17:
@@ -206,6 +218,17 @@ def main():
         rx = actions[:total_frames, 16]
         cum_dyaw = np.cumsum(-rx * dt)
         base_yaws = cum_dyaw
+    elif "observation.root_orientation" in df.columns:
+        try:
+            for i in range(total_frames):
+                q = df["observation.root_orientation"].iloc[i]
+                w, x, y, z = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+                siny_cosp = 2.0 * (w * z + x * y)
+                cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+                base_yaws[i] = np.arctan2(siny_cosp, cosy_cosp)
+            base_yaws = base_yaws - base_yaws[0]
+        except Exception:
+            pass
 
     # Side-by-side camera frames if requested
     camera_frames = []
@@ -259,8 +282,8 @@ def main():
             cv2.putText(sim_bgr, mode_text, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
             if args.mode == "action" and actions is not None:
-                rx_val = actions[i, 16]
-                cv2.putText(sim_bgr, f"Target Action (Remote RX: {rx_val:+.2f})", (15, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                rx_val_str = f"{actions[i, 16]:+.2f}" if actions.shape[1] >= 17 else "N/A"
+                cv2.putText(sim_bgr, f"Target Action (Remote RX: {rx_val_str})", (15, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
             if args.side_by_side and camera_frames:
                 cam_img = camera_frames[i] if i < len(camera_frames) else np.zeros((render_h, render_w, 3), dtype=np.uint8)
