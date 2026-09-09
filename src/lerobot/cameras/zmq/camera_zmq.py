@@ -110,7 +110,8 @@ class ZMQCamera(Camera):
     @property
     def is_connected(self) -> bool:
         """Checks if the ZMQ socket is initialized and connected."""
-        return self._connected and self.context is not None and self.socket is not None
+        thread_ok = self.thread is None or self.thread.is_alive()
+        return self._connected and self.context is not None and self.socket is not None and thread_ok
 
     @check_if_already_connected
     def connect(self, warmup: bool = True) -> None:
@@ -132,14 +133,20 @@ class ZMQCamera(Camera):
             self.socket.connect(f"tcp://{self.server_address}:{self.port}")
             self._connected = True
 
-            # Auto-detect resolution if not provided
+            # Auto-detect or synchronize resolution from incoming stream
+            temp_frame = self._read_from_hardware()
+            h, w = temp_frame.shape[:2]
             if self.width is None or self.height is None:
-                # Read directly from hardware because the thread isn't running yet
-                temp_frame = self._read_from_hardware()
-                h, w = temp_frame.shape[:2]
                 self.height = h
                 self.width = w
                 logger.info(f"{self} resolution detected: {w}x{h}")
+            elif (w, h) != (self.width, self.height):
+                logger.info(
+                    f"{self} configured for {self.width}x{self.height}, but incoming stream is {w}x{h}. "
+                    f"Syncing camera resolution to actual stream {w}x{h}."
+                )
+                self.width = w
+                self.height = h
 
             self._start_read_thread()
             logger.info(f"{self} connected.")
@@ -265,11 +272,16 @@ class ZMQCamera(Camera):
             except DeviceNotConnectedError:
                 break
             except (TimeoutError, Exception) as e:
+                # If we haven't received the first frame yet, keep waiting without killing the thread
+                if self.latest_frame is None:
+                    time.sleep(0.1)
+                    continue
                 if failure_count <= 10:
                     failure_count += 1
                     logger.warning(f"Read error: {e}")
                 else:
-                    raise RuntimeError(f"{self} exceeded maximum consecutive read failures.") from e
+                    logger.error(f"{self} exceeded maximum consecutive read failures (10).")
+                    break
 
     def _start_read_thread(self) -> None:
         if self.stop_event is not None:

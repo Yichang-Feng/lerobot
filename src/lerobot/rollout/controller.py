@@ -439,6 +439,8 @@ class RolloutController:
         """Pause inference and return the robot home (the task was restored by :meth:`reset`)."""
         self._emit(RolloutEvent.RESET_STARTED)
         self._ctx.policy.inference.pause()
+        # Immediately purge RTC queues, leftover prefixes, and stale observations
+        self._strategy.reset_control_state()
         if not self._ctx.hardware.initial_position:
             logger.warning("No initial position captured — skipping the return move")
             self._emit(RolloutEvent.RESET_SKIPPED)

@@ -442,14 +442,24 @@ class UnitreeG1(Robot):
 
         # Wait for first state message to arrive
         lowstate = None
-        deadline = time.time() + 10.0
+        timeout = getattr(self.config, "connect_timeout", 60.0)
+        deadline = time.time() + timeout
+        start_time = time.time()
+        last_log_time = start_time
         while lowstate is None:
             with self._lowstate_lock:
                 lowstate = self._lowstate
             if lowstate is None:
-                if time.time() > deadline:
-                    raise TimeoutError("Timed out waiting for robot state (10s)")
-                logger.warning("[UnitreeG1] Waiting for robot state...")
+                now = time.time()
+                if now > deadline:
+                    raise TimeoutError(f"Timed out waiting for robot state ({int(timeout)}s)")
+                if now - last_log_time >= 5.0:
+                    logger.warning(
+                        "[UnitreeG1] Still waiting for robot state... (elapsed: %.0fs / %.0fs)",
+                        now - start_time,
+                        timeout,
+                    )
+                    last_log_time = now
                 time.sleep(0.01)
         logger.info("[UnitreeG1] Connected to robot.")
         self.msg.mode_machine = lowstate.mode_machine

@@ -19,6 +19,7 @@ from __future__ import annotations
 import abc
 import contextlib
 import logging
+import math
 from typing import TYPE_CHECKING
 
 from lerobot.datasets.utils import DEFAULT_VIDEO_FILE_SIZE_IN_MB
@@ -177,7 +178,7 @@ class RolloutStrategy(abc.ABC):
 
     @staticmethod
     def return_to_initial_position(hw: HardwareContext, duration_s: float = 3.0, fps: int = 50) -> bool:
-        """Smoothly interpolate the robot back to its initial position.
+        """Smoothly interpolate the robot back to its initial position using a cosine S-curve.
 
         Returns ``True`` when the interpolation completed, ``False`` when it failed
         partway — the robot is then at an arbitrary pose, so callers must not report
@@ -191,11 +192,21 @@ class RolloutStrategy(abc.ABC):
             steps = max(int(duration_s * fps), 1)
             for step in range(1, steps + 1):
                 t = step / steps
+                # Smooth cosine S-curve weighting
+                alpha = 0.5 * (1.0 - math.cos(math.pi * t))
                 interp = {}
                 for k in current_pos:
-                    interp[k] = current_pos[k] * (1 - t) + target[k] * t
+                    interp[k] = current_pos[k] * (1.0 - alpha) + target[k] * alpha
+                # Lock remote chassis axes to 0.0 during arm homing
+                for remote_key in ("remote.lx", "remote.ly", "remote.rx", "remote.ry"):
+                    if remote_key in robot.action_features:
+                        interp[remote_key] = 0.0
                 robot.send_action(interp)
                 precise_sleep(1 / fps)
+
+            # Signal protocol-level reset on robot if supported (e.g. UnitreeG1Client sends {"cmd": "reset"})
+            if hasattr(robot, "reset"):
+                robot.reset()
         except Exception as e:
             logger.warning("Could not return to initial position: %s", e)
             return False

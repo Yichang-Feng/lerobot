@@ -245,7 +245,7 @@ class RolloutConfig:
     dataset: DatasetRecordConfig | None = None
 
     # Runtime
-    fps: float = 25.0
+    fps: float = 30.0
     # Run time in seconds; 0 = infinite (24/7 mode).  In interactive mode this
     # bounds each /start segment, not the whole session.
     duration: float = 1000.0

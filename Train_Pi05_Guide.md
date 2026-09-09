@@ -56,8 +56,8 @@ conda activate lerobot
 export LD_LIBRARY_PATH=/home/yichangfeng/miniforge3/envs/lerobot/lib:$LD_LIBRARY_PATH
 
 python -m lerobot.scripts.lerobot_train \
-    --dataset.repo_id=g1_box_pick_turn_v30 \
-    --dataset.root=datasets/g1_box_pick_turn_v30 \
+    --dataset.repo_id=g1_box_pick_turn_v30_aligned \
+    --dataset.root=datasets/g1_box_pick_turn_v30_aligned \
     --policy.path=model/box_pick \
     --output_dir=outputs/train/test_smoke_run \
     --job_name=test_smoke_pi05 \
@@ -88,8 +88,8 @@ conda activate lerobot
 export LD_LIBRARY_PATH=/home/yichangfeng/miniforge3/envs/lerobot/lib:$LD_LIBRARY_PATH
 
 python -m lerobot.scripts.lerobot_train \
-    --dataset.repo_id=g1_box_pick_turn_v30 \
-    --dataset.root=datasets/g1_box_pick_turn_v30 \
+    --dataset.repo_id=g1_box_pick_turn_v30_aligned \
+    --dataset.root=datasets/g1_box_pick_turn_v30_aligned \
     --policy.path=model/box_pick \
     --policy.train_expert_only=true \
     --policy.compile_model=false \
@@ -112,8 +112,8 @@ conda activate lerobot
 export LD_LIBRARY_PATH=/home/yichangfeng/miniforge3/envs/lerobot/lib:$LD_LIBRARY_PATH
 
 nohup python -m lerobot.scripts.lerobot_train \
-    --dataset.repo_id=g1_box_pick_turn_v30 \
-    --dataset.root=datasets/g1_box_pick_turn_v30 \
+    --dataset.repo_id=g1_box_pick_turn_v30_aligned \
+    --dataset.root=datasets/g1_box_pick_turn_v30_aligned \
     --policy.path=model/box_pick \
     --policy.train_expert_only=true \
     --policy.compile_model=false \
@@ -149,8 +149,8 @@ nohup python -m lerobot.scripts.lerobot_train \
 | :--- | :--- | :--- |
 | `--policy.train_expert_only` | `true` | **核心微调设置**。冻结 2B PaliGemma 大视觉语言模型，仅微调 300M Action Expert。大幅削减显存（从 30GB+ 降至 8GB），防止小样本过拟合并杜绝 OOM。 |
 | `--policy.compile_model` | `false` | **秒开设置**。跳过漫长的 Triton Autotune 编译测试，5 秒内直接启动训练，同时节省 3GB+ CUDA Graph 显存。 |
-| `--dataset.repo_id` | `g1_box_pick_turn_v30` | **必填项**。LeRobot 数据集标识名，不填会报 `Missing required field repo_id` 错误。 |
-| `--dataset.root` | `datasets/g1_box_pick_turn_v30` | 本地转换后的 LeRobot v3.0 数据集目录路径。 |
+| `--dataset.repo_id` | `g1_box_pick_turn_v30_aligned` | **必填项**。LeRobot 数据集标识名，不填会报 `Missing required field repo_id` 错误。 |
+| `--dataset.root` | `datasets/g1_box_pick_turn_v30_aligned` | 速度对齐后的 LeRobot v3.0 数据集目录路径。 |
 | `--policy.path` | `model/box_pick` | 基础底模权重目录（内置预训练参数与 `config.json`）。 |
 | `--output_dir` | `outputs/train/...` | 训练产物（日志、Checkpoints、最终模型）的存放路径。 |
 | `--batch_size` | `4`（正式） / `2`（试水） | RTX 4090 D 推荐为 `4`；微调模式下显存仅占用约 8~9 GB，极为安全。 |
@@ -212,4 +212,115 @@ python plot_train_curve.py train.log
 --wandb.enable=true
 ```
 启动时终端会输出一个专属网页链接，用浏览器打开即可实时查看带平滑滤波、缩放的交互式 Loss 曲线。
+
+---
+
+## 八、模型评测与最优 Checkpoint 决策指南
+
+训练产生多个 Checkpoint（如每 1000 步保存一次）后，如何客观判断**哪个模型效果最好**？
+在 VLA 具身智能任务中，不能只看离线 Loss（存在动作误差累积的“协变量偏移”），推荐按照 **“离线自动化初筛排行榜” -> “闭环仿真多 Episode 决胜”** 的两级评估流程。
+
+> [!NOTE]
+> **关于 Step 5000 Checkpoint 完整性的特别说明**：
+> `outputs/train/pi05_box_pick_turn_aligned/checkpoints/005000` 经底层完整性校验：
+> - `pretrained_model/` 包含的 814 个权重 Tensor 及模型文件（9.35 GB）**100% 完好无损**。
+> - 当时训练中断仅发生在保存用于继续训练的优化器动量状态（`training_state/optimizer_state.safetensors`）时触发磁盘已满（`No space left on device`）。
+> - **用于模型评测、仿真与实机 Rollout 部署时，仅需 `pretrained_model/`，完全不受影响，可正常参与评估！**
+
+---
+
+### 1. 第一级：离线自动化定量评测（排行榜与误差对比）
+
+我们提供了专用的离线评估工具 [`eval_checkpoints_offline.py`](file:///home/yichangfeng/lerobot/eval_checkpoints_offline.py) 与快捷脚本 [`run_eval_offline.sh`](file:///home/yichangfeng/lerobot/run_eval_offline.sh)。
+
+该工具会自动遍历 `outputs/train/` 下的所有 Checkpoints，在验证集（默认留出最后 10% 的示教数据）上跑动作前向预测与对比，统计关键指标并自动生成排行榜。
+
+#### 核心评测命令：
+
+```bash
+cd ~/lerobot
+conda activate lerobot
+export LD_LIBRARY_PATH=/home/yichangfeng/miniforge3/envs/lerobot/lib:$LD_LIBRARY_PATH
+
+# 1. 快速评测 outputs/train/ 下所有模型（默认快速抽样 60 帧，各模型横向对比）：
+./run_eval_offline.sh
+
+# 2. 仅评测 aligned 版本的重点步数（如 3000、4000、5000 步）：
+./run_eval_offline.sh --runs=pi05_box_pick_turn_aligned --steps=003000,004000,005000
+
+# 3. 提高样本量进行更详尽评估（如 150 帧样本）：
+./run_eval_offline.sh --max-samples=150
+```
+
+#### 评测核心指标含义：
+* **`Val Loss`**：流匹配（Flow Matching）在未见验证数据上的损失（表征模型对动作分布的整体拟合能力）。
+* **`手臂 MAE (°)`**：14 个手臂关节角与人类示范动作的平均绝对误差（单位：度）。**该指标最能直接反映抓取与抱箱姿态的还原度**。
+* **`遥控 MAE`**：底盘移动和转向摇杆指令（`remote.lx/ly/rx/ry`）的误差（表征旋转速度与步伐控制对齐度）。
+* **`动作相似度`**：动作向量的方向余弦相似度（越接近 1.0 说明动作方向越一致）。
+
+运行后会在终端输出类似如下格式的排行榜，并自动导出 `eval_results.json` 与 `eval_results.md`：
+```text
+============================================================================================
+                      【G1 PI0.5 策略模型离线评测排行榜】
+============================================================================================
+排名   | 模型名称 (Run/Step)                        | Val Loss  | 手臂 MAE (°)   | 遥控 MAE    | 动作相似度     
+--------------------------------------------------------------------------------------------
+ #1   | pi05_box_pick_turn_final/005000        | 0.0354    | 3.19°        | 0.0210    | 0.9835    
+ #2   | pi05_box_pick_turn_aligned/004000      | 0.0288    | 3.35°        | 0.0234    | 0.9821    
+ #3   | pi05_box_pick_turn_final/004000        | 0.0428    | 3.41°        | 0.0236    | 0.9814    
+ #4   | pi05_box_pick_turn_aligned/005000      | 0.0271    | 3.46°        | 0.0260    | 0.9803    
+ #5   | pi05_box_pick_turn_aligned/003000      | 0.0338    | 3.57°        | 0.0285    | 0.9799    
+ #6   | pi05_box_pick_turn_aligned/002000      | 0.0333    | 3.76°        | 0.0287    | 0.9779    
+ #7   | pi05_box_pick_turn_final/003000        | 0.0370    | 3.78°        | 0.0248    | 0.9785    
+ #8   | pi05_box_pick_turn_final/002000        | 0.0398    | 4.23°        | 0.0238    | 0.9741    
+ #9   | pi05_box_pick_turn_final/001000        | 0.0367    | 5.06°        | 0.0299    | 0.9631    
+ #10  | pi05_box_pick_turn_aligned/001000      | 0.0391    | 5.07°        | 0.0350    | 0.9604    
+============================================================================================
+
+🏆 [推荐最优模型]: pi05_box_pick_turn_final/005000
+   - 手臂关节平均误差: 3.19° (0.0557 rad)
+   - 动作方向相似度:   0.9835
+   - 验证集 Loss:     0.0354
+
+```
+
+---
+
+### 2. 第二级：闭环 MuJoCo 仿真多 Episode 任务成功率测试（终极黄金标准）
+
+根据离线评测挑选出综合表现最好的 **Top-2 ~ Top-3 个模型**（例如 `aligned/004000` 与 `aligned/005000`），在 MuJoCo 物理仿真中各测试 **5 ~ 10 次完整 Episode**。
+
+#### 步骤 1：终端 1 启动仿真服务端
+```bash
+cd ~/lerobot
+./run_sim_locomotion.sh
+```
+
+#### 步骤 2：终端 2 运行待测模型推理（务必带 `--sim`）
+```bash
+cd ~/lerobot
+# 测试 Checkpoint A:
+./run_vla.sh \
+    --sim \
+    --policy.path=outputs/train/pi05_box_pick_turn_aligned/checkpoints/004000/pretrained_model \
+    --task="pick up the box, turn right, and place it on the table"
+
+# 测试 Checkpoint B:
+./run_vla.sh \
+    --sim \
+    --policy.path=outputs/train/pi05_box_pick_turn_aligned/checkpoints/005000/pretrained_model \
+    --task="pick up the box, turn right, and place it on the table"
+```
+
+#### 步骤 3：多维度闭环评价打分表
+
+建议使用下表对测试模型进行定级打分：
+
+| 评测维度 | 考核重点与观察要点 | 良好表现（合格） | 较差表现（淘汰） |
+| :--- | :--- | :--- | :--- |
+| **1. 下探与定位** | 机器人是否能够准确弯臂下探并对准纸箱两侧。 | 准确下探，双手对称包夹箱体。 | 探手过早/过晚，或插在箱体外侧。 |
+| **2. 夹持与抱起** | 搬起纸箱时双臂是否有足够力矩夹紧纸箱。 | 箱体平稳离地，未滑脱掉落。 | 箱子抓空或半途滑落。 |
+| **3. 协同右转行走** | 抱箱后上半身与下肢转向协调性，平衡控制器（WBC）是否稳定。 | 转向平稳推进，躯干姿态稳定不跌倒。 | 遥控急突导致底盘晃动失稳、摔倒。 |
+| **4. 桌面释放** | 到达目标桌面前减速并平稳张开双手释放。 | 动作干脆，箱体平稳停在桌面。 | 砸桌、不松手或原地停滞卡死。 |
+| **★ 全流程成功率** | **5 次测试中完整完成上述 4 阶段的次数百分比**。 | **≥ 80% (4/5)** | **< 60% (≤ 3/5)** |
 

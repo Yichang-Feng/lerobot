@@ -68,48 +68,107 @@ def compute_column_stats(df: pa.Table) -> Dict[str, dict]:
     return stats
 
 
-def resolve_source_dirs(raw_inputs: List[str], output_dir: Path) -> List[Path]:
-    """解析并过滤输入的源数据集目录列表"""
-    matched_dirs = set()
-    explicit_paths = set()
-    for item in raw_inputs:
-        expanded = str(Path(item).expanduser())
-        p_raw = Path(expanded)
-        if p_raw.exists() and p_raw.is_dir():
-            explicit_paths.add(p_raw.resolve())
+def parse_ep_range(range_str: Optional[str]) -> Optional[Tuple[Optional[int], Optional[int]]]:
+    """解析单个范围表达式: '28:', '28:62', '28-62', ':28', '28', 'all' 等"""
+    if not range_str or range_str.lower() in ("all", "none", "*", ":"):
+        return None
+    range_str = range_str.strip()
+    if ":" in range_str:
+        parts = range_str.split(":")
+        start = int(parts[0]) if parts[0].strip() else None
+        end = int(parts[1]) if len(parts) > 1 and parts[1].strip() else None
+        return (start, end)
+    elif "-" in range_str:
+        parts = range_str.split("-")
+        start = int(parts[0]) if parts[0].strip() else None
+        end = int(parts[1]) if len(parts) > 1 and parts[1].strip() else None
+        return (start, end)
+    else:
+        val = int(range_str)
+        return (val, val)
 
-        hits = glob.glob(expanded)
-        if not hits:
-            if p_raw.exists() and p_raw.is_dir():
-                matched_dirs.add(p_raw.resolve())
-        else:
-            for hit in hits:
-                p = Path(hit).resolve()
-                if p.is_dir():
-                    matched_dirs.add(p)
 
-    resolved = []
+def parse_dir_spec(item: str) -> Tuple[str, Optional[Tuple[Optional[int], Optional[int]]]]:
+    """解析目录规格，支持 'dir:28:' 或 'dir[28:]' 语法"""
+    item = item.strip()
+    if "[" in item and item.endswith("]"):
+        idx = item.rfind("[")
+        dir_part = item[:idx]
+        range_part = item[idx + 1 : -1]
+        return dir_part, parse_ep_range(range_part)
+
+    if ":" in item:
+        p_raw = Path(item).expanduser()
+        if not p_raw.exists():
+            idx = item.rfind(":")
+            prefix = item[:idx]
+            suffix = item[idx + 1 :]
+            if ":" in prefix:
+                sub_idx = prefix.rfind(":")
+                candidate_dir = prefix[:sub_idx]
+                candidate_range = item[sub_idx + 1 :]
+                if Path(candidate_dir).expanduser().exists():
+                    return candidate_dir, parse_ep_range(candidate_range)
+            if Path(prefix).expanduser().exists():
+                return prefix, parse_ep_range(suffix)
+
+    return item, None
+
+
+def resolve_source_dirs(
+    raw_inputs: List[str],
+    output_dir: Path,
+    ep_ranges: Optional[List[str]] = None,
+) -> List[Tuple[Path, Optional[Tuple[Optional[int], Optional[int]]]]]:
+    """解析并过滤输入的源数据集目录列表，严格保持输入顺序"""
+    resolved_entries = []
+    seen_entries = set()
     output_resolved = output_dir.resolve()
 
-    for p in sorted(list(matched_dirs)):
-        name = p.name
-        # 自动过滤备份目录与暂存目录
-        if any(keyword in name for keyword in ["_backup_", "_staged_", "_staging_", "_trial_backup"]):
-            continue
-        # 如果是通配符匹配出的 output_dir 本身，且用户并未显式将其作为独立参数传入，则自动跳过避免重复
-        if p == output_resolved and output_resolved not in explicit_paths:
-            continue
-        # 校验是否包含合法的 data 与 meta 结构
-        if (p / "data/chunk-000").exists() and (p / "meta/info.json").exists():
-            resolved.append(p)
+    if ep_ranges is None:
+        ep_ranges = []
+
+    for i, item in enumerate(raw_inputs):
+        dir_spec, inline_range = parse_dir_spec(item)
+        if i < len(ep_ranges) and ep_ranges[i]:
+            target_range = parse_ep_range(ep_ranges[i])
         else:
-            print(f"[!] 提示: 跳过非有效 Sonic 数据集目录: {p}")
+            target_range = inline_range
 
-    return resolved
+        expanded = str(Path(dir_spec).expanduser())
+        p_raw = Path(expanded)
+
+        hits = sorted(glob.glob(expanded)) if any(c in expanded for c in ["*", "?", "["]) else []
+        if not hits:
+            candidates = [p_raw]
+        else:
+            candidates = [Path(h) for h in hits]
+
+        for cand in candidates:
+            p = cand.resolve()
+            if not p.is_dir():
+                continue
+            name = p.name
+            if any(k in name for k in ["_backup_", "_staged_", "_staging_", "_trial_backup"]):
+                continue
+            if p == output_resolved and len(candidates) > 1:
+                continue
+            if (p / "data/chunk-000").exists() and (p / "meta/info.json").exists():
+                entry_key = (p, target_range)
+                if entry_key not in seen_entries:
+                    seen_entries.add(entry_key)
+                    resolved_entries.append((p, target_range))
+            else:
+                print(f"[!] 提示: 跳过非有效 Sonic 数据集目录: {p}")
+
+    return resolved_entries
 
 
-def inspect_dataset(ds_dir: Path) -> Tuple[List[int], Dict[int, int]]:
-    """检查数据集中的连续 Episode 及帧数"""
+def inspect_dataset(
+    ds_dir: Path,
+    ep_range: Optional[Tuple[Optional[int], Optional[int]]] = None,
+) -> Tuple[List[int], Dict[int, int]]:
+    """检查数据集中的连续 Episode 及帧数，支持范围过滤"""
     data_dir = ds_dir / "data/chunk-000"
     vid_dir = ds_dir / "videos/chunk-000/observation.images.ego_view"
 
@@ -125,6 +184,15 @@ def inspect_dataset(ds_dir: Path) -> Tuple[List[int], Dict[int, int]]:
         vid_file = vid_dir / f"episode_{ep_idx:06d}.mp4"
         if not vid_file.exists():
             continue
+
+        # 范围过滤
+        if ep_range is not None:
+            start, end = ep_range
+            if start is not None and ep_idx < start:
+                continue
+            if end is not None and ep_idx > end:
+                continue
+
         # 读取表格长度
         try:
             meta = pq.read_metadata(p)
@@ -136,7 +204,8 @@ def inspect_dataset(ds_dir: Path) -> Tuple[List[int], Dict[int, int]]:
         ep_lengths[ep_idx] = n_rows
 
     valid_eps.sort()
-    return valid_eps, ep_lengths
+    filtered_ep_lengths = {ep: ep_lengths[ep] for ep in valid_eps}
+    return valid_eps, filtered_ep_lengths
 
 
 def main():
@@ -146,7 +215,14 @@ def main():
         type=str,
         nargs="+",
         required=True,
-        help="待合并的源数据集目录列表或通配符匹配 (如 --src-dirs outputs/session_* outputs/other_dir)",
+        help="待合并的源数据集目录列表 (支持 'dir:28:' 或 'dir[28:]' 范围语法，如 outputs/raw:28: outputs/new)",
+    )
+    parser.add_argument(
+        "--ep-ranges",
+        type=str,
+        nargs="*",
+        default=[],
+        help="对应每个源目录的 Episode 范围 (例如: --ep-ranges 28: all)",
     )
     parser.add_argument(
         "--output-dir",
@@ -169,7 +245,7 @@ def main():
     args = parser.parse_args()
 
     dst_dir = Path(args.output_dir).expanduser().resolve()
-    src_dirs = resolve_source_dirs(args.src_dirs, dst_dir)
+    src_dirs = resolve_source_dirs(args.src_dirs, dst_dir, args.ep_ranges)
 
     if not src_dirs:
         print("[!] 错误: 未发现任何符合条件的源数据集目录！请检查 --src-dirs 参数。")
@@ -185,12 +261,18 @@ def main():
     total_frames_planned = 0
     batch_plan = []
 
-    for idx, s_dir in enumerate(src_dirs):
-        eps, ep_lens = inspect_dataset(s_dir)
+    for idx, (s_dir, ep_range) in enumerate(src_dirs):
+        eps, ep_lens = inspect_dataset(s_dir, ep_range)
         n_eps = len(eps)
         n_frames = sum(ep_lens.values())
-        batch_plan.append((s_dir, eps, ep_lens))
-        print(f"   [{idx + 1}] {s_dir.name:<36} -> {n_eps:3d} 条 Episode, 共 {n_frames:6d} 帧 ({n_frames/args.fps:6.1f}s)")
+        range_desc = ""
+        if ep_range is not None:
+            s_val = f"Ep {ep_range[0]}" if ep_range[0] is not None else "Ep 0"
+            e_val = f"Ep {ep_range[1]}" if ep_range[1] is not None else "末尾"
+            range_desc = f" [{s_val}~{e_val}]"
+        batch_plan.append((s_dir, eps, ep_lens, range_desc))
+        dir_display = s_dir.name + range_desc
+        print(f"   [{idx + 1}] {dir_display:<40} -> {n_eps:3d} 条 Episode, 共 {n_frames:6d} 帧 ({n_frames/args.fps:6.1f}s)")
         total_episodes_planned += n_eps
         total_frames_planned += n_frames
 
@@ -235,8 +317,8 @@ def main():
     template_modality = None
     template_tasks = None
 
-    for s_idx, (s_dir, eps, ep_lens) in enumerate(batch_plan):
-        print(f"\n  >> 正在处理批次 [{s_idx + 1}/{len(batch_plan)}]: {s_dir.name} (含 {len(eps)} 条轨迹)")
+    for s_idx, (s_dir, eps, ep_lens, range_desc) in enumerate(batch_plan):
+        print(f"\n  >> 正在处理批次 [{s_idx + 1}/{len(batch_plan)}]: {s_dir.name}{range_desc} (含 {len(eps)} 条轨迹)")
         s_data = s_dir / "data/chunk-000"
         s_vid = s_dir / "videos/chunk-000/observation.images.ego_view"
         s_meta = s_dir / "meta"

@@ -184,3 +184,6 @@ paligemma_tokenizer/
 MUJOCO_LOG.TXT
 *.rrd
 unitree-g1-mujoco/
+
+# Video files
+*.mp4

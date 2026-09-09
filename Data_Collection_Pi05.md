@@ -170,19 +170,20 @@ cd ~/lerobot
 > ```
 
 #### 【终端 1】(上位机) 启动 C++ WBC 控制器
-在上位机连接物理直连网卡（如 `enx6c1ff724495a`）：
+在上位机连接物理直连网卡（如 `enx6c1ff724495a`，注意底层是 C++ 原生编译，无需激活 conda 环境）：
 ```bash
 cd ~/SonicStar/wbc/gear_sonic_deploy
-conda activate starVLA
 
 bash deploy.sh --input-type zmq_manager enx6c1ff724495a
 ```
 等待打印 `Init done`，底层控制器进入就绪状态。
 
 #### 【终端 2】(上位机) 启动 PICO 遥操串流服务
+> **注意**：GR00T / GEAR-SONIC 使用独立 uv 虚拟环境，PICO 遥操作需要使用预装了 XRoboToolkit SDK 和 teleop 依赖的 `.venv_teleop` 环境，**不能**使用 `starVLA`。
 ```bash
 cd ~/SonicStar/wbc
-conda activate starVLA
+source ~/GR00T-WholeBodyControl/.venv_teleop/bin/activate
+export PYTHONPATH=$PWD:$PYTHONPATH
 
 python gear_sonic/scripts/pico_manager_thread_server.py --manager
 ```
@@ -190,7 +191,8 @@ python gear_sonic/scripts/pico_manager_thread_server.py --manager
 #### 【终端 3】(上位机) 启动相机监视窗口 (验证图像传输与光照)
 ```bash
 cd ~/SonicStar/wbc
-conda activate starVLA
+source ~/GR00T-WholeBodyControl/.venv_teleop/bin/activate
+export PYTHONPATH=$PWD:$PYTHONPATH
 
 python gear_sonic/scripts/run_camera_viewer.py --camera-host 192.168.123.164 --camera-port 5555
 ```
@@ -198,9 +200,10 @@ python gear_sonic/scripts/run_camera_viewer.py --camera-host 192.168.123.164 --c
 
 #### 【终端 4】(上位机) 启动数据记录器 (Data Exporter)
 ```bash
-# 必须使用专门预装了 datasets 和 lerobot 录制依赖的环境
+# 必须使用专门预装了 datasets 和 lerobot 录制依赖的 .venv_data_collection 环境
 source ~/GR00T-WholeBodyControl/.venv_data_collection/bin/activate
 cd ~/SonicStar/wbc
+export PYTHONPATH=$PWD:$PYTHONPATH
 
 python gear_sonic/scripts/run_data_exporter.py \
     --task-prompt "pick up the box, turn right, and place it on the table" \
@@ -225,12 +228,20 @@ python gear_sonic/scripts/run_data_exporter.py \
 
 遥操人员在控制机器人抱起箱子、转身放置的过程中，通过以下按键控制数据录制：
 
-| 控制设备 | 按键动作 | 功能行为 | 语音反馈 |
-| :--- | :--- | :--- | :--- |
-| **PICO VR 手柄** | **Left Grip + A** | **开始录制 / 结束并保存** 当前 Episode | *"Recording started"* / *"Episode saved"* |
-| **PICO VR 手柄** | **Left Grip + B** | **放弃当前 Episode** (标记为 Discarded，丢弃失误动作) | *"Episode discarded"* |
-| **上位机键盘** | `c` 键 | 切换录制 / 保存 | 同上 |
-| **上位机键盘** | `x` 键 | 放弃当前 Episode | 同上 |
+| 控制设备 | 按键动作 | 功能行为 | 提示音效 (零延迟) | 语音反馈 |
+| :--- | :--- | :--- | :--- | :--- |
+| **PICO VR 手柄** | **Left Grip + A** | **开始录制** (IDLE 状态) | 🎵 清脆上扬音 (`BEEP_START`, 880Hz $\to$ 1320Hz) | *"Recording started"* |
+| **PICO VR 手柄** | **Left Grip + A** | **结束并保存** (录制满 2.0s 后) | 🔔 清脆双音 (`BEEP_SAVE`, 1046Hz + 1318Hz) | *"Finished saving episode"* |
+| **PICO VR 手柄** | **Left Grip + A** | **误触多按 / 抖动拦截** (< 2.0s 内) | ⚠️ 急促双重警告音 (`BEEP_GUARD`, 440Hz 嘟嘟) | *(保持录制，不翻转)* |
+| **PICO VR 手柄** | **Left Grip + B** | **放弃当前 Episode** (丢弃失误动作) | 📉 低沉下落音 (`BEEP_DISCARD`, 587Hz $\to$ 293Hz) | *"Episode discarded"* |
+| **上位机键盘** | `c` 键 | 切换录制 / 保存 (带防抖门禁) | 同上手柄音效 | 同上 |
+| **上位机键盘** | `x` 键 | 放弃当前 Episode | 同上手柄音效 | 同上 |
+
+> [!TIP]
+> **防抖与最短录制保护机制说明**：
+> 默认已开启 `--min-episode-duration 2.0`（最短录制有效时长 2 秒）与 `--debounce-cooldown 1.5`（按键冷却 1.5 秒）。
+> 若手柄误触连按，系统会自动拦截并播放 `BEEP_GUARD` 提示音，**状态绝不翻转，持续保持录制**；只有操作满 2 秒后的正常按键才会触发保存。无需分心看终端！
+
 
 每次录制完毕后，数据会自动累积保存在：
 `~/SonicStar/wbc/outputs/g1_rubberhand_pick_turn/`
@@ -288,7 +299,22 @@ python convert_rubberhand_to_g1_v30.py \
     --task "pick up the box, turn right, and place it on the table"
 ```
 
-*（若想基于 `~/Psi0` 的 36 维标准全身动作头进行训练，可调用 [`~/Psi0/scripts/data/convert_sonic_to_psi36.py`](file:///home/yichangfeng/Psi0/scripts/data/convert_sonic_to_psi36.py) 进行转码）。*
+### 4. 速度指令与统计量对齐（生成新数据集）
+
+由于“原地转身”任务中横移与前进速度恒为 0（`remote.lx=0, remote.ly=0, remote.ry=0`），直接计算会导致 $q_{99}-q_{01}=0$ 塌陷。而底模 `model/box_pick` 依赖 `QUANTILES` 归一化，训练时分母除以极小值 $\text{eps}=10^{-8}$ 会破坏静止动作表征。
+
+运行速度对齐工具 [`align_velocity_dataset.py`](file:///home/yichangfeng/lerobot/align_velocity_dataset.py)，在完整保留原 `g1_box_pick_turn_v30` 的同时，生成对齐后的新数据集 `g1_box_pick_turn_v30_aligned`：
+
+```bash
+cd ~/lerobot
+conda activate lerobot
+python align_velocity_dataset.py \
+    --src-dir ~/lerobot/datasets/g1_box_pick_turn_v30 \
+    --dst-dir ~/lerobot/datasets/g1_box_pick_turn_v30_aligned
+```
+
+* 对齐后，后 4 维分位数范围与 `model/box_pick`（基模预训练集）完全一致；
+* `0.0` 速度被准确映射至预训练模型认知的静止动作空间（如 `ly=0` 映射至约 `-0.244`），彻底避免除零和数值震荡。
 
 ---
 
@@ -297,7 +323,7 @@ python convert_rubberhand_to_g1_v30.py \
 > [!TIP]
 > 完整训练参数表、后台运行指南及部署说明已整理于专属文档：[`Train_Pi05_Guide.md`](file:///home/yichangfeng/lerobot/Train_Pi05_Guide.md)。
 
-转换完成后，加载已有预训练权重作为底模启动轻量微调（微调模式下显存仅占用约 8~9 GB，跳过耗时编译，5秒内启动）：
+使用对齐后的新数据集启动轻量微调（微调模式下显存仅占用约 8~9 GB，跳过耗时编译，5秒内启动）：
 
 ```bash
 cd ~/lerobot
@@ -305,8 +331,8 @@ conda activate lerobot
 export LD_LIBRARY_PATH=/home/yichangfeng/miniforge3/envs/lerobot/lib:$LD_LIBRARY_PATH
 
 python -m lerobot.scripts.lerobot_train \
-    --dataset.repo_id=g1_box_pick_turn_v30 \
-    --dataset.root=datasets/g1_box_pick_turn_v30 \
+    --dataset.repo_id=g1_box_pick_turn_v30_aligned \
+    --dataset.root=datasets/g1_box_pick_turn_v30_aligned \
     --policy.path=model/box_pick \
     --policy.train_expert_only=true \
     --policy.compile_model=false \

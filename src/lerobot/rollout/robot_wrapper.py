@@ -47,6 +47,11 @@ class ThreadSafeRobot:
         with self._lock:
             return self._robot.send_action(action)
 
+    def reset(self, *args, **kwargs) -> Any:
+        with self._lock:
+            if hasattr(self._robot, "reset"):
+                return self._robot.reset(*args, **kwargs)
+
     # -- Read-only proxies (no lock needed) -----------------------------------
 
     @property

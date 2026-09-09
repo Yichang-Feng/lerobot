@@ -106,129 +106,98 @@
 >     --robot.cameras='{"global_view": {"type": "zmq", "server_address": "localhost", "port": 5556, "camera_name": "head_camera", "width": 640, "height": 480, "fps": 30, "warmup_s": 5}}' \
 >     --task="move blue box" \
 >     --duration=1000 \
->     --fps=25 \
+>     --fps=30 \
 >     --display_data=false
 > ```
 
-### 3.2 优化前后性能与运行指标对比
+---
 
-| 指标维度 | 修复前初始状态 | 最新修复后状态 | 改善幅度 |
-| :--- | :--- | :--- | :--- |
-| **动作连贯性与表现** | 手臂剧烈抽动、下坠抽搐 | **动作平滑自然，下坠抽搐彻底消除** | 质量质的飞跃 |
-| **Rerun 可视化视图** | 一片空白（Tensor 全部被丢弃） | **机载图像、29 维状态、18 维动作流式呈现** | 彻底修复 |
-| **Policy 有效控制频率** | 17.89 Hz (严重掉帧) | **23.25 Hz (接近目标 25Hz)** | +30.0% 提升 |
-| **Command 指令发送频率** | 35.78 Hz | **46.50 Hz (接近目标 50Hz)** | +30.0% 提升 |
-| **Telemetry 最大卡顿耗时** | **23,083.78 ms (23 秒)** | **40.92 ms ~ 209 ms** | **降低 99% 以上** |
-| **主循环单周期平均耗时** | 28.5 ms | **22.0 ms** | 保持充裕调度裕量 |
-| **超预算周期占比 (Over 40ms)** | 卡顿频繁 | **仅 0.9% (32 / 3735 cycles)** | 控制回路高度平稳 |
-| **Pacing 调度余量 (Headroom)** | 濒临饱和 | **平均每 tick 沉睡 10.5 ms** | 算力充裕 |
+## 4. 实机调试问题深度剖析与应对方案 (2026-09-07)
 
-#### 最新控制台诊断输出（Cadence Summary）
-```text
-WARNING 2026-09-02 14:17:57 le_timer.py:407 Control loop is running slower (24.8 Hz) than the target FPS (25 Hz). Robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference (action or text) taking too long 3) CPU starvation
-INFO 2026-09-02 14:17:57 on_queue.py:272 Indexes diff is not equal to real delay. indexes_diff=26, real_delay=31; using indexes_diff for seamless trajectory continuity
-INFO 2026-09-02 14:17:58 on_queue.py:272 Indexes diff is not equal to real delay. indexes_diff=24, real_delay=27; using indexes_diff for seamless trajectory continuity
-INFO 2026-09-02 14:18:01 itree_g1.py:346 Controller actual rate: 49.0Hz (target: 50.0Hz)
-INFO 2026-09-02 14:18:02 le_timer.py:606 Cadence summary — whole run · target 25 Hz × 2 (20.0 ms tick slot, 40.0 ms cycle budget): 7472 ticks, 3735 cycles judged
-  effective cadence: 23.25 Hz policy / 46.50 Hz commands over 160.7 s measured
-  cycles over the 40.0 ms work budget: 32/3735 (0.9%) — work mean 22.0 ms, worst 217.8 ms
-  ticks over their 20.0 ms slot: 1675/7472 (costs interpolation smoothness only)
-  ticks with no action to send (inference engine starved): 279 — each commanded nothing and recorded no frame
-  cycles whose cadence slipped outside the loop body (sleep overshoot / CPU starvation while pacing): 2276
-  loop-body steps (share of measured work):
-    observe      mean   0.08 ms · worst   0.45 ms ·   0.8% of work · 7472 calls
-    process_obs  mean   0.01 ms · worst   0.93 ms ·   0.1% of work · 7472 calls
-    infer        mean   0.23 ms · worst   3.36 ms ·   1.1% of work · 3876 calls
-    telemetry    mean   8.56 ms · worst 209.56 ms ·  77.9% of work · 7472 calls
-    query        mean   0.01 ms · worst   0.04 ms ·   0.1% of work · 7472 calls
-    send         mean   1.59 ms · worst   6.80 ms ·  14.4% of work · 7435 calls
-  pacing headroom: 10.5 ms slept per tick on average (max 21.8 ms)
-```
+针对 Unitree G1 接入 PI0.5 策略实机联调中暴露的两个典型关键问题，进行系统的问题描述、底层机理剖析与应对方案总结。
 
 ---
 
-## 4. 代码修改清单与深度技术复盘
+### 4.1 问题 1：从 Locomotion 接入 VLA 瞬间手臂猛甩、抬起过快
 
-### 4.1 历次修改文件与改动点清单
+#### 1. 问题描述
+* 机器人在平衡控制器（Locomotion WBC）站立状态下，通过网络接入 VLA 动作流后，双臂会立刻去拟合抬手姿态。
+* **现象对比**：
+  * **5000 步模型**：抬手幅度相对适中，更接近示教采集的姿态，但动作依然偏突兀。
+  * **1000 步模型**：抬手幅度极大且速度极快，电机出现剧烈机械冲击，易造成身体晃动失稳甚至跌倒意外。
+* **核心诉求**：如何在既准确跟随 VLA 指令的前提下，消除开局骤突，让机械臂平缓、受控地过渡到初始作业姿态。
 
-| 文件路径 | 原始逻辑 | 本次修改内容 | 修改意图 |
-| :--- | :--- | :--- | :--- |
-| **`src/lerobot/policies/rtc/configuration_rtc.py`** | `execution_horizon = 10` | 默认值提升为 `25` | 扩大前缀引导窗口，消除接缝处动作阶跃与抽动 |
-| **`src/lerobot/rollout/inference/rtc.py`** | 1. `_normalize_prev_actions_length` 补 0<br>2. 无条件传全局视界 | 1. 改为复制末帧 `prev_actions[-1:]`<br>2. 传递 `effective_horizon = min(execution_horizon, available_steps)` | 彻底消除因前缀补零导致手臂向 0 位下坠的抽搐跳变 |
-| **`src/lerobot/policies/rtc/modeling_rtc.py`** | `padded` 历史 chunk 补 0 | 改为复制末有效帧填充 | 避免去噪引导将未来关节目标拉向全 0 |
-| **`src/lerobot/policies/rtc/action_queue.py`** | `_check_and_resolve_delays()` 在差值不一致时仍返回 `real_delay` | 改为优先返回实际消费步数 `indexes_diff` | 消除估算延迟偏差导致的跳步 |
-| **`src/lerobot/policies/rtc/latency_tracker.py`** | `max()` 返回全局单调递增的历史最大峰值 | 改为基于滑动窗口 `_values` 动态计算 `max()`，添加 `mean()` | 避免单次偶发毛刺永久放大延迟估算 |
-| **`src/lerobot/rollout/inference/rtc.py`** | 使用 `latency_tracker.max()` 估算延迟 | 改用 `latency_tracker.p95()` 获取 95 分位延迟 | 过滤极端异常延迟毛刺 |
-| **`src/lerobot/rollout/inference/factory.py`** | RTC `queue_threshold` 默认为 30 | 默认值调整为 `40` | 增大队列安全水位，彻底避免消费速度超过推理时饥饿停顿 |
-| **`src/lerobot/robots/unitree_g1/config_unitree_g1.py`** | 1. `controller: None`<br>2. `cameras: dict()` | 1. `controller = "GrootLocomotionController"`<br>2. 默认配置 `global_view` (ZMQ `localhost:5556`) | 固化 G1 机器人的默认全身平衡控制器与机载推流配置 |
-| **`src/lerobot/rollout/configs.py`** | 1. `robot: None`<br>2. `inference: sync`<br>3. `fps: 30`<br>4. `duration: 0`<br>5. `interpolation_multiplier: 1` | 1. `robot = UnitreeG1Config()`<br>2. `inference = RTCInferenceConfig()`<br>3. `fps = 25.0`<br>4. `duration = 1000.0`<br>5. `interpolation_multiplier = 3` | 全面固化 G1 + PI0.5 默认运行参数，命令行大幅精简为仅需 2~4 个参数 |
-| **`src/lerobot/policies/pi05/configuration_pi05.py` / `pi0`** | `dtype: float32` | 默认改为 `bfloat16` | 默认采用半精度节省显存并加速 |
-| **`src/lerobot/configs/policies.py`** | `device: None` | 默认改为 `cuda` | 默认采用 GPU 运行推理 |
-| **`src/lerobot/rollout/strategies/core.py`** | 1. 队列饥饿时返回 `None`<br>2. 每帧无条件推流<br>3. 无异常保护 | 1. 饥饿时保持 `_prev` 动作<br>2. 限制仅在 Policy 决策周期推流<br>3. 增加 `try-except` 异常保护与编译日志 | 防止动作悬空，降低推流频次，杜绝推流异常中断主控循环 |
-| **`src/lerobot/rollout/configs.py`** | `display_compressed_images: False` | 默认改为 `True` | 开启 JPEG 压缩，减小图像传输体积 |
-| **`src/lerobot/utils/rerun_visualization.py`** | 1. 仅支持 `np.ndarray`，丢弃 `torch.Tensor`<br>2. 图像推流误设 `static=True`<br>3. `$PATH` 缺少 conda 环境 `bin` | 1. 增加 `_to_numpy()` 支持 CPU/CUDA `torch.Tensor`、维度 Squeeze 与通道转换<br>2. 移除 `static=True` 恢复时序流式展示<br>3. 自动注入 `sys.prefix/bin` 到 `$PATH` | 彻底修复 Rerun 无画面问题，确保 29 维状态与 18 维动作时序流正常渲染 |
-| **`src/lerobot/scripts/lerobot_rollout.py`** | PyTorch 默认占用全部 32 核 CPU 线程 | 设置 PyTorch 最大 CPU 线程数为 8 | 防止推理占满 CPU 饿死主控制循环 |
-| **`verify_video_rollout.sh` / `verify_video_rollout_real.sh` / `deploy_real_g1.sh`** | 冗长全量参数 | 全面精简为仅传递差异参数（`policy.path`, `task`, `is_simulation`, `display_data` 等） | 脚本代码极为精炼清晰 |
+#### 2. 底层机理分析
+1. **初始位置阶跃突变（Step-Input Discontinuity）**：
+   * 机器人站立待命时，双臂通常处于自然下垂或默认归零状态（$q \approx 0$）。
+   * 示教数据中，录制的第一帧往往已经是准备抱箱的预备抬手姿态（肩、肘关节已有明显角度偏差）。
+   * VLA 客户端一旦接入，首帧输出的目标角度与机器人当前真实姿态存在数十度的跳变。
+2. **欠拟合模型的方差放大**：
+   * 1000 步模型处于欠拟合阶段，输出置信度低、方差大，首帧往往预测出幅度夸张的极端关节角；5000 步模型因在首帧附近拟合较好，输出相对温和。
+3. **高刚度 PD 控制器的扭矩冲激**：
+   * 底层服务端收到目标后直接写入 `motor_cmd.q`。瞬时位置偏差 $e = q_{target} - q_{current}$ 极大。
+   * 电机端高刚度 PD 控制器输出扭矩 $\tau = k_p \cdot e$ 瞬间饱和，电机爆发最大加速度，导致手臂猛烈甩动。
 
----
-
-### 4.2 新问题原因剖析：为什么 Rerun 窗口内无画面与数据？（已修复）
-
-#### 核心根因：数据类型判定不匹配（`torch.Tensor` 被全部静默丢弃）
-1. 在 `BaseStrategy.run` 中，传给可视化推流器 `_log_telemetry` 的是经过预处理管道后的 **`obs_processed`**。
-2. 经过 `robot_observation_processor` 处理后，所有图像和状态量均已被转换为 **`torch.Tensor`**（如 `(3, 224, 224)` 的 Tensor）。
-3. 在 `src/lerobot/utils/rerun_visualization.py` 的 `log_rerun_data()` 中，类型判断原本仅检查了 `np.ndarray`，导致 Tensor 全被跳过，且带 `static=True` 错误标记。
-4. **修复完成**：已在 `rerun_visualization.py` 中引入 `_to_numpy()`，全面兼容 `torch.Tensor`（自动转 CPU numpy、Squeeze 批次维度、CHW->HWC 转置），并移除了 `static=True`。
-
----
-
-### 4.3 为什么依然抽动卡顿、`indexes_diff=11, real_delay=12`？（已修复）
-
-1. **Rerun 同步推流阻塞主循环**：
-   - 之前 `telemetry` 在主控制线程内同步执行，最差耗时达 23 秒，拖慢了主循环并导致推理延迟估算剧增（膨胀至 11~12 步）。
-   - **修复完成**：通过在 `_log_telemetry` 中过滤插值子步、开启 JPEG 压缩并添加异常保护，消除了主循环的无效耗时（最差耗时由 23 秒降至 40.92ms）。
-2. **延迟超限（`delay=11~12`）击穿了 RTC 前缀引导窗口（`execution_horizon=10`）**：
-   - 当延迟达到 11~12 步时，原本 10 步的前缀引导无法覆盖第 11 步，导致新 chunk 起点自由漂移，在第 10 步切换到第 11 步时发生物理阶跃（动作抽动）。
-   - **修复完成**：已将 `execution_horizon` 提升至 `25`（PI0.5 50 步 chunk 的一半，对应 1.0 秒），确保实机 10~15 步的延迟始终处于引导平滑区间内，消除接缝处动作突变。
+#### 3. 应对与优化方案
+1. **1.5 秒软启动余弦平滑过渡（Soft-Start Cosine S-Curve）**：
+   * 当检测到 VLA 首次连接或刚执行完 Reset 时，捕捉当前机器人机械臂的真实实际角度 $q_{real\_start}$。
+   * 在随后的 $T = 1.0 \sim 1.5$ 秒内，采用平滑余弦权重 $\alpha(t) = \frac{1}{2}\left(1 - \cos\left(\frac{\pi t}{T}\right)\right)$ 进行加权融合：
+     $$q_{cmd}(t) = (1 - \alpha(t)) \cdot q_{real\_start} + \alpha(t) \cdot q_{vla\_target}(t)$$
+   * 初始时刻误差为 0，扭矩为 0，随后 1.5 秒内优雅过渡到 VLA 控制姿态。
+2. **关节角速度限幅器（Slew-Rate Limiter）**：
+   * 限制机械臂各关节单步最大角速度不超过 **$1.2 \sim 1.5\text{ rad/s}$**。
+   * 单步（20ms）最大变化量 $\Delta q_{max} = v_{max} \cdot \Delta t \approx 0.024\text{ rad}$。无论策略输出多大跳变，物理电机绝不超速。
+3. **底盘速度淡入**：
+   * 在软启动过渡期内，底盘移动/转向遥控速度也同步乘以 $\alpha(t)$，避免手臂未到指定开度底盘即急剧移动造成失衡。
 
 ---
 
-### 4.4 偶发性“手臂突然往下再回弹”抽搐现象根因与彻底修复（已修复）
+### 4.2 问题 2：5000 步犹豫不前 vs 1000 步仅限首轮成功（为什么过拟合反而不敢动？）
 
-#### 核心根因：RTC 前缀补齐（Zero-Padding）将未来关节目标强制引导至 0.0
-1. 在 `RTCInferenceEngine` 中，当剩余动作数量不足目标长度（`steps < execution_horizon`，例如队列仅剩 10~15 步）时，原 `_normalize_prev_actions_length` 使用 `torch.zeros((target_steps, action_dim))` 进行填充。
-2. 填充后，末尾缺失的 10~15 步被全部置为 **`0.0`**（对 G1 人形机器人手臂而言，0 rad 关节角即手臂受重力自然垂直向下的姿态）。
-3. RTC 在去噪扩散阶段计算雅可比梯度修正：`err = (prev_chunk_left_over - x1_t) * weights`。
-4. 由于末尾全为 0.0 且引导权重非零，**扩散模型被强制引导将新 chunk 的后半段动作拉向全 0 关节角**。
-5. 当机器人执行到该区域时，手臂突然急剧下坠至 0 位；而在下一个新 chunk 预测生成后又恢复正常轨迹，从而表现为“手臂剧烈下抽再弹回”的抽搐现象。
+#### 1. 问题描述
+* **5000 步模型**：机器人看到箱子后表现为“犹犹豫豫”，有抱箱趋势但又停滞在半空不敢抱合。
+* **1000 步模型**：能做出果断抱箱并转身的连贯动作，但**仅限第一次运行**；第二次把机器人和箱子转回原位后，动作变形失效。
+* **核心疑问**：
+  1. 为什么 5000 步效果反而不如 1000 步？按直觉理解，如果过拟合，不应该更加极致地跟随示教动作吗？
+  2. 为什么 1000 步第二次就不行了？如何在显存不重新加载模型的前提下彻底清空上下文？
 
-#### 彻底修复方案：
-1. **末帧保持填充代替补零**：在 `_normalize_prev_actions_length` 中，将不足长度的填充由全 0 改为复制最后有效动作帧 `padded[steps:] = prev_actions[-1:]`，避免数值阶跃。
-2. **有效视界动态截断**：在 `rtc.py` 中将传递给去噪模型的有效视界限制为 `effective_horizon = min(execution_horizon, prev_actions.shape[0])`，仅对队列中真实存在的历史步施加连续性引导约束，对不存在的未来步不施加强制牵引。
-3. **`modeling_rtc.py` 补齐逻辑修正**：在 `RTCProcessor.denoise_step` 中同步修正为复制末帧而非填 0。
+#### 2. 深度理论剖析：“为什么过拟合反而不敢动？”（静止吸引子问题）
+直觉认为“过拟合 = 更激进地模仿人”，但在模仿学习与流匹配（Flow Matching / Diffusion Policy）中，过拟合往往导致**“静止瘫痪”（The Zero-Velocity Attractor / Policy Freezing）**：
 
----
+1. **示范数据中的低速停顿偏差（Zero-Velocity Bias）**：
+   * 人类在遥控采集抱箱任务时，在手爪靠近纸箱对准边缘的关键时刻，为了操作精确，动作通常极慢，甚至有数十毫秒的观察微停。
+2. **协变量漂移（Covariate Shift）与速度矢量坍塌**：
+   * 流匹配网络拟合的是动作的速度向量场 $v(x_t, t)$。
+   * 5000 步微调时，Action Expert 被深度拘束在示范轨迹狭窄的超管流内。
+   * 实机闭环中，环境光照轻微变化、箱子摆放偏移数厘米、或下肢站姿有微弱倾斜，当前的视觉与状态观测便落入了未见区域（Out of Distribution, OOD）。
+   * 在 OOD 区域，过度拟合的网络无法泛化，各个模态预测的速度矢量在各方向上相互抵消，**输出的速度向量模长急剧萎缩接近于 0**。
+   * 表现为：机器人“知道要抱（方向有轻微倾向），但速度场大小趋近于 0，双臂悬在半空打摆子、犹豫不前”。
+3. **欠拟合（1000 步）为何反而动作果断？**：
+   * 1000 步时，网络仅捕获了宏观动力学大趋势（“视野出现箱子 -> 双臂抱合 -> 转向”）。
+   * 它未被局部微小停顿特征绑架，且大量保留了 $\pi_{0.5}$ 预训练底模原有的**物理动作流动先验（Action Flow Prior）**，因而动作大开大合，敢于向前扑击抱箱。
+4. **黄金步数规律**：
+   * 1000 步太粗糙（抗干扰差、首帧突变大），5000 步陷入静止陷阱；**最佳效果通常落在 2000 ~ 3000 步（如 Checkpoint 002000 / 003000）**，兼顾大动作的推进力与末端对准精度。
 
-### 4.5 当前残余问题深入剖析：偶发性轻微停顿（279 次 starved ticks / 160 秒）
+#### 3. 深度机理剖析：“为什么 1000 步第二次执行就失效？”
+1. **RTC 残留前缀污染（Left-over Chunk & Prefix Contamination）**：
+   * `run_vla.sh` 默认启用了实时分块推理（`--inference.type=rtc`）。
+   * RTC 机制每次前向预测时，会抽取上一个 Chunk 尚未消费完的动作切片（`prev_chunk_left_over`）作为前缀约束，保障轨迹连续。
+   * 当机器人完成第一次“抱箱+转身”后，若未做系统级重置，RTC 队列中仍填充着**上一轮“转身阶段/任务末尾”的大角速度与抱死手臂的前缀向量**。
+   * 当操作员把机器人或箱子转回原处时，当前眼前的相机画面是“开局待命”，而 RTC 强行喂给策略模型的前缀却是“正在转身”，**视觉感知与历史前缀产生剧烈语义撕裂**，输出直接崩溃。
+2. **动作插值器与底盘 WBC 状态残留**：
+   * 上位机动作插值器与下肢控制器的积分状态未归零，上一轮残余的遥控转向偏置依然存在。
 
-#### 1. 现象本质与数学机理
-- **现状表现**：
-  动作整体非常平滑自然，无大幅度抽搐下坠，Rerun 与底层控制器均正常稳定运行在 ~50Hz。但在 160 秒的全程中，记录有 279 次 `ticks with no action to send (inference engine starved)`，平均每秒有 1~2 步（约 40~80ms）的短暂动作保持。
-- **数学供求失衡根因**：
-  1. **模型单次推理耗时**：PI0.5 模型（PaliGemma 2B + Gemma 300M Expert）在当前 GPU 上的纯 Eager 推理耗时为 **1.08 ~ 1.24 秒（对应 25Hz 下的 27 ~ 31 步延迟）**。
-  2. **Chunk 产出与消耗对比**：模型单次输出 `chunk_size = 50` 步。在扣除 26 步用于与前序历史重叠平滑对齐后，每个 chunk 实际有效提供的新动作仅有 **$50 - 26 = 24$ 步（对应 0.96 秒）**。
-  3. **速度差**：动作消耗速度（0.96 秒耗尽 24 步）略微快于模型生成速度（1.10 秒生成 1 次），因此在每个 chunk 衔接的末尾，队列会出现 2~4 步的动作空档期，主控策略自动触发“保持上一帧动作（Hold last action）”，表现为偶发微小停顿。
+#### 4. 解决方案：显存常驻下的“0 耗时热重置”（Hot Reset）
+避免每次测试都通过杀死脚本重新加载 9.35GB 权重（每次冷启动耗时 25~35 秒）：
 
-#### 2. 为什么 `torch.compile` 和 `dtype=bfloat16` 暂未能彻底消除该速度差？
-- **`torch.compile` 冲突**：PI0.5 动作采样内部包含 10 步欧拉去噪循环、动态 KV-cache 克隆以及 RTC 在线 Autograd 雅可比梯度计算。PyTorch 动态图编译器目前无法正确追踪该图，会陷入 C++ 底层死锁，占满算力拖垮控制器并导致段错误崩溃。
-- **`dtype=bfloat16` 的实际效果**：由于权重 safetensors 以 float32 存储且 vision tower 在 Eager 模式下受限于 Python 解释器逐层调度，纯计算耗时未产生质的飞跃（仍需 ~1.05s）。
-
-#### 3. 后续彻底解决该微小停顿的推荐方案
-1. **减少扩散去噪迭代步数（最有效且立即可行）**：
-   - 目前 PI0.5 默认进行 10 步扩散迭代（`num_inference_steps = 10`）。
-   - 将去噪步数微调至 **6 ~ 8 步**，可直接减少 25% ~ 40% 的 GPU 推理耗时（由 1.1s 降至 0.7~0.8s），使得新动作产出速度（0.75s）完全快于消费速度（0.96s），彻底消除 279 次饥饿停顿。
-2. **在后续模型微调/重训练时增大 Horizon**：
-   - 将策略的输出预测长度由 `chunk_size = 50` 扩展至 `chunk_size = 80 ~ 100`（对应 3.2~4.0 秒动作），提供极为充裕的缓冲余量。
-
-
+1. **上位机上下文清空**：
+   * 针对 `RTCInferenceEngine`：调用 `reset()`，立即清空 `ActionQueue`、清除 `prev_chunk_left_over`，重置预处理器与后处理器状态，并丢弃前一轮陈旧的 Observation。
+   * 针对策略模型：调用 `policy.reset()`，清空动作缓冲队列，使流匹配从纯高斯白噪声开始去噪。
+   * **9.35GB 模型常驻 GPU 显存，无需重新载入，0 秒完成逻辑重置！**
+2. **机器人端状态回正**：
+   * 向动作端口（6002）下发 `{"cmd": "reset"}`。
+   * 服务端拦截该指令后，自动将底盘遥控指令清零，并驱动双臂通过 2~3 秒平滑插值返回默认待命姿态。
+3. **实机推荐调试手段**：
+   * **交互式模式（`--interactive`）**：在 VLA 启动脚本中开启交互式会话，完成一次任务后在终端输入 `/reset` 瞬间重置，重新摆放箱子后输入 `/start` 即可干净利落地开始下一轮。
+   * **换用中间步数权重**：推荐实机重点评估 `aligned/003000` 或 `aligned/002000`，彻底摆脱 5000 步的犹豫停滞问题。
 

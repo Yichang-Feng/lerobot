@@ -28,8 +28,8 @@ DISPLAY_DATA=false                             # 是否开启 Rerun 实时数据
 
 # 3. 异步推理与控制队列参数 (RTC 调优)
 QUEUE_THRESHOLD=35                             # RTC 队列触发阈值 (推荐 35~40)
-INTERPOLATION_MULTIPLIER=3                     # 指令插值倍率 (25Hz * 3 = 75Hz 指令流)
-FPS=25                                         # Policy 决策帧率 (Hz)
+INTERPOLATION_MULTIPLIER=3                     # 指令插值倍率 (30Hz * 3 = 90Hz 指令流)
+FPS=30                                         # Policy 决策帧率 (Hz)
 DURATION=1000                                  # 运行最长时间 (秒)
 
 # 4. 机器人与平衡控制器

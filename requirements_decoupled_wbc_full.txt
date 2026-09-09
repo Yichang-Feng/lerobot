@@ -1,0 +1,37 @@
+# Official full dependencies extracted from decoupled_wbc/pyproject.toml [project.optional-dependencies.full]
+numpy==1.26.4
+scipy>=1.13.0
+torch
+av>=14.2
+pyttsx3==2.90
+matplotlib
+hydra-core
+click
+gymnasium
+mujoco
+termcolor
+flask
+python-socketio>=5.13.0
+flask_socketio
+loguru
+meshcat
+meshcat-shapes
+onnxruntime
+rerun-sdk==0.21.0
+pygame
+sshkeyboard
+msgpack
+msgpack-numpy
+pyzmq
+PyQt6
+pin
+pin-pink
+pyrealsense2
+qpsolvers[osqp,quadprog]
+tyro
+lark
+datasets==3.6.0
+pandas
+evdev
+pyyaml
+lerobot @ git+https://github.com/huggingface/lerobot.git@a445d9c9da6bea99a8972daa4fe1fdd053d711d2

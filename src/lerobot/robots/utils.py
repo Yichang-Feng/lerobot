@@ -82,6 +82,10 @@ def make_robot_from_config(config: RobotConfig) -> Robot:
         from tests.mocks.mock_robot import MockRobot
 
         return MockRobot(config)
+    elif config.type == "unitree_g1_client":
+        from .unitree_g1.unitree_g1_client import UnitreeG1Client
+
+        return UnitreeG1Client(config)
     else:
         try:
             return cast(Robot, make_device_from_device_class(config))

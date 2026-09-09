@@ -16,5 +16,6 @@
 
 from .config_unitree_g1 import UnitreeG1Config
 from .unitree_g1 import UnitreeG1
+from .unitree_g1_client import UnitreeG1Client, UnitreeG1ClientConfig
 
-__all__ = ["UnitreeG1", "UnitreeG1Config"]
+__all__ = ["UnitreeG1", "UnitreeG1Config", "UnitreeG1Client", "UnitreeG1ClientConfig"]

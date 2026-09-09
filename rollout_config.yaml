@@ -37,8 +37,8 @@ robot:
       server_address: "localhost"
       port: 5556
       camera_name: "head_camera"
-      width: 640
-      height: 480
+      width: 1280
+      height: 720
       fps: 30
       warmup_s: 5
 
@@ -52,7 +52,7 @@ inference:
 # ------------------------------------------------------------------------------
 # 5. 动作调度与频率参数
 # ------------------------------------------------------------------------------
-fps: 25.0
+fps: 30.0
 duration: 1000.0
 interpolation_multiplier: 3
 

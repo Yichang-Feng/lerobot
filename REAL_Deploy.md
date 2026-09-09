@@ -210,11 +210,11 @@ ping -c 3 192.168.123.164
 | *--strategy.type* | *base* | *base* | 默认值：`base` |
 | *--inference.type* | *rtc* | *rtc* | 默认值：`rtc`（Real-Time Chunking 异步推理） |
 | *--inference.queue_threshold* | *40* | *40* | 默认值：`40` |
-| *--interpolation_multiplier* | *3* | *3* | 默认值：`3`（底层 75Hz/50Hz 高频平滑插值） |
+| *--interpolation_multiplier* | *3* | *3* | 默认值：`3`（底层 90Hz/50Hz 高频平滑插值） |
 | *--policy.device* / *dtype* | *cuda* / *bfloat16* | *cuda* / *bfloat16* | 默认值：`cuda` + `bfloat16` |
 | *--robot.type* | *unitree_g1* | *unitree_g1* | 默认值：`unitree_g1` |
 | *--robot.controller* | *GrootLocomotionController* | *GrootLocomotionController* | 默认值：`GrootLocomotionController` (50Hz 全身平衡) |
-| *--fps* / *--duration* | *25* / *1000* | *25* / *1000* | 默认值：`25` FPS，`1000` 秒 |
+| *--fps* / *--duration* | *30* / *1000* | *30* / *1000* | 默认值：`30` FPS，`1000` 秒 |
 
 ---
 

@@ -52,8 +52,8 @@ def _default_unitree_g1_cameras() -> dict[str, CameraConfig]:
             server_address="localhost",
             port=5556,
             camera_name="head_camera",
-            width=640,
-            height=480,
+            width=1280,
+            height=720,
             fps=30,
             warmup_s=5,
         )
@@ -99,5 +99,8 @@ class UnitreeG1Config(RobotConfig):
 
     # Enable interactive keyboard listener in terminal for dynamic stand/walk switching ('s' / 'w' / 'space')
     enable_keyboard_locomotion_toggle: bool = True
+
+    # Connection timeout in seconds waiting for initial lowstate
+    connect_timeout: float = 60.0
 
 

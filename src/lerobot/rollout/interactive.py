@@ -85,20 +85,43 @@ def _strip_quotes(text: str) -> str:
     return text
 
 
+COMMAND_ALIASES: dict[str, str] = {
+    "r": "reset",
+    "s": "start",
+    "q": "stop",
+    "h": "help",
+}
+
+
 def parse_command(line: str) -> InteractiveCommand | None:
     """Parse an input line into an :class:`InteractiveCommand`.
 
-    Commands are ``/name`` optionally followed by free-text arguments.  Returns ``None`` for lines
-    that are not commands (no leading ``/`` or a bare ``/``).
+    Commands are ``/name`` (or single-character shortcuts ``/s``, ``/r``, ``/q``, ``/h``,
+    and bare ``s``, ``r``, ``q``, ``h``) optionally followed by free-text arguments.
+    Returns ``None`` for lines that are not commands.
     """
     line = line.strip()
-    if not line.startswith("/"):
+    if not line:
         return None
-    head, *rest = line.split(maxsplit=1)
-    name = head[1:].lower()
-    if not name:
-        return None
-    return InteractiveCommand(name=name, args=rest[0].strip() if rest else "")
+
+    if line.startswith("/"):
+        parts = line[1:].split(maxsplit=1)
+        if not parts or not parts[0]:
+            return None
+        head = parts[0]
+        args = parts[1].strip() if len(parts) > 1 else ""
+    else:
+        # Check single-character shortcuts without slash
+        parts = line.split(maxsplit=1)
+        if parts[0].lower() in COMMAND_ALIASES:
+            head = parts[0]
+            args = parts[1].strip() if len(parts) > 1 else ""
+        else:
+            return None
+
+    name = head.lower()
+    name = COMMAND_ALIASES.get(name, name)
+    return InteractiveCommand(name=name, args=args)
 
 
 class InteractiveSession:
@@ -127,7 +150,7 @@ class InteractiveSession:
 
         # name -> (handler, argument hint, help line); /help and the banner render from this table.
         self._commands: dict[str, tuple[Callable[[InteractiveCommand], None], str, str]] = {
-            "start": (self._cmd_start, "", "start (or restart) the policy control loop"),
+            "start": (self._cmd_start, "", "start (or restart) the policy control loop (shortcut: /s, s)"),
             "subtask": (self._cmd_subtask, " <text>", "set the instruction the policy follows"),
             "vqa": (self._cmd_vqa, " <text>", "ask the policy a question about what it sees"),
             "autosteer": (
@@ -135,9 +158,9 @@ class InteractiveSession:
                 " <goal>|off",
                 "let the policy pick its own subtasks toward a high-level goal",
             ),
-            "reset": (self._cmd_reset, "", "stop movement, return to initial position, restore the task"),
-            "stop": (self._cmd_stop, "", "end the session and shut down"),
-            "help": (self._cmd_help, "", "show this help"),
+            "reset": (self._cmd_reset, "", "stop movement, return to initial position, reset VLA context (shortcut: /r, r)"),
+            "stop": (self._cmd_stop, "", "end the session and shut down (shortcut: /q, q)"),
+            "help": (self._cmd_help, "", "show this help (shortcut: /h, h)"),
         }
 
     @contextlib.contextmanager
@@ -353,7 +376,7 @@ class InteractiveSession:
     def _render_banner(self) -> str:
         return (
             f"{_BANNER_RULE}\n"
-            "Interactive rollout session — the robot will NOT move until you type /start.\n"
+            "Interactive rollout session — the robot will NOT move until you type /start (or /s).\n"
             f"Task: {_format_task(self.controller.initial_task)}\n"
             f"{self._render_help()}\n"
             "Routine system logs and warnings are muted during the session (errors and the "

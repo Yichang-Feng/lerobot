@@ -131,7 +131,7 @@ class GrootLocomotionController(RobotController):
         self.groot_action[:] = 0.0
         self.groot_obs_single[:] = 0.0
         self.groot_obs_stacked[:] = 0.0
-        self.groot_height_cmd = 0.74
+        self.groot_height_cmd = 0.74  # Default base height
         self.groot_orientation_cmd[:] = 0.0
         self.groot_obs_history.clear()
         for _ in range(6):
