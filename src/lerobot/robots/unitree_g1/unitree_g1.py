@@ -769,9 +769,6 @@ class UnitreeG1(Robot):
                     {f"{motor.name}.q": float(default_positions[motor.value]) for motor in G1_29_JointIndex}
                 )
             else:
-                total_time = 3.0
-                num_steps = int(total_time / control_dt)
-
                 # get current state
                 obs = self.get_observation()
 
@@ -779,6 +776,12 @@ class UnitreeG1(Robot):
                 init_dof_pos = np.zeros(NUM_MOTORS, dtype=np.float32)
                 for motor in G1_29_JointIndex:
                     init_dof_pos[motor.value] = obs[f"{motor.name}.q"]
+
+                # If already virtually homed (e.g. client return_to_initial_position already interpolated),
+                # do not redundantly block for 3.0s which causes packet drops on the server.
+                max_diff = float(np.max(np.abs(init_dof_pos - default_positions)))
+                total_time = 0.2 if max_diff < 0.08 else 3.0
+                num_steps = max(int(total_time / control_dt), 1)
 
                 # Interpolate to default position
                 for step in range(num_steps):

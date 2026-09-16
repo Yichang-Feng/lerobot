@@ -182,7 +182,7 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         revision: str | None = None,
         **policy_kwargs: Any,
     ) -> T:
-        model_id = str(pretrained_name_or_path)
+        model_id = str(Path(pretrained_name_or_path).expanduser())
         config_file: str | None = None
         if Path(model_id).is_dir():
             if CONFIG_NAME in os.listdir(model_id):
@@ -221,11 +221,18 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
             raise ValueError(f"Missing 'type' field in {CONFIG_NAME} of {model_id}")
         try:
             config_cls = cls.get_choice_class(policy_type)
-        except Exception as e:
-            raise ValueError(
-                f"Policy type '{policy_type}' (from {CONFIG_NAME} of {model_id}) is not registered. "
-                f"Available policy types: {cls.get_known_choices()}"
-            ) from e
+        except Exception:
+            # Policy subclasses might not be imported yet if only lerobot.configs was imported
+            import importlib
+
+            importlib.import_module("lerobot.policies")
+            try:
+                config_cls = cls.get_choice_class(policy_type)
+            except Exception as e:
+                raise ValueError(
+                    f"Policy type '{policy_type}' (from {CONFIG_NAME} of {model_id}) is not registered. "
+                    f"Available policy types: {cls.get_known_choices()}"
+                ) from e
 
         with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
             json.dump(config, f)

@@ -175,7 +175,7 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                 revision=revision,
                 **kwargs,
             )
-        model_id = str(pretrained_name_or_path)
+        model_id = str(Path(pretrained_name_or_path).expanduser())
         instance = cls(config, **kwargs)
         if os.path.isdir(model_id):
             print("Loading weights from local directory")

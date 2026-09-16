@@ -19,6 +19,7 @@ from __future__ import annotations
 import abc
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import ClassVar
 
 import draccus
@@ -278,6 +279,8 @@ class RolloutConfig:
     # Use vocal synthesis to read events
     play_sounds: bool = True
     resume: bool = False
+    # 3-Subtask automatic sequencing mode (clamp & lift -> turn right -> place on table)
+    subtasks: bool = False
     # Rename map for mapping robot/dataset observation keys to policy keys
     rename_map: dict[str, str] = field(default_factory=dict)
 
@@ -293,8 +296,16 @@ class RolloutConfig:
     torch_compile_mode: str = "default"
     compile_warmup_inferences: int = 2
 
+    # Deployment diagnostics recording (video.mp4, actions.npy, states.npy, tokens.npy)
+    record: bool = False
+    record_diagnostics: bool = False
+    diagnostics_dir: str | None = None
+
     def __post_init__(self):
         """Validate config invariants and load the policy config from ``--policy.path``."""
+        if self.record:
+            self.record_diagnostics = True
+
         if self.interpolation_multiplier < 1:
             raise ValueError(f"interpolation_multiplier must be >= 1, got {self.interpolation_multiplier}")
 
@@ -386,6 +397,7 @@ class RolloutConfig:
 
         policy_path = parser.get_path_arg("policy")
         if policy_path:
+            policy_path = str(Path(policy_path).expanduser())
             yaml_overrides = parser.get_yaml_overrides("policy")
             cli_overrides = parser.get_cli_overrides("policy") or []
             policy_overrides = yaml_overrides + cli_overrides

@@ -247,10 +247,10 @@ class UnitreeG1Client(Robot):
 
         old_ip = self.config.robot_ip
         self.config.robot_ip = clean_ip
-        if self.config.action_ip == old_ip or not self.config.action_ip:
+        if self.config.action_ip in (old_ip, "localhost", "127.0.0.1", "") or not self.config.action_ip:
             self.config.action_ip = clean_ip
 
-        if self.config.camera_ip in (old_ip, "localhost", "127.0.0.1") or not self.config.camera_ip:
+        if self.config.camera_ip in (old_ip, "localhost", "127.0.0.1", "") or not self.config.camera_ip:
             self.config.camera_ip = clean_ip
             for cam in self._cameras.values():
                 if hasattr(cam, "server_address"):
@@ -263,6 +263,7 @@ class UnitreeG1Client(Robot):
 
         # Re-initialize sockets with new IP
         self._init_sockets()
+        self._try_connect_cameras()
         logger.info(
             "🔄 [UnitreeG1Client] 目标 IP 已热切换为: %s (State: %d, Action: %d, Camera: %d)",
             clean_ip,
@@ -274,7 +275,7 @@ class UnitreeG1Client(Robot):
     def _check_stdin(self, timeout: float = 0.0) -> str | None:
         """Check for user input on stdin without blocking."""
         try:
-            if sys.stdin and sys.stdin.isatty():
+            if sys.stdin:
                 rlist, _, _ = select.select([sys.stdin], [], [], timeout)
                 if rlist:
                     return sys.stdin.readline()
@@ -365,7 +366,7 @@ class UnitreeG1Client(Robot):
             logger.info("ℹ️  [UnitreeG1Client] 纯视觉 (Camera-Only) 模式已启用：关节使用虚拟零位，仅监听机载相机。")
 
         logger.info("=" * 80)
-        logger.info("🚀 [VLA 策略模型已加载至 GPU 显存]")
+        logger.info(" [VLA 策略模型已加载至 GPU 显存]")
         logger.info("-" * 80)
         logger.info("当前网络接入监听配置:")
         if self.config.mock_state:
@@ -489,7 +490,7 @@ class UnitreeG1Client(Robot):
                     )
                 logger.warning("-" * 80)
                 logger.warning(
-                    "⚠️  已等待超过 %.0f 秒，仍未连通机器人！(状态: %s, 视觉: %s)",
+                    " 已等待超过 %.0f 秒，仍未连通机器人！(状态: %s, 视觉: %s)",
                     self.config.connect_timeout,
                     "已就绪" if has_state else "未收到包",
                     "已就绪" if has_camera else "未收到帧",

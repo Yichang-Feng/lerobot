@@ -55,6 +55,60 @@ else:
     AutoTokenizer = None
 
 
+def resolve_tokenizer_path(tokenizer_name: str) -> str:
+    """
+    Attempts to find a local tokenizer directory before hitting Hugging Face Hub,
+    supporting offline usage and cross-user deployments.
+    """
+    if not tokenizer_name:
+        return tokenizer_name
+
+    # 1. Explicit environment variable
+    env_path = os.environ.get("PALIGEMMA_TOKENIZER_PATH")
+    if env_path and os.path.isdir(env_path) and (
+        os.path.isfile(os.path.join(env_path, "tokenizer.json"))
+        or os.path.isfile(os.path.join(env_path, "tokenizer_config.json"))
+    ):
+        return env_path
+
+    # 2. Directly specified existing path
+    if os.path.isdir(tokenizer_name) and (
+        os.path.isfile(os.path.join(tokenizer_name, "tokenizer.json"))
+        or os.path.isfile(os.path.join(tokenizer_name, "tokenizer_config.json"))
+    ):
+        return tokenizer_name
+
+    # 3. Dynamic candidate directories across common repo and user layouts
+    current_file_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.abspath(os.path.join(current_file_dir, "..", "..", ".."))
+
+    hub_key = tokenizer_name.replace("/", "--")
+    candidate_dirs = [
+        # Current working directory
+        os.path.join(os.getcwd(), "paligemma_tokenizer"),
+        # Repository root
+        os.path.join(repo_root, "paligemma_tokenizer"),
+        # Nested repo paths (e.g. ~/lerobot/lerobot/paligemma_tokenizer)
+        os.path.expanduser("~/lerobot/lerobot/paligemma_tokenizer"),
+        os.path.expanduser("~/lerobot/paligemma_tokenizer"),
+        os.path.expanduser("~/paligemma_tokenizer"),
+        # Legacy fallback
+        "/home/yichangfeng/lerobot/paligemma_tokenizer",
+        "/home/yichangfeng/paligemma_tokenizer",
+        # Hugging Face local hub cache
+        os.path.expanduser(f"~/.cache/huggingface/hub/models--{hub_key}"),
+    ]
+
+    for cand in candidate_dirs:
+        if cand and os.path.isdir(cand) and (
+            os.path.isfile(os.path.join(cand, "tokenizer.json"))
+            or os.path.isfile(os.path.join(cand, "tokenizer_config.json"))
+        ):
+            return cand
+
+    return tokenizer_name
+
+
 @dataclass
 @ProcessorStepRegistry.register(name="tokenizer_processor")
 class TokenizerProcessorStep(ObservationProcessorStep):
@@ -112,23 +166,8 @@ class TokenizerProcessorStep(ObservationProcessorStep):
         elif self.tokenizer_name is not None:
             if AutoTokenizer is None:
                 raise ImportError("AutoTokenizer is not available")
-            candidate_paths = [
-                self.tokenizer_name,
-                "/home/yichangfeng/lerobot/paligemma_tokenizer",
-                "/home/yichangfeng/paligemma_tokenizer",
-                os.path.expanduser(f"~/.cache/huggingface/hub/models--{self.tokenizer_name.replace('/', '--')}"),
-            ]
-            loaded = False
-            for cand in candidate_paths:
-                if os.path.isdir(cand) and (
-                    os.path.isfile(os.path.join(cand, "tokenizer.json"))
-                    or os.path.isfile(os.path.join(cand, "tokenizer_config.json"))
-                ):
-                    self.input_tokenizer = AutoTokenizer.from_pretrained(cand)
-                    loaded = True
-                    break
-            if not loaded:
-                self.input_tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name)
+            resolved_path = resolve_tokenizer_path(self.tokenizer_name)
+            self.input_tokenizer = AutoTokenizer.from_pretrained(resolved_path)
         else:
             raise ValueError(
                 "Either 'tokenizer' or 'tokenizer_name' must be provided. "
@@ -416,8 +455,9 @@ class ActionTokenizerProcessorStep(ActionProcessorStep):
                 "Pass a tokenizer object directly or a tokenizer name to auto-load."
             )
 
+        resolved_paligemma = resolve_tokenizer_path(self.paligemma_tokenizer_name)
         self._paligemma_tokenizer = AutoTokenizer.from_pretrained(
-            self.paligemma_tokenizer_name,
+            resolved_paligemma,
             trust_remote_code=self.trust_remote_code,
             add_eos_token=True,
             add_bos_token=False,
