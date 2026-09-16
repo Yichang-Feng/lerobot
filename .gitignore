@@ -187,3 +187,17 @@ unitree-g1-mujoco/
 
 # Video files
 *.mp4
+
+# Local evaluation, diagnostics & data tools
+dataset_tools/
+evaluation_plots/
+evaluation_plots_ik_vs_sonic/
+eval_results.*
+*.png
+src/lerobot/rollout/inference/diagnostics.py
+
+# Local training & rollout scripts / configs
+run_train.sh
+run_vla_subtask.py
+train_pi05_*.yaml
+VLA_Vision_Evaluation_Guide.md
