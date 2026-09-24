@@ -20,6 +20,7 @@ __MACOSX/
 !wrist_and_ring_mount.png
 !video_cover2.jpg
 teleop/data/
+teleop/utils/data/
 episode_0*
 .vscode/
 *.pkl

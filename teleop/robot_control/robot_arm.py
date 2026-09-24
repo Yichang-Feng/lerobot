@@ -218,6 +218,18 @@ class G1_29_ArmController:
         '''Return current state q of all body motors.'''
         return np.array([self.lowstate_buffer.GetData().motor_state[id].q for id in G1_29_JointIndex])
     
+    def get_current_motor_dq(self):
+        '''Return current state dq of all body motors.'''
+        return np.array([self.lowstate_buffer.GetData().motor_state[id].dq for id in G1_29_JointIndex])
+
+    def get_current_leg_q(self):
+        '''Return current state q of the 12 leg motors.'''
+        return np.array([self.lowstate_buffer.GetData().motor_state[id].q for id in G1_29_JointLegIndex])
+
+    def get_current_leg_dq(self):
+        '''Return current state dq of the 12 leg motors.'''
+        return np.array([self.lowstate_buffer.GetData().motor_state[id].dq for id in G1_29_JointLegIndex])
+    
     def get_current_dual_arm_q(self):
         '''Return current state q of the left and right arm motors.'''
         return np.array([self.lowstate_buffer.GetData().motor_state[id].q for id in G1_29_JointArmIndex])
@@ -281,6 +293,23 @@ class G1_29_ArmController:
             G1_29_JointIndex.kRightWristYaw.value,
         ]
         return motor_index.value in wrist_motors
+
+class G1_29_JointLegIndex(IntEnum):
+    # Left leg
+    kLeftHipPitch = 0
+    kLeftHipRoll = 1
+    kLeftHipYaw = 2
+    kLeftKnee = 3
+    kLeftAnklePitch = 4
+    kLeftAnkleRoll = 5
+
+    # Right leg
+    kRightHipPitch = 6
+    kRightHipRoll = 7
+    kRightHipYaw = 8
+    kRightKnee = 9
+    kRightAnklePitch = 10
+    kRightAnkleRoll = 11
 
 class G1_29_JointArmIndex(IntEnum):
     # Left arm
@@ -354,19 +383,20 @@ class G1_29_Internal_Dex1_JointIndex(IntEnum):
 
 class G1_29_Arm_Internal_Dex1_Controller:
     BODY_MOTOR_COUNT = 29
-    DELTA_GRIPPER_CMD = 0.18
+    DELTA_GRIPPER_CMD = 0.0216  # 5.4 rad/s => 9 cm/s, full stroke ~1 s (control loop @ 250 Hz)
     THUMB_INDEX_DISTANCE = (5.0, 7.0)
-    MAPPED_GRIPPER_RANGE = (0.0, 5.4)
+    MAPPED_GRIPPER_RANGE = (2.7, 5.4)  # ~4.5 cm to 9.0 cm
 
     def __init__(self, left_gripper_value_in, right_gripper_value_in,
                  dual_gripper_data_lock = None, dual_gripper_state_out = None,
                  dual_gripper_action_out = None, simulation_mode = False,
-                 xr_motion_data_ready_in = None, motion_mode = False):
+                 xr_motion_data_ready_in = None, motion_mode = False, input_mode = "controller"):
         logger_mp.info("Initialize G1_29_Arm_Internal_Dex1_Controller...")
 
         if motion_mode:
             raise ValueError("Internal Dex1 does not currently support motion mode.")
 
+        self.input_mode = input_mode
         self.left_gripper_value_in = left_gripper_value_in
         self.right_gripper_value_in = right_gripper_value_in
         self.dual_gripper_data_lock = dual_gripper_data_lock
@@ -525,26 +555,40 @@ class G1_29_Arm_Internal_Dex1_Controller:
             with self.xr_motion_data_ready_in.get_lock():
                 xr_motion_data_ready = self.xr_motion_data_ready_in.value
 
-        gripper_state = self.get_current_dual_gripper_q()
+        if not hasattr(self, "_gripper_cmd_traj"):
+            init_q = self.get_current_dual_gripper_q()
+            self._gripper_cmd_traj = np.clip(init_q.copy(), self.MAPPED_GRIPPER_RANGE[0], self.MAPPED_GRIPPER_RANGE[1])
+
         if xr_motion_data_ready:
-            gripper_q_target = np.array([
-                np.interp(left_gripper_value, self.THUMB_INDEX_DISTANCE, self.MAPPED_GRIPPER_RANGE),
-                np.interp(right_gripper_value, self.THUMB_INDEX_DISTANCE, self.MAPPED_GRIPPER_RANGE),
-            ])
+            if self.input_mode == "controller":
+                # Controller trigger: 10.0 = not pressed (open 5.4 rad), 0.0 = fully pressed (closed 0.0 rad)
+                gripper_q_target = np.array([
+                    np.interp(left_gripper_value, [0.0, 10.0], self.MAPPED_GRIPPER_RANGE),
+                    np.interp(right_gripper_value, [0.0, 10.0], self.MAPPED_GRIPPER_RANGE),
+                ])
+            else:
+                gripper_q_target = np.array([
+                    np.interp(left_gripper_value, self.THUMB_INDEX_DISTANCE, self.MAPPED_GRIPPER_RANGE),
+                    np.interp(right_gripper_value, self.THUMB_INDEX_DISTANCE, self.MAPPED_GRIPPER_RANGE),
+                ])
         else:
-            gripper_q_target = gripper_state.copy()
+            gripper_q_target = self._gripper_cmd_traj.copy()
+
+        gripper_q_target = np.clip(gripper_q_target, self.MAPPED_GRIPPER_RANGE[0], self.MAPPED_GRIPPER_RANGE[1])
 
         with self.ctrl_lock:
             self.gripper_q_target = gripper_q_target
 
         if self.simulation_mode:
-            gripper_q_cmd = gripper_q_target
+            self._gripper_cmd_traj = gripper_q_target
         else:
-            gripper_q_cmd = np.clip(
+            self._gripper_cmd_traj = np.clip(
                 gripper_q_target,
-                gripper_state - self.DELTA_GRIPPER_CMD,
-                gripper_state + self.DELTA_GRIPPER_CMD,
+                self._gripper_cmd_traj - self.DELTA_GRIPPER_CMD,
+                self._gripper_cmd_traj + self.DELTA_GRIPPER_CMD,
             )
+
+        gripper_q_cmd = self._gripper_cmd_traj.copy()
 
         if self.gripper_smooth_filter is not None:
             self.gripper_smooth_filter.add_data(gripper_q_cmd)
@@ -599,6 +643,27 @@ class G1_29_Arm_Internal_Dex1_Controller:
         return np.array([
             lowstate.motor_state[id].q
             for id in G1_29_JointIndex
+        ])
+
+    def get_current_motor_dq(self):
+        lowstate = self.lowstate_buffer.GetData()
+        return np.array([
+            lowstate.motor_state[id].dq
+            for id in G1_29_JointIndex
+        ])
+
+    def get_current_leg_q(self):
+        lowstate = self.lowstate_buffer.GetData()
+        return np.array([
+            lowstate.motor_state[id].q
+            for id in G1_29_JointLegIndex
+        ])
+
+    def get_current_leg_dq(self):
+        lowstate = self.lowstate_buffer.GetData()
+        return np.array([
+            lowstate.motor_state[id].dq
+            for id in G1_29_JointLegIndex
         ])
 
     def get_current_dual_arm_q(self):

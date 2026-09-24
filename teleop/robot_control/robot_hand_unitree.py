@@ -236,7 +236,7 @@ kTopicGripperRightState = "rt/dex1/right/state"
 
 class Dex1_1_Gripper_Controller:
     def __init__(self, left_gripper_value_in, right_gripper_value_in, dual_gripper_data_lock = None, dual_gripper_state_out = None, dual_gripper_action_out = None, 
-                       filter = True, fps = 200.0, Unit_Test = False, simulation_mode = False, xr_motion_data_ready_in = None):
+                       filter = True, fps = 200.0, Unit_Test = False, simulation_mode = False, xr_motion_data_ready_in = None, input_mode = "controller"):
         """
         [note] A *_array type parameter requires using a multiprocessing Array, because it needs to be passed to the internal child process
 
@@ -255,6 +255,8 @@ class Dex1_1_Gripper_Controller:
         Unit_Test: Whether to enable unit testing
 
         simulation_mode: Whether to use simulation mode (default is False, which means using real robot)
+
+        input_mode: 'controller' or 'hand'
         """
 
         logger_mp.info("Initialize Dex1_1_Gripper_Controller...")
@@ -263,6 +265,7 @@ class Dex1_1_Gripper_Controller:
         self.Unit_Test = Unit_Test
         self.gripper_sub_ready = False
         self.simulation_mode = simulation_mode
+        self.input_mode = input_mode
         
         if filter and not self.simulation_mode:
             self.smooth_filter = WeightedMovingFilter(np.array([0.5, 0.3, 0.2]), 2)
@@ -323,16 +326,16 @@ class Dex1_1_Gripper_Controller:
     def control_thread(self, left_gripper_value_in, right_gripper_value_in, left_gripper_state_value, right_gripper_state_value, dual_hand_data_lock = None, 
                              dual_gripper_state_out = None, dual_gripper_action_out = None, xr_motion_data_ready_in = None):
         self.running = True
-        DELTA_GRIPPER_CMD = 0.18     # The motor rotates 5.4 radians, the clamping jaw slide open 9 cm, so 0.6 rad <==> 1 cm, 0.18 rad <==> 3 mm
+        DELTA_GRIPPER_CMD_OPEN = 0.055   # At 200Hz, faster release (~11 rad/s, ~0.4s for full open)
+        DELTA_GRIPPER_CMD_CLOSE = 0.035  # At 200Hz, smooth closing (7 rad/s)
         THUMB_INDEX_DISTANCE_MIN = 5.0
         THUMB_INDEX_DISTANCE_MAX = 7.0
-        LEFT_MAPPED_MIN  = 0.0           # The minimum initial motor position when the gripper closes at startup.
-        RIGHT_MAPPED_MIN = 0.0           # The minimum initial motor position when the gripper closes at startup.
-        # The maximum initial motor position when the gripper closes before calibration (with the rail stroke calculated as 0.6 cm/rad * 9 rad = 5.4 cm).
-        LEFT_MAPPED_MAX = LEFT_MAPPED_MIN + 5.40 
-        RIGHT_MAPPED_MAX = RIGHT_MAPPED_MIN + 5.40
-        left_target_action  = (LEFT_MAPPED_MAX - LEFT_MAPPED_MIN) / 2.0
-        right_target_action = (RIGHT_MAPPED_MAX - RIGHT_MAPPED_MIN) / 2.0
+        # Dex1 stroke: 9.0 cm <==> 5.40 rad (0.60 rad / cm)
+        # Clamping limit set to ~4.5 cm (4.5 cm * 0.60 rad/cm = 2.70 rad)
+        LEFT_MAPPED_MIN  = 2.70           # Minimum clamping position (~4.5 cm width)
+        RIGHT_MAPPED_MIN = 2.70           # Minimum clamping position (~4.5 cm width)
+        LEFT_MAPPED_MAX  = 5.00           # Fully open position
+        RIGHT_MAPPED_MAX = 5.00
 
         dq = 0.0
         tau = 0.0
@@ -344,19 +347,26 @@ class Dex1_1_Gripper_Controller:
         self.right_gripper_msg = MotorCmds_()
         self.right_gripper_msg.cmds = [unitree_go_msg_dds__MotorCmd_()]
 
+        self.left_gripper_msg.cmds[0].mode = 1
         self.left_gripper_msg.cmds[0].dq  = dq
         self.left_gripper_msg.cmds[0].tau = tau
         self.left_gripper_msg.cmds[0].kp  = kp
         self.left_gripper_msg.cmds[0].kd  = kd
 
+        self.right_gripper_msg.cmds[0].mode = 1
         self.right_gripper_msg.cmds[0].dq  = dq
         self.right_gripper_msg.cmds[0].tau = tau
         self.right_gripper_msg.cmds[0].kp  = kp
         self.right_gripper_msg.cmds[0].kd  = kd
+
+        # Initialize internal command trajectory with current measured position to avoid sudden jump
+        current_gripper_cmd = np.array([left_gripper_state_value.value, right_gripper_state_value.value], dtype=float)
+        current_gripper_cmd = np.clip(current_gripper_cmd, [LEFT_MAPPED_MIN, RIGHT_MAPPED_MIN], [LEFT_MAPPED_MAX, RIGHT_MAPPED_MAX])
+
         try:
             while self.running:
                 start_time = time.time()
-                # get dual hand skeletal point state from XR device
+                # get dual hand skeletal point / controller trigger state from XR device
                 with left_gripper_value_in.get_lock():
                     left_gripper_value  = left_gripper_value_in.value
                 with right_gripper_value_in.get_lock():
@@ -370,20 +380,35 @@ class Dex1_1_Gripper_Controller:
                 dual_gripper_state = np.array([left_gripper_state_value.value, right_gripper_state_value.value])
 
                 if xr_motion_data_ready:
-                    # Linear mapping from [0, THUMB_INDEX_DISTANCE_MAX] to gripper action range
-                    left_target_action  = np.interp(left_gripper_value, [THUMB_INDEX_DISTANCE_MIN, THUMB_INDEX_DISTANCE_MAX], [LEFT_MAPPED_MIN, LEFT_MAPPED_MAX])
-                    right_target_action = np.interp(right_gripper_value, [THUMB_INDEX_DISTANCE_MIN, THUMB_INDEX_DISTANCE_MAX], [RIGHT_MAPPED_MIN, RIGHT_MAPPED_MAX])
+                    if self.input_mode == "controller":
+                        # Controller trigger value: 10.0 = not pressed (max open), 0.0 = fully pressed (closed)
+                        left_target_action  = np.interp(left_gripper_value, [0.0, 10.0], [LEFT_MAPPED_MIN, LEFT_MAPPED_MAX])
+                        right_target_action = np.interp(right_gripper_value, [0.0, 10.0], [RIGHT_MAPPED_MIN, RIGHT_MAPPED_MAX])
+                    else:
+                        # Hand tracking pinch distance: 5.0cm = pinched (closed), 7.0cm = open
+                        left_target_action  = np.interp(left_gripper_value, [THUMB_INDEX_DISTANCE_MIN, THUMB_INDEX_DISTANCE_MAX], [LEFT_MAPPED_MIN, LEFT_MAPPED_MAX])
+                        right_target_action = np.interp(right_gripper_value, [THUMB_INDEX_DISTANCE_MIN, THUMB_INDEX_DISTANCE_MAX], [RIGHT_MAPPED_MIN, RIGHT_MAPPED_MAX])
                 else:
-                    left_target_action = dual_gripper_state[0]
-                    right_target_action = dual_gripper_state[1]
-                # clip dual gripper action to avoid overflow
+                    left_target_action = current_gripper_cmd[0]
+                    right_target_action = current_gripper_cmd[1]
+
+                target_action = np.array([left_target_action, right_target_action])
+                target_action = np.clip(target_action, [LEFT_MAPPED_MIN, RIGHT_MAPPED_MIN], [LEFT_MAPPED_MAX, RIGHT_MAPPED_MAX])
+
+                # Smoothly ramp command trajectory towards target (faster release, smooth close)
                 if not self.simulation_mode:
-                    left_actual_action  = np.clip(left_target_action,  dual_gripper_state[0] - DELTA_GRIPPER_CMD, dual_gripper_state[0] + DELTA_GRIPPER_CMD) 
-                    right_actual_action = np.clip(right_target_action, dual_gripper_state[1] - DELTA_GRIPPER_CMD, dual_gripper_state[1] + DELTA_GRIPPER_CMD)
+                    target_diff = target_action - current_gripper_cmd
+                    step = np.where(target_diff > 0, np.minimum(target_diff, DELTA_GRIPPER_CMD_OPEN), np.maximum(target_diff, -DELTA_GRIPPER_CMD_CLOSE))
+                    current_gripper_cmd += step
+                    current_gripper_cmd = np.clip(
+                        current_gripper_cmd,
+                        [LEFT_MAPPED_MIN, RIGHT_MAPPED_MIN],
+                        [LEFT_MAPPED_MAX, RIGHT_MAPPED_MAX]
+                    )
                 else:
-                    left_actual_action  = left_target_action
-                    right_actual_action = right_target_action
-                dual_gripper_action = np.array([left_actual_action, right_actual_action])
+                    current_gripper_cmd = target_action
+
+                dual_gripper_action = current_gripper_cmd.copy()
 
                 if self.smooth_filter:
                     self.smooth_filter.add_data(dual_gripper_action)
@@ -391,8 +416,8 @@ class Dex1_1_Gripper_Controller:
 
                 if dual_gripper_state_out and dual_gripper_action_out:
                     with dual_hand_data_lock:
-                        dual_gripper_state_out[:] = dual_gripper_state - np.array([LEFT_MAPPED_MIN, RIGHT_MAPPED_MIN])
-                        dual_gripper_action_out[:] = dual_gripper_action - np.array([LEFT_MAPPED_MIN, RIGHT_MAPPED_MIN])
+                        dual_gripper_state_out[:] = dual_gripper_state
+                        dual_gripper_action_out[:] = dual_gripper_action
 
                 self.ctrl_dual_gripper(dual_gripper_action)
                 current_time = time.time()
