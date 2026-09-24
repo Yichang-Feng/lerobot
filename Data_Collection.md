@@ -421,7 +421,7 @@ frame_data = {
 
 ## 12. 统一 LeRobot v3.0 数据结构与字段定义
 
-依据 [`datasets/unitree_box_move_blue_full/meta/info.json`](file:///home/yichangfeng/lerobot/datasets/unitree_box_move_blue_full/meta/info.json) 与 [`convert_rubberhand_to_g1_v30.py`](file:///home/yichangfeng/lerobot/convert_rubberhand_to_g1_v30.py)，最终输入模型的各特征维度定义如下：
+依据 [`datasets/unitree_box_move_blue_full/meta/info.json`](file:///home/yichangfeng/lerobot/datasets/unitree_box_move_blue_full/meta/info.json) 与 [`convert_rubberhand_to_g1_v30.py`](file:///home/yichangfeng/lerobot/dataset_tools/convert_rubberhand_to_g1_v30.py)，最终输入模型的各特征维度定义如下：
 
 | 字段名称 | 数据类型与维度 | 物理定义与关节分布 |
 | :--- | :--- | :--- |
@@ -474,7 +474,7 @@ selected_policy_name = "balance" if cmd_magnitude < 0.05 else "walk"
 
 ## 14. 原始动捕/遥操数据到 LeRobot v3.0 的转换映射
 
-在 [`convert_rubberhand_to_g1_v30.py`](file:///home/yichangfeng/lerobot/convert_rubberhand_to_g1_v30.py#L170-L194) 中执行的标准转换规则：
+在 [`convert_rubberhand_to_g1_v30.py`](file:///home/yichangfeng/lerobot/dataset_tools/convert_rubberhand_to_g1_v30.py#L170-L194) 中执行的标准转换规则：
 
 * **State 映射 (43-D $\rightarrow$ 29-D)**：
   ```python

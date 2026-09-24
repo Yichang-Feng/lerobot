@@ -27,7 +27,7 @@ task: "move blue box"
 robot:
   type: "unitree_g1"
   is_simulation: true
-  robot_ip: "192.168.123.164"
+  robot_ip: "10.3.42.221"
   controller: "GrootLocomotionController"
   locomotion_mode: "stand"
   zero_locomotion_cmd: false

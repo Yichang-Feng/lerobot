@@ -35,7 +35,7 @@ export LD_LIBRARY_PATH=/home/yichangfeng/miniforge3/envs/lerobot/lib:$LD_LIBRARY
 cd ~/lerobot
 conda activate lerobot
 
-python convert_rubberhand_to_g1_v30.py \
+python dataset_tools/convert_rubberhand_to_g1_v30.py \
     --src-dir ~/SonicStar/wbc/outputs/g1_rubberhand_pick_turn \
     --dst-dir ~/lerobot/datasets/g1_box_pick_turn_v30 \
     --fps 30 \

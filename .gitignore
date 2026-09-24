@@ -200,4 +200,5 @@ src/lerobot/rollout/inference/diagnostics.py
 run_train.sh
 run_vla_subtask.py
 train_pi05_*.yaml
+!train_pi05_dex1_*.yaml
 VLA_Vision_Evaluation_Guide.md

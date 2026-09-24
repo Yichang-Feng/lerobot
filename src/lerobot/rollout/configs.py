@@ -281,6 +281,11 @@ class RolloutConfig:
     resume: bool = False
     # 3-Subtask automatic sequencing mode (clamp & lift -> turn right -> place on table)
     subtasks: bool = False
+    # Auto mode: automatically start policy inference when robot gamepad enters VLA mode,
+    # and automatically reset (after 0.2s debounce) when switching back to gamepad/nav mode.
+    auto_mode: bool = False
+    # ZMQ port for receiving robot mode stream (PUB on server, SUB on client; default 6000)
+    mode_port: int = 6000
     # Rename map for mapping robot/dataset observation keys to policy keys
     rename_map: dict[str, str] = field(default_factory=dict)
 
@@ -308,6 +313,9 @@ class RolloutConfig:
 
         if self.interpolation_multiplier < 1:
             raise ValueError(f"interpolation_multiplier must be >= 1, got {self.interpolation_multiplier}")
+
+        if self.robot is not None and hasattr(self.robot, "mode_port") and self.mode_port > 0:
+            self.robot.mode_port = self.mode_port
 
         # --- Strategy-specific validation ---
         if isinstance(self.strategy, DAggerStrategyConfig) and self.teleop is None:

@@ -1,8 +1,9 @@
 # LeRobot + Unitree G1 + PI0.5 实机与仿真部署交接文档 (HANDOVER.MD)
 
-- **更新时间**: 2026-09-02
+- **更新时间**: 2026-09-10
 - **工作目录**: `/home/yichangfeng/lerobot`
-- **上位机环境**: `/home/yichangfeng/miniforge3/envs/lerobot` (Python 3.12, GPU Workstation IP: `192.168.123.213`)
+- **上位机环境**: `/home/yichangfeng/miniforge3/envs/lerobot` (Python 3.12, GPU: NVIDIA GeForce RTX 4090 D 24GB, 上位机 IP: `192.168.123.213`)
+- **多卡训练机环境**: `zhengwang@CNBESLPD260001` (Python 3.12, GPU: RTX 5090)
 - **机器人端环境**: Unitree G1 机载电脑 (`unitree@192.168.123.164`, Ubuntu 20.04, Python 3.8)
 
 ---
@@ -10,15 +11,15 @@
 ## 1. 项目架构与通信拓扑
 
 ### 1.1 总体架构
-本项目在 **LeRobot** 框架下，结合 **PI0.5 策略模型（`model/box_move_blue` / `model/box_pick`）** 与 **GrootLocomotionController / SonicWholeBodyController**，实现对 **Unitree G1 (29-DoF)** 人形机器人的控制。
+本项目在 **LeRobot** 框架下，结合 **PI0.5 VLA 策略模型（23 亿参数）** 与 **GrootLocomotionController / SonicWholeBodyController / unitree_g1_client**，实现对 **Unitree G1 (29-DoF)** 人形机器人的闭环控制。
 
 - **输入**: 
-  - `observation.images.global_view`: 480×640×3 RGB 图像（机载 RealSense 摄像头或 ZMQ 视频流）。
-  - `observation.state`: 29 维关节位置状态向量。
+  - `observation.images.global_view`: 480×640×3 RGB 图像（机载 RealSense 摄像头或 ZMQ 视频流，默认端口 `5556` 或 `5555`）。
+  - `observation.state`: 29 维关节位置状态向量（由 G1 机器人 `6001` 端口广播）。
 - **输出**: 
-  - 18 维 Action 向量（前 14 维为双臂关节目标角度，后 4 维为 `remote.lx`, `remote.ly`, `remote.rx`, `remote.ry` 遥控速度指令）。
-- **底层控制**: 
-  - 50Hz 独立控制线程运行平衡控制器（GR00T / SONIC），驱动下肢与腰部 15 个关节维持直立平衡，双臂 14 关节执行策略目标。
+  - 18 维 Action 向量（前 14 维为双臂关节目标角度，后 4 维为 `remote.lx`, `remote.ly`, `remote.rx`, `remote.ry` 遥控速度指令，下发至 `6002` 端口）。
+- **RTC 异步推理**:
+  - LeRobot 原生 RTC 机制，上位机 RTX 4090 D 以 ~30Hz 频率实时推理下发动作块（Action Chunk），队列满阈值与插值平滑处理。
 
 ### 1.2 网络与通信拓扑
 ```text
@@ -27,177 +28,172 @@
 │        IP: 192.168.123.213                   │                │          IP: 192.168.123.164                 │
 │        网卡: enx6c1ff724495a                 │                │                                              │
 │                                              │ 千兆以太网直连  │  【机载轻量服务 robot_server】                │
-│  【lerobot-rollout 上位机推理】              │◄──────────────►│   ├─ ZMQ Port 6000 (PULL 接收 LowCmd)        │
-│   ├─ PI0.5 Policy (双臂 14-DoF 目标)         │                │   ├─ ZMQ Port 6001 (PUB 广播 LowState)       │
-│   ├─ GrootLocomotionController (50Hz 腰腿)   │                │   └─ ZMQ Port 5555 (PUB 广播机载摄像头帧)     │
-│   └─ 键盘交互 ('s'=STAND / 'w'=WALK)          │                │  【底层 DDS】                                │
-│                                              │                │   └─ 宇树原厂电机执行器 (29-DoF)             │
+│  【lerobot-rollout / run_vla 上位机推理】    │◄──────────────►│   ├─ ZMQ Port 6002 (PULL 接收 LowCmd)        │
+│   ├─ PI0.5 Policy (RTX 4090 D 显存常驻)      │                │   ├─ ZMQ Port 6001 (PUB 广播 LowState)       │
+│   ├─ unitree_g1_client (轻量网络客户端)       │                │   └─ ZMQ Port 5556/5555 (PUB 广播机载图像)   │
+│   ├─ 原生 3-Subtask 状态自动流转引擎         │                │  【底层 DDS】                                │
+│   └─ RTC 动作插值与流控                      │                │   └─ 宇树原厂电机执行器 (29-DoF)             │
 └──────────────────────────────────────────────┘                └──────────────────────────────────────────────┘
 ```
 
 ---
 
-## 2. 仓库核心文件与目录结构
+## 2. 仓库核心文件与工具清单
 
-### 2.1 上位机核心文件
-- **`run_rollout.sh`**: **快捷调试与参数调优启动脚本**（顶部集中定义了模型、任务、仿真/实机、RTC 队列、插值倍率等全部常用参数，开箱即用）。
-- **`rollout_config.yaml`**: **YAML 格式统一配置文件**（支持 `lerobot-rollout --config_path=rollout_config.yaml` 一键启动与调参）。
-- **`REAL_Deploy.md`**: 实机多终端部署 SOP 与网络配置说明文档。
-- **`deploy_real_g1.sh`**: 真实机载相机模式（模式 A）一键启动脚本。
-- **`verify_video_rollout_real.sh`**: 实机动作 + 视频回放模式（模式 B）一键启动脚本。
-- **`verify_video_rollout.sh`**: 纯仿真回放验证脚本。
-- **`src/lerobot/robots/unitree_g1/`**: G1 机器人控制实现（`unitree_g1.py`, `unitree_sdk2_socket.py`, `config_unitree_g1.py`, 控制器目录 `controllers/`）。
-- **`src/lerobot/cameras/zmq/`**: ZMQ 相机接收与推流模块（`camera_zmq.py`, `stream_dataset_video_zmq.py`, `image_server.py`）。
+### 2.1 推理部署与联调脚本
+- **`run_vla.sh`**: **VLA 大模型主推理启动脚本（核心入口）**
+  - 已完成**原生 3-Subtask 自动流转与动态环境自适应**集成。
+  - 自动探测多用户/多机器 Python 虚拟环境与 `LD_LIBRARY_PATH`。
+  - 支持单任务与 3 阶段子任务模式，采用单进程直接替换（`exec`），键盘 TTY 直达，`Ctrl+C` 显存瞬间释放清零。
+- **`check_zmq_connection.py`**: 快速网络端口与 ZMQ 连通性测试脚本（毫秒级排查通信，无需加载 2.3B 大模型）。
+- **`run_vla_subtask.py`**: （*已弃用*）旧版外部 subprocess supervisor 脚本。由于重定向管道破坏 TTY 且产生孤儿进程，已被 `run_vla.sh` 的原生集成方案彻底替代。
 
-### 2.2 机器人端轻量服务文件 (`robot_server/`)
-为避免在机器人端克隆完整的 LeRobot 仓库或安装 PyTorch/CUDA 庞大依赖，已将机器人机载服务独立解耦整理至 `robot_server/`：
-- **`robot_server/start_server.sh`**: 机载一键启停总控制脚本（支持 `--no-camera`，带 `Ctrl+C` 信号捕获与进程清理）。
-- **`robot_server/camera_server/motor_server.py`**: 独立电机 DDS-to-ZMQ 桥接服务（监听 6000 端口，广播 6001 端口）。
-- **`robot_server/camera_server/server.py`**: 摄像头 OpenCV-to-ZMQ 推流服务（采集 `/dev/video2`，广播 5555 端口）。
-- **`robot_server/README.md`**: 机器人机载端部署与运行说明文档。
+### 2.2 训练与微调脚本及配置
+- **`run_train.sh`**: **通用跨机器模型微调训练脚本**
+  - 动态检测并绑定运行环境（支持 `miniforge3`、`CONDA_PREFIX`、`VIRTUAL_ENV`）。
+  - 自动链接 `libstdc++.so.6` 动态库，完美规避 Scipy / PyTorch CXXABI 报错。
+  - 统一超参数配置：`batch_size=8`, `steps=5000`, `save_freq=1000`, `log_freq=50`。
+- **`train_pi05_config.yaml`**: 4090 D（24GB 显存）微调配置文件（包含 LoRA/Full-FT 策略、图像分辨率与设备配置）。
+- **`train_pi05_5090_config.yaml`**: 5090 机器微调配置文件（优化显存利用与加速编译）。
+
+### 2.3 数据集处理工具链与 SOP
+- **`Dataset_Cleaning_Guide.md`**: 数据集清洗、子任务切分与 State 代替 Action 处理 SOP 手册。
+- **`dataset_tools/`**: 集中整理的数据处理工具包：
+  - `align_velocity_dataset.py`: 速度指令与动作时间对齐工具。
+  - `convert_rubberhand_to_g1_v30.py`: 原始灵巧手/手套数据转 G1 标准 29-DoF 格式。
+  - `evaluate_state_action.py`: 动作抖动度、状态平滑度量化分析工具。
+  - `merge_sonic_datasets.py`: 跨采集批次数据集融合脚本。
+  - `replay_g1_dataset.py`: 动态回放演示数据，终端同步输出 HUD 指标。
+  - `sanitize_sonic_dataset.py`: 异常值清理与丢帧修复。
+  - `create_subtask_dataset.py`: 转向任务 3-Subtask 切分脚本（剔除 Episode 32, 48 脏数据，产出 85 条演示）。
+  - `create_subtask_dataset_inplace.py`: 原地任务 2-Subtask 切分脚本（基于手腕高度与下放速度启动沿）。
+  - `replace_action_with_state.py`: 使用机械臂低抖动真实 State 代替遥操抖动 Action（生成 shift=0 与 shift=1 数据集）。
+  - `verify_subtask_splits.py`: 转向任务 3-Subtask 阶段切分曲线与时序可视化工具。
+  - `verify_subtask_splits_inplace.py`: 原地任务 2-Subtask 阶段切分曲线与时序可视化工具。
 
 ---
 
-## 3. 当前运行状态与效果对比
+## 3. 数据集体系与模型 Checkpoints 清单
 
-### 3.1 快捷调试与执行命令（已全面精简）
+### 3.1 数据集目录 (`datasets/`)
+1. **`datasets/g1_box_pick_turn_v30`**:
+   - 基础高质量完整长任务数据集（单任务指令："pick up the box, turn right, and place it on the table"）。
+2. **`datasets/g1_box_pick_turn_v30_subtasks`**:
+   - 3-Subtask 细粒度语言分段数据集（85 个 Episode，59,825 帧），包含三段式子任务文本。
+3. **`datasets/g1_box_pick_turn_v30_subtasks_state_as_action_shift0`**:
+   - 3-Subtask 数据集，上肢 14 个关节用无抖动的真实 State 代替原始 Action（`shift=0`，当前时刻状态对齐）。
+4. **`datasets/g1_box_pick_turn_v30_subtasks_state_as_action_shift1`**:
+   - 3-Subtask 数据集，上肢 14 个关节用下一时刻真实 State 代替原始 Action（`shift=1`，下一步目标对齐）。
 
-#### 方式 1：使用快捷调试脚本 `run_rollout.sh`（推荐，最省心）
-直接打开 [**`run_rollout.sh`**](file:///home/yichangfeng/lerobot/run_rollout.sh) 修改顶部参数，或在命令行直接传参覆盖：
+### 3.2 训练产出模型权重 (`outputs/train/`)
+1. **`outputs/train/pi05_box_pick_turn_v30_subtasks/checkpoints/005000/pretrained_model`**:
+   - **【当前默认主力部署模型】**：基于 3-Subtask 分段数据集微调训练 5000 步的最新模型权重。
+2. **`outputs/train/pi05_subtasks_state_as_action_shift1/checkpoints/005000/pretrained_model`**:
+   - 基于 State-as-Action (shift=1) 数据集训练的模型，用于消除遥操固有手臂高频抖动。
+3. **`outputs/train/pi05_subtasks_state_as_action_shift0/checkpoints/005000/pretrained_model`**:
+   - 基于 State-as-Action (shift=0) 数据集训练的模型对比权重。
+
+---
+
+## 4. 历史部署问题根因排查与闭环总结
+
+在之前的联调中，使用外置包装器 `run_vla_subtask.py` 暴露了 4 个致命问题。现已全部彻底根治，根因与解决方案对比如下：
+
+| 故障现象 | 根因排查结论 | 根治修复方案 | 状态 |
+| :--- | :--- | :--- | :---: |
+| **1. 连接等待期输入新 IP 无法修改** | `run_vla_subtask.py` 采用了 `subprocess.Popen(..., stdin=PIPE)` 重定向标准输入，破坏了 TTY 控制台环境，导致底层 `unitree_g1_client.py` 的 `sys.stdin.isatty()` 为 `False`，所有终端键盘按键被静默丢弃。 | 废除外层管道，终端标准输入直接接管进程；同时解除 `unitree_g1_client.py` 中 `_check_stdin` 的 `isatty` 限制，并在热切换时联动更新 `action_ip` 和即时重连相机。 | **已解决** |
+| **2. Ctrl+C 中断后显存泄露 (残留 16GB)** | 外部 Python 进程作为父进程启动底层推理进程，父子进程未归属同一进程组。用户 Ctrl+C 仅终止了外层脚本，底层的 PyTorch CUDA 引擎沦为孤儿进程继续滞留显存。 | `run_vla.sh` 采用 `exec "$PYTHON_BIN"` 单进程直接替换启动，**消除任何中间包装层**。Ctrl+C 信号直接直达 Python 解释器，优雅清理 ZMQ 并瞬间释放 GPU 显存。 | **已解决** |
+| **3. IP 连通后不等待确认直接开动** | `run_vla_subtask.py` 内部检测到 Interactive banner 打印后，在代码第 398 行硬编码执行了 `send_cmd("/start")`，跳过了人机确认环节。 | 恢复 LeRobot 标准交互握手：模型就绪并连通后，机器人保持在零动作安全待命姿态，打印操作菜单，**必须由操作员主动输入 `s`（或 `/s`）才会开跑**。 | **已解决** |
+| **4. 3 阶段执行完毕后闪退退出** | `run_vla_subtask.py` 在第 3 阶段（放箱）达到 8.5s 后，直接触发 `break` 并强行调用了 `proc.terminate()` 杀死进程。 | 采用长效交互会话：第 3 阶段完成后，系统打印任务完成通知，**机器人平稳保持当前姿态，绝不闪退**！操作员键入 `r` 即可平滑复位重置，随时可键入 `s` 再次测试。 | **已解决** |
+
+---
+
+## 5. 3-Subtask 原生深度集成方案 (核心技术实现)
+
+我们彻底抛弃外部 supervisor 脚本，直接将子任务流转引擎原生嵌入 LeRobot 体系：
+
+### 5.1 配置扩展 (`src/lerobot/rollout/configs.py`)
+在 `RolloutConfig` 中注册 `--subtasks bool = False` 参数，CLI 原生支持 `--subtasks=true/false`。
+
+### 5.2 状态监测与自动流转引擎 (`src/lerobot/rollout/interactive.py`)
+- **智能自激活**:
+  - 当 CLI 传入 `--subtasks=true` 或模型路径中包含 `subtask` 字符时，自动激活 3 阶段引擎，并将初始任务设为 `"clamp and lift the box"`。
+- **轻量零开销状态感知 (`_get_robot_metrics`)**:
+  - 直接读取已有机器人实例的 `ctx.robot_wrapper.inner._latest_state`，无需开启额外 ZMQ 连接或占用额外端口，内存级无锁读取。
+- **3 阶段精准流转条件 (`_subtask_tracker_loop`)**:
+  - **阶段 1**: `"clamp and lift the box"` (夹持并抬箱)
+    - 触发条件: 双肩俯仰角 `l_pitch <= -0.35` 且 `r_pitch <= -0.35` rad 持续 1.0s，或经验保底超时 12.0s。
+  - **阶段 2**: `"hold the box and turn right"` (抱箱右转)
+    - 触发条件: 机载 IMU 航向偏航角 $|\Delta \text{yaw}| \ge 78^\circ$（右转负偏航角到位），或经验保底超时 6.5s。
+  - **阶段 3**: `"place the box on the table and release"` (俯身放箱并松开)
+    - 持续执行 8.5s 后触发完成提醒，**机器人保持就绪姿态，保持在交互控制台中**。
+- **状态 HUD 实时打印**:
+  - 运行过程中每 2.0s 在终端打印一行富文本物理监控信息（耗时、双肩俯仰角度数、累计偏航角旋转度数）。
+
+### 5.3 控制台快捷指令集
+在 `InteractiveSession` 中注入单键/斜杠通用别名映射：
+
+| 快捷键 | 完整指令 | 功能说明 |
+| :---: | :---: | :--- |
+| **`s`** | `/s` / `/start` | 启动策略推理循环（确认现场安全后开跑） |
+| **`r`** | `/r` / `/reset` | 停止运动，机器人平滑返回安全初始姿态，子任务重置回阶段 1 |
+| **`n`** | `/n` / `/next` | 任何时刻手动提前跳至下一个子任务 |
+| **`1`** | `/1` / `/phase1` | 直接跳转至阶段 1 (`clamp and lift the box`) |
+| **`2`** | `/2` / `/phase2` | 直接跳转至阶段 2 (`hold the box and turn right`) |
+| **`3`** | `/3` / `/phase3` | 直接跳转至阶段 3 (`place the box on the table and release`) |
+| - | `/subtask <text>` | 临时手动更换自定义任务语言指令 |
+| **`q`** | `/q` / `/stop` | 安全断开连接并退出程序，显存瞬间清零 |
+| **`h`** | `/h` / `/help` | 查看交互控制台帮助指南 |
+
+---
+
+## 6. 标准化使用指南 (SOP)
+
+### 6.1 实机部署运行 (推荐)
+进入项目主目录，直接执行：
 ```bash
-# 默认启动（仿真 + 任务 "move blue box"）
-./run_rollout.sh
+./run_vla.sh --real
+```
+- 默认自动载入 3-Subtask 最优模型：`outputs/train/pi05_box_pick_turn_v30_subtasks/checkpoints/005000/pretrained_model`。
+- 自动连接默认机器人 IP (`192.168.123.164`)、状态端口 `6001`、动作端口 `6002`、相机端口 `5556`。
 
-# 命令行快速覆盖参数（例如切换任务、开启可视化或切换实机）
-./run_rollout.sh --task="pick up blue box" --display_data=true
-./run_rollout.sh --robot.is_simulation=false --robot.zero_locomotion_cmd=true
+> **IP 热切换提示**:
+> 若机器人 IP 有变化，无需退出程序：
+> 1. 可启动时指定：`./run_vla.sh --real --robot_ip=192.168.123.xxx`；
+> 2. 或在启动后的连接等待提示 `⏳ [等待接入]` 时，**直接在终端键盘键入新 IP 并按回车**（例如 `192.168.123.200`），系统将在 0.1 秒内自动重连。
+
+### 6.2 本地/仿真纯视觉测试
+在没有连接实体机器人电机时，测试相机与策略推流：
+```bash
+./run_vla.sh --sim --camera_only
 ```
 
-#### 方式 2：使用 YAML 配置文件 `rollout_config.yaml`
-在 [**`rollout_config.yaml`**](file:///home/yichangfeng/lerobot/rollout_config.yaml) 中集中修改参数，然后运行：
-```bash
-/home/yichangfeng/miniforge3/envs/lerobot/bin/lerobot-rollout --config_path=rollout_config.yaml
-```
-
-#### 方式 3：精简 CLI 命令行直调
-由于已将所有通用参数固化为默认配置，直接调用 CLI 时仅需指定必要参数：
-```bash
-/home/yichangfeng/miniforge3/envs/lerobot/bin/lerobot-rollout \
-    --policy.path=model/box_move_blue \
-    --task="move blue box" \
-    --robot.is_simulation=true \
-    --display_data=false
-```
-
-> **全量参数展开（系统内部默认等价于）：**
-> ```bash
-> lerobot-rollout \
->     --strategy.type=base \
->     --inference.type=rtc \
->     --inference.queue_threshold=40 \
->     --interpolation_multiplier=3 \
->     --policy.path=model/box_move_blue \
->     --policy.device=cuda \
->     --policy.dtype=bfloat16 \
->     --robot.type=unitree_g1 \
->     --robot.is_simulation=true \
->     --robot.controller=GrootLocomotionController \
->     --robot.locomotion_mode=stand \
->     --robot.cameras='{"global_view": {"type": "zmq", "server_address": "localhost", "port": 5556, "camera_name": "head_camera", "width": 640, "height": 480, "fps": 30, "warmup_s": 5}}' \
->     --task="move blue box" \
->     --duration=1000 \
->     --fps=30 \
->     --display_data=false
-> ```
+### 6.3 运行过程操作流程
+1. **启动与就绪**: 脚本加载 2.3B 模型至显存，连通机器人后打印控制台 Banner，机器人待命静止。
+2. **确认开跑**: 确认周边环境安全后，在终端键入 `s` 并回车，机器人开始执行抱箱动作。
+3. **观察流转**:
+   - 抱起箱子稳定 1 秒后，系统自动流转至阶段 2 并打印通知，机器人开始踏步右转；
+   - 右转达到 ~80 度后，系统自动流转至阶段 3 并打印通知，机器人俯身放箱并松手；
+   - 放箱完成后，终端提示任务结束，机器人平稳保持在最后姿态。
+4. **复位与重新测试**:
+   - 键入 `r` 并回车：机器人平稳返回初始待命姿势，子任务自动重置回阶段 1。
+   - 随时再次键入 `s` 即可开始下一轮测试。
+5. **退出**:
+   - 键入 `q` 或直接按 `Ctrl+C`：程序优雅退出，显存即刻清零。
 
 ---
 
-## 4. 实机调试问题深度剖析与应对方案 (2026-09-07)
+## 7. 应急与排错指南 (Troubleshooting)
 
-针对 Unitree G1 接入 PI0.5 策略实机联调中暴露的两个典型关键问题，进行系统的问题描述、底层机理剖析与应对方案总结。
-
----
-
-### 4.1 问题 1：从 Locomotion 接入 VLA 瞬间手臂猛甩、抬起过快
-
-#### 1. 问题描述
-* 机器人在平衡控制器（Locomotion WBC）站立状态下，通过网络接入 VLA 动作流后，双臂会立刻去拟合抬手姿态。
-* **现象对比**：
-  * **5000 步模型**：抬手幅度相对适中，更接近示教采集的姿态，但动作依然偏突兀。
-  * **1000 步模型**：抬手幅度极大且速度极快，电机出现剧烈机械冲击，易造成身体晃动失稳甚至跌倒意外。
-* **核心诉求**：如何在既准确跟随 VLA 指令的前提下，消除开局骤突，让机械臂平缓、受控地过渡到初始作业姿态。
-
-#### 2. 底层机理分析
-1. **初始位置阶跃突变（Step-Input Discontinuity）**：
-   * 机器人站立待命时，双臂通常处于自然下垂或默认归零状态（$q \approx 0$）。
-   * 示教数据中，录制的第一帧往往已经是准备抱箱的预备抬手姿态（肩、肘关节已有明显角度偏差）。
-   * VLA 客户端一旦接入，首帧输出的目标角度与机器人当前真实姿态存在数十度的跳变。
-2. **欠拟合模型的方差放大**：
-   * 1000 步模型处于欠拟合阶段，输出置信度低、方差大，首帧往往预测出幅度夸张的极端关节角；5000 步模型因在首帧附近拟合较好，输出相对温和。
-3. **高刚度 PD 控制器的扭矩冲激**：
-   * 底层服务端收到目标后直接写入 `motor_cmd.q`。瞬时位置偏差 $e = q_{target} - q_{current}$ 极大。
-   * 电机端高刚度 PD 控制器输出扭矩 $\tau = k_p \cdot e$ 瞬间饱和，电机爆发最大加速度，导致手臂猛烈甩动。
-
-#### 3. 应对与优化方案
-1. **1.5 秒软启动余弦平滑过渡（Soft-Start Cosine S-Curve）**：
-   * 当检测到 VLA 首次连接或刚执行完 Reset 时，捕捉当前机器人机械臂的真实实际角度 $q_{real\_start}$。
-   * 在随后的 $T = 1.0 \sim 1.5$ 秒内，采用平滑余弦权重 $\alpha(t) = \frac{1}{2}\left(1 - \cos\left(\frac{\pi t}{T}\right)\right)$ 进行加权融合：
-     $$q_{cmd}(t) = (1 - \alpha(t)) \cdot q_{real\_start} + \alpha(t) \cdot q_{vla\_target}(t)$$
-   * 初始时刻误差为 0，扭矩为 0，随后 1.5 秒内优雅过渡到 VLA 控制姿态。
-2. **关节角速度限幅器（Slew-Rate Limiter）**：
-   * 限制机械臂各关节单步最大角速度不超过 **$1.2 \sim 1.5\text{ rad/s}$**。
-   * 单步（20ms）最大变化量 $\Delta q_{max} = v_{max} \cdot \Delta t \approx 0.024\text{ rad}$。无论策略输出多大跳变，物理电机绝不超速。
-3. **底盘速度淡入**：
-   * 在软启动过渡期内，底盘移动/转向遥控速度也同步乘以 $\alpha(t)$，避免手臂未到指定开度底盘即急剧移动造成失衡。
-
----
-
-### 4.2 问题 2：5000 步犹豫不前 vs 1000 步仅限首轮成功（为什么过拟合反而不敢动？）
-
-#### 1. 问题描述
-* **5000 步模型**：机器人看到箱子后表现为“犹犹豫豫”，有抱箱趋势但又停滞在半空不敢抱合。
-* **1000 步模型**：能做出果断抱箱并转身的连贯动作，但**仅限第一次运行**；第二次把机器人和箱子转回原位后，动作变形失效。
-* **核心疑问**：
-  1. 为什么 5000 步效果反而不如 1000 步？按直觉理解，如果过拟合，不应该更加极致地跟随示教动作吗？
-  2. 为什么 1000 步第二次就不行了？如何在显存不重新加载模型的前提下彻底清空上下文？
-
-#### 2. 深度理论剖析：“为什么过拟合反而不敢动？”（静止吸引子问题）
-直觉认为“过拟合 = 更激进地模仿人”，但在模仿学习与流匹配（Flow Matching / Diffusion Policy）中，过拟合往往导致**“静止瘫痪”（The Zero-Velocity Attractor / Policy Freezing）**：
-
-1. **示范数据中的低速停顿偏差（Zero-Velocity Bias）**：
-   * 人类在遥控采集抱箱任务时，在手爪靠近纸箱对准边缘的关键时刻，为了操作精确，动作通常极慢，甚至有数十毫秒的观察微停。
-2. **协变量漂移（Covariate Shift）与速度矢量坍塌**：
-   * 流匹配网络拟合的是动作的速度向量场 $v(x_t, t)$。
-   * 5000 步微调时，Action Expert 被深度拘束在示范轨迹狭窄的超管流内。
-   * 实机闭环中，环境光照轻微变化、箱子摆放偏移数厘米、或下肢站姿有微弱倾斜，当前的视觉与状态观测便落入了未见区域（Out of Distribution, OOD）。
-   * 在 OOD 区域，过度拟合的网络无法泛化，各个模态预测的速度矢量在各方向上相互抵消，**输出的速度向量模长急剧萎缩接近于 0**。
-   * 表现为：机器人“知道要抱（方向有轻微倾向），但速度场大小趋近于 0，双臂悬在半空打摆子、犹豫不前”。
-3. **欠拟合（1000 步）为何反而动作果断？**：
-   * 1000 步时，网络仅捕获了宏观动力学大趋势（“视野出现箱子 -> 双臂抱合 -> 转向”）。
-   * 它未被局部微小停顿特征绑架，且大量保留了 $\pi_{0.5}$ 预训练底模原有的**物理动作流动先验（Action Flow Prior）**，因而动作大开大合，敢于向前扑击抱箱。
-4. **黄金步数规律**：
-   * 1000 步太粗糙（抗干扰差、首帧突变大），5000 步陷入静止陷阱；**最佳效果通常落在 2000 ~ 3000 步（如 Checkpoint 002000 / 003000）**，兼顾大动作的推进力与末端对准精度。
-
-#### 3. 深度机理剖析：“为什么 1000 步第二次执行就失效？”
-1. **RTC 残留前缀污染（Left-over Chunk & Prefix Contamination）**：
-   * `run_vla.sh` 默认启用了实时分块推理（`--inference.type=rtc`）。
-   * RTC 机制每次前向预测时，会抽取上一个 Chunk 尚未消费完的动作切片（`prev_chunk_left_over`）作为前缀约束，保障轨迹连续。
-   * 当机器人完成第一次“抱箱+转身”后，若未做系统级重置，RTC 队列中仍填充着**上一轮“转身阶段/任务末尾”的大角速度与抱死手臂的前缀向量**。
-   * 当操作员把机器人或箱子转回原处时，当前眼前的相机画面是“开局待命”，而 RTC 强行喂给策略模型的前缀却是“正在转身”，**视觉感知与历史前缀产生剧烈语义撕裂**，输出直接崩溃。
-2. **动作插值器与底盘 WBC 状态残留**：
-   * 上位机动作插值器与下肢控制器的积分状态未归零，上一轮残余的遥控转向偏置依然存在。
-
-#### 4. 解决方案：显存常驻下的“0 耗时热重置”（Hot Reset）
-避免每次测试都通过杀死脚本重新加载 9.35GB 权重（每次冷启动耗时 25~35 秒）：
-
-1. **上位机上下文清空**：
-   * 针对 `RTCInferenceEngine`：调用 `reset()`，立即清空 `ActionQueue`、清除 `prev_chunk_left_over`，重置预处理器与后处理器状态，并丢弃前一轮陈旧的 Observation。
-   * 针对策略模型：调用 `policy.reset()`，清空动作缓冲队列，使流匹配从纯高斯白噪声开始去噪。
-   * **9.35GB 模型常驻 GPU 显存，无需重新载入，0 秒完成逻辑重置！**
-2. **机器人端状态回正**：
-   * 向动作端口（6002）下发 `{"cmd": "reset"}`。
-   * 服务端拦截该指令后，自动将底盘遥控指令清零，并驱动双臂通过 2~3 秒平滑插值返回默认待命姿态。
-3. **实机推荐调试手段**：
-   * **交互式模式（`--interactive`）**：在 VLA 启动脚本中开启交互式会话，完成一次任务后在终端输入 `/reset` 瞬间重置，重新摆放箱子后输入 `/start` 即可干净利落地开始下一轮。
-   * **换用中间步数权重**：推荐实机重点评估 `aligned/003000` 或 `aligned/002000`，彻底摆脱 5000 步的犹豫停滞问题。
-
+1. **显存被占满处理**:
+   若因其他非标准脚本异常退出导致 GPU 显存残留，可执行：
+   ```bash
+   pkill -9 -f lerobot-rollout
+   pkill -9 -f rerun
+   ```
+2. **ZMQ 端口连通性排查**:
+   无需加载模型，毫秒级快速测试机载端口：
+   ```bash
+   ./run_vla.sh --check --real
+   ```
+   可直观查看 6001（状态）、6002（动作）、5556（相机）的收发帧率与连通状态。

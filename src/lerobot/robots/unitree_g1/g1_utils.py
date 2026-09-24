@@ -137,3 +137,37 @@ class G1_29_JointIndex(IntEnum):
     kRightWristRoll = 26
     kRightWristPitch = 27
     kRightWristYaw = 28
+
+
+# Dex1 Gripper Constants
+DEX1_LEFT_FINGER_ACTUATORS = ("left_dex1_finger_joint_1", "left_dex1_finger_joint_2")
+DEX1_RIGHT_FINGER_ACTUATORS = ("right_dex1_finger_joint_1", "right_dex1_finger_joint_2")
+DEX1_ALL_FINGER_ACTUATORS = DEX1_LEFT_FINGER_ACTUATORS + DEX1_RIGHT_FINGER_ACTUATORS
+NUM_DEX1_FINGER_MOTORS = len(DEX1_ALL_FINGER_ACTUATORS)
+
+
+def map_gripper_cmd_to_pos(
+    val: float,
+    min_val: float = 0.0,
+    max_val: float = 5.0,
+    min_pos: float = -0.02,
+    max_pos: float = 0.0245,
+) -> float:
+    """Map client gripper command [0.0 ~ 5.0] (0=closed, 5=open) to MuJoCo joint position [-0.02 ~ 0.0245]."""
+    val_clipped = float(np.clip(val, min_val, max_val))
+    norm = (val_clipped - min_val) / (max_val - min_val) if max_val != min_val else 0.0
+    return min_pos + norm * (max_pos - min_pos)
+
+
+def map_pos_to_gripper_val(
+    pos: float,
+    min_pos: float = -0.02,
+    max_pos: float = 0.0245,
+    min_val: float = 0.0,
+    max_val: float = 5.0,
+) -> float:
+    """Map MuJoCo joint position [-0.02 ~ 0.0245] to client gripper command [0.0 ~ 5.0]."""
+    pos_clipped = float(np.clip(pos, min_pos, max_pos))
+    norm = (pos_clipped - min_pos) / (max_pos - min_pos) if max_pos != min_pos else 0.0
+    return min_val + norm * (max_val - min_val)
+

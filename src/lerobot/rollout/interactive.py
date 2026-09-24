@@ -105,6 +105,8 @@ COMMAND_ALIASES: dict[str, str] = {
     "help": "help",
     "n": "next",
     "next": "next",
+    "m": "mode",
+    "mode": "mode",
     "1": "phase1",
     "2": "phase2",
     "3": "phase3",
@@ -170,14 +172,38 @@ class InteractiveSession:
         self._play_sounds = ctx.runtime.cfg.play_sounds
         self._listener = StdinCommandListener(self._handle_line, on_eof=self._handle_eof, stream=input_stream)
 
-        # 3-Subtask automatic sequencing support
-        self._subtasks_enabled = getattr(ctx.runtime.cfg, "subtasks", False)
-        if not self._subtasks_enabled:
-            policy_path = str(getattr(getattr(ctx.runtime.cfg, "policy", None), "path", ""))
-            if "subtask" in policy_path.lower():
-                self._subtasks_enabled = True
+        # Auto mode (port 6003 supervision: NAV/GAMEPAD/VLA mode transitions)
+        self._auto_mode = getattr(ctx.runtime.cfg, "auto_mode", False)
+        self._is_resetting = False
+        self._is_starting = False
+        self._auto_supervisor_thread: threading.Thread | None = None
+        self._auto_supervisor_stop_event = threading.Event()
 
-        self._subtask_list = list(DEFAULT_SUBTASKS)
+        # Subtask automatic sequencing support
+        raw_subtasks = getattr(ctx.runtime.cfg, "subtasks", None)
+        policy_path = str(getattr(getattr(ctx.runtime.cfg, "policy", None), "path", ""))
+
+        if isinstance(raw_subtasks, str) and raw_subtasks.lower() in ("false", "0", "none", "off", "no"):
+            self._subtasks_enabled = False
+            self._subtask_list = []
+        elif isinstance(raw_subtasks, str) and ("," in raw_subtasks or len(raw_subtasks.strip()) > 0):
+            self._subtask_list = [s.strip() for s in raw_subtasks.split(",") if s.strip()]
+            self._subtasks_enabled = len(self._subtask_list) > 0
+        elif isinstance(raw_subtasks, (list, tuple)):
+            self._subtask_list = list(raw_subtasks)
+            self._subtasks_enabled = bool(raw_subtasks)
+        elif raw_subtasks is True:
+            self._subtasks_enabled = True
+            self._subtask_list = list(DEFAULT_SUBTASKS)
+        else:
+            # Auto-detect only if this is specifically the legacy 3-stage turn-right model
+            if "turn" in policy_path.lower() and "subtask" in policy_path.lower():
+                self._subtasks_enabled = True
+                self._subtask_list = list(DEFAULT_SUBTASKS)
+            else:
+                self._subtasks_enabled = False
+                self._subtask_list = []
+
         self._current_phase = 0
         self._phase_start_time = 0.0
         self._phase1_start_yaw = 0.0
@@ -186,7 +212,7 @@ class InteractiveSession:
         self._subtask_tracker_running = False
         self._subtask_stop_event = threading.Event()
 
-        if self._subtasks_enabled:
+        if self._subtasks_enabled and self._subtask_list:
             self.controller._initial_task = self._subtask_list[0]
             self.controller.set_task(self._subtask_list[0])
 
@@ -201,6 +227,7 @@ class InteractiveSession:
                 "let the policy pick its own subtasks toward a high-level goal",
             ),
             "reset": (self._cmd_reset, "", "stop movement, return to initial position, reset VLA context (shortcut: /r, r)"),
+            "mode": (self._cmd_mode, "", "show 6003 robot mode stream status & diagnostics (shortcut: /mode, m)"),
             "stop": (self._cmd_stop, "", "end the session and shut down (shortcut: /q, q)"),
             "help": (self._cmd_help, "", "show this help (shortcut: /h, h)"),
         }
@@ -209,6 +236,12 @@ class InteractiveSession:
             self._commands["phase1"] = (lambda cmd: self._cmd_jump_phase(0), "", "jump to phase 1: clamp and lift the box (shortcut: /1, 1)")
             self._commands["phase2"] = (lambda cmd: self._cmd_jump_phase(1), "", "jump to phase 2: hold and turn right (shortcut: /2, 2)")
             self._commands["phase3"] = (lambda cmd: self._cmd_jump_phase(2), "", "jump to phase 3: place on table and release (shortcut: /3, 3)")
+
+    @property
+    def robot_wrapper(self):
+        """Retrieve the robot wrapper instance reliably across sub-context structures."""
+        hw = getattr(self.ctx, "hardware", None)
+        return getattr(hw, "robot_wrapper", None) if hw is not None else getattr(self.ctx, "robot_wrapper", None)
 
     @contextlib.contextmanager
     def _route_cadence_reports(self) -> Iterator[None]:
@@ -229,11 +262,14 @@ class InteractiveSession:
             with _mute_system_output(), self._route_cadence_reports():
                 self._print(self._render_banner())
                 self._listener.start()
+                if self._auto_mode:
+                    self._start_auto_supervisor()
                 try:
                     self.controller.serve()
                 finally:
                     self._listener.stop()
         finally:
+            self._stop_auto_supervisor()
             self._stop_subtask_tracker()
             # Outside the muting context, so the announcement and teardown logs are visible again.
             log_say("Interactive session ended", self._play_sounds)
@@ -246,6 +282,7 @@ class InteractiveSession:
         if event is RolloutEvent.QUERY_ANSWERED and payload is not None:
             self._report_answer(payload)
         elif event is RolloutEvent.SEGMENT_STARTED:
+            self._is_starting = False
             log_say("Starting rollout", self._play_sounds)
             if self._subtasks_enabled:
                 self.controller.set_task(self._subtask_list[self._current_phase])
@@ -261,31 +298,43 @@ class InteractiveSession:
                     "/subtask <text> to change it, /reset to return to initial position, /stop to shut down."
                 )
         elif event is RolloutEvent.SEGMENT_ENDED:
+            self._is_starting = False
             self._stop_subtask_tracker()
             self._print(
                 "Rollout run ended on its own (duration reached). Robot is holding position — "
                 "/start to run again, /reset to return to initial position, /stop to shut down."
             )
         elif event is RolloutEvent.RESET_STARTED:
+            self._is_starting = False
+            self._is_resetting = True
             self._stop_subtask_tracker()
             log_say("Resetting robot to initial position", self._play_sounds)
             self._print("Resetting — returning the robot to its initial position...")
         elif event is RolloutEvent.RESET_DONE:
+            self._is_starting = False
+            self._is_resetting = False
             self._print("Robot reset — holding at initial position. /start (or s) to run.")
         elif event is RolloutEvent.RESET_SKIPPED:
+            self._is_starting = False
+            self._is_resetting = False
             self._print("Robot paused — no initial position captured, holding current pose. /start to run.")
         elif event is RolloutEvent.RESET_FAILED:
+            self._is_starting = False
+            self._is_resetting = False
             self._print(
                 "Reset FAILED — the return move errored, so the robot may NOT be at its "
                 "initial position. Check the robot before /start."
             )
         elif event is RolloutEvent.ENGINE_FAILED:
+            self._is_starting = False
             self._stop_subtask_tracker()
             self._report_failure("Inference engine failed — shutting down.")
         elif event is RolloutEvent.STRATEGY_FAILED:
+            self._is_starting = False
             self._stop_subtask_tracker()
             self._report_failure("Rollout strategy failed (robot or recording error) — shutting down.")
         elif event is RolloutEvent.STOPPED:
+            self._is_starting = False
             self._stop_subtask_tracker()
 
     def _report_answer(self, answer: QueryAnswer) -> None:
@@ -314,15 +363,89 @@ class InteractiveSession:
             self._print("Re-run without --interactive=true to see the error output.")
 
     # ------------------------------------------------------------------
+    # Auto Mode Supervisor (Port 6003: NAV / GAMEPAD / VLA transitions)
+    # ------------------------------------------------------------------
+
+    def _start_auto_supervisor(self) -> None:
+        if self._auto_supervisor_thread is not None and self._auto_supervisor_thread.is_alive():
+            return
+        self._auto_supervisor_stop_event.clear()
+        self._auto_supervisor_thread = threading.Thread(
+            target=self._auto_supervisor_loop, daemon=True, name="AutoModeSupervisor"
+        )
+        self._auto_supervisor_thread.start()
+
+    def _stop_auto_supervisor(self) -> None:
+        self._auto_supervisor_stop_event.set()
+        if self._auto_supervisor_thread is not None:
+            self._auto_supervisor_thread.join(timeout=1.0)
+            self._auto_supervisor_thread = None
+
+    def _auto_supervisor_loop(self) -> None:
+        """Supervises robot mode on port 6003 for automatic start and reset.
+
+        Mode lifecycle:
+        - Handheld controller in NAV or GAMEPAD: Wait idly (inference paused).
+        - Handheld controller enters VLA: Automatically invoke controller.start() and trigger smooth engagement.
+        - Handheld controller leaves VLA: Wait 0.2s debounce; if still non-VLA, invoke controller.reset().
+        - Resetting completes: Wait for subsequent VLA entry to re-trigger start with smooth engagement.
+        """
+        robot = self.robot_wrapper
+        debounce_start_time: float | None = None
+
+        while not self._auto_supervisor_stop_event.is_set():
+            if self.controller.stopped:
+                break
+
+            current_mode = getattr(robot, "current_mode", None)
+            is_vla = bool(getattr(robot, "is_vla_mode", False))
+            mode_port = getattr(robot, "mode_port", 6000)
+
+            # Case 1: Currently IDLE (not running, not resetting, and not starting) -> Watch for VLA entry
+            if not self.controller.running and not self._is_resetting and not self._is_starting:
+                debounce_start_time = None
+                if is_vla:
+                    self._is_starting = True
+                    mode_val = current_mode.value if hasattr(current_mode, "value") else str(current_mode)
+                    self._print(
+                        f"\n🤖 [自动模式] 监听到 {mode_port} 端口切换为 VLA 模式 ({mode_val})！\n"
+                        "   ├─ 自动启动策略推理 (Controller.start)\n"
+                        "   └─ 激活关节平滑过渡 (S-curve Smoothing) 消除初始突变..."
+                    )
+                    if hasattr(robot, "trigger_engagement_smoothing"):
+                        robot.trigger_engagement_smoothing()
+                    if not self.controller.start():
+                        self._is_starting = False
+
+            # Case 2: Currently RUNNING -> Watch for non-VLA exit with 0.2s debounce
+            elif self.controller.running and not self._is_resetting:
+                # ONLY trigger reset when mode is explicitly recognized as NAV or GAMEPAD!
+                # NEVER reset when mode is UNKNOWN (e.g. no packets, or manual start without mode stream)
+                from lerobot.robots.unitree_g1.unitree_g1_client import RobotMode
+                if current_mode in (RobotMode.NAV, RobotMode.GAMEPAD):
+                    if debounce_start_time is None:
+                        debounce_start_time = time.time()
+                    elif time.time() - debounce_start_time >= 0.2:
+                        mode_val = current_mode.value if hasattr(current_mode, "value") else str(current_mode)
+                        self._print(
+                            f"\n🤖 [自动模式] 监听到 {mode_port} 端口退出 VLA 模式 (切换为手柄/导航模式: {mode_val})，持续超过 0.2s！\n"
+                            "   └─ 自动触发复位 (Reset) 归位并清空 RTC 历史..."
+                        )
+                        self._cmd_reset(InteractiveCommand(name="reset"))
+                        debounce_start_time = None
+                else:
+                    debounce_start_time = None
+
+            time.sleep(0.02)
+
+    # ------------------------------------------------------------------
     # 3-Subtask Kinematics & Automated Progression
     # ------------------------------------------------------------------
 
     def _get_robot_metrics(self) -> dict:
         """Extract arm shoulder pitch and IMU yaw from robot state."""
         try:
-            hw = getattr(self.ctx, "hardware", None)
-            robot_wrapper = getattr(hw, "robot_wrapper", None) if hw is not None else getattr(self.ctx, "robot_wrapper", None)
-            robot = getattr(robot_wrapper, "inner", robot_wrapper)
+            robot = getattr(self.robot_wrapper, "inner", self.robot_wrapper)
             if robot is not None and hasattr(robot, "_latest_state") and hasattr(robot, "_state_lock"):
                 with robot._state_lock:
                     state = robot._latest_state
@@ -480,11 +603,20 @@ class InteractiveSession:
     # ------------------------------------------------------------------
 
     def _handle_line(self, line: str) -> None:
-        if not line.strip():
+        stripped = line.strip()
+        if not stripped:
+            # User pressed empty Enter: print a one-line quick status
+            robot = self.robot_wrapper
+            mode = getattr(robot, "current_mode", "N/A")
+            mode_val = mode.value if hasattr(mode, "value") else str(mode)
+            pkts = getattr(robot, "mode_packet_count", 0)
+            mode_port = getattr(robot, "mode_port", 6000)
+            ctrl_state = "RUNNING (运行中)" if self.controller.running else ("RESETTING (复位中)" if self._is_resetting else "IDLE (待命)")
+            self._print(f"[当前状态] 模式端口({mode_port}): {mode_val} (收包: {pkts}) | 控制器: {ctrl_state} | 输入 'm' 查看详情, 's' 启动, 'r' 复位")
             return
-        cmd = parse_command(line)
+        cmd = parse_command(stripped)
         if cmd is None:
-            self._print("Input not recognized — commands: s (start), r (reset), n (next), 1/2/3, q (stop), /help.")
+            self._print("Input not recognized — commands: s (start), r (reset), m (mode), n (next), 1/2/3, q (stop), /help.")
             return
         entry = self._commands.get(cmd.name)
         if entry is None:
@@ -497,7 +629,29 @@ class InteractiveSession:
         self._print("Input stream closed — stopping the session.")
         self.controller.stop()
 
+    def _cmd_mode(self, cmd: InteractiveCommand) -> None:
+        """Display live mode monitoring statistics and troubleshooting tips."""
+        robot = self.robot_wrapper
+        mode_port = getattr(robot, "mode_port", 6000)
+        self._print("\n" + "=" * 65)
+        self._print(f"📡 [{mode_port} 端口模式监听诊断报告]")
+        if robot is not None and hasattr(robot, "mode_status_summary"):
+            self._print(robot.mode_status_summary())
+        else:
+            self._print(f"  • 当前模式: {getattr(robot, 'current_mode', 'N/A')}")
+
+        mode_packets = getattr(robot, "mode_packet_count", 0)
+        if mode_packets == 0:
+            self._print(f"\n💡 [排查提示 - 尚未收到任何 {mode_port} 数据包]:")
+            self._print(f"   1. 请确认状态发送端 (手柄遥控/导航节点) 已启动并正在向 {mode_port} 端口发送 PUB 广播。")
+            self._print(f"   2. 请确认发送端绑定的 IP 是 0.0.0.0 或 *，且本机与机器人 IP 之间网络互通。")
+            self._print(f"   3. 可新开终端运行: python check_zmq_connection.py --mode-port={mode_port} 进行 2 秒快速排查。")
+        self._print("=" * 65 + "\n")
+
     def _cmd_start(self, cmd: InteractiveCommand) -> None:
+        robot = self.robot_wrapper
+        if robot is not None and hasattr(robot, "trigger_engagement_smoothing"):
+            robot.trigger_engagement_smoothing()
         if self.controller.start():
             return
         # start() also refuses while stopping or after a failure — don't mislabel an idle robot.
@@ -597,6 +751,8 @@ class InteractiveSession:
             self._print(f"Could not start autosteer ({result.value}).")
 
     def _cmd_reset(self, cmd: InteractiveCommand) -> None:
+        self._is_starting = False
+        self._is_resetting = True
         self._stop_subtask_tracker()
         if self._subtasks_enabled:
             self._current_phase = 0
@@ -644,9 +800,30 @@ class InteractiveSession:
                 "  [1] clamp and lift the box -> [2] hold the box and turn right -> [3] place the box on the table and release\n"
                 "  (快捷键: 'n' 跳下一阶段, '1'/'2'/'3' 选阶段, 'r' 复位, 's' 启动, 'q' 退出)\n"
             )
+        mode_info = ""
+        robot = self.robot_wrapper
+        mode_port = getattr(robot, "mode_port", getattr(getattr(self.ctx, "runtime", None), "cfg", None).mode_port if hasattr(getattr(self.ctx, "runtime", None), "cfg") else 6000)
+        if self._auto_mode:
+            mode_info = (
+                "Deploy Mode: AUTO (★ 自动模式已激活)\n"
+                f"  • 自动监听 {mode_port} 端口: 导航/手柄模式下待命，切入 VLA 模式时自动启动推理并平滑过渡\n"
+                "  • 切出 VLA 模式后延迟 0.2s 自动执行复位 (Reset)，切回 VLA 再次自动接管\n"
+                f"  • 随时输入 'm' (或 /mode) 查看 {mode_port} 端口实时收包与手柄模式状态\n"
+                "  • 亦支持键盘指令: 's' (启动), 'r' (复位), 'q' (退出)\n"
+            )
+            session_lead = f"Interactive rollout session — waiting for VLA gamepad mode on port {mode_port} (or type /start).\n"
+        else:
+            mode_info = (
+                "Deploy Mode: MANUAL (手动模式)\n"
+                "  • 键盘输入 's' (或 /start) 启动推理，'r' 复位，'q' 退出\n"
+                f"  • 随时输入 'm' (或 /mode) 查看 {mode_port} 端口实时收包与手柄模式状态\n"
+            )
+            session_lead = "Interactive rollout session — the robot will NOT move until you type /start (or /s).\n"
+
         return (
             f"{_BANNER_RULE}\n"
-            "Interactive rollout session — the robot will NOT move until you type /start (or /s).\n"
+            f"{session_lead}"
+            f"{mode_info}"
             f"{subtask_info}"
             f"Task: {_format_task(self.controller.initial_task)}\n"
             f"{self._render_help()}\n"

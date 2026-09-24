@@ -216,6 +216,12 @@ def make_pre_post_processors(
                     "postprocessor_config_filename", f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
                 ),
             )
+        if getattr(policy_cfg, "type", None) == "unifolm_vla":
+            from pathlib import Path
+            from .unifolm_vla.processor_unifolm_vla import make_unifolm_vla_pre_post_processors
+            pre_cfg_name = kwargs.get("preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json")
+            if not (Path(pretrained_path) / pre_cfg_name).exists():
+                return make_unifolm_vla_pre_post_processors(policy_cfg, kwargs.get("dataset_stats"))
 
         preprocessor = PolicyProcessorPipeline.from_pretrained(
             pretrained_model_name_or_path=pretrained_path,

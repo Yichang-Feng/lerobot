@@ -45,6 +45,10 @@ from lerobot.utils.feature_utils import build_dataset_frame
 
 from ..robot_wrapper import ThreadSafeRobot
 from .base import InferenceEngine, PolicyQuery
+try:
+    from .diagnostics import AsyncDiagnosticsRecorder
+except ImportError:
+    AsyncDiagnosticsRecorder = Any
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +200,7 @@ class RTCInferenceEngine(InferenceEngine):
         compile_warmup_inferences: int = 2,
         rtc_queue_threshold: int = 30,
         shutdown_event: Event | None = None,
+        diagnostics_recorder: AsyncDiagnosticsRecorder | None = None,
     ) -> None:
         super().__init__(task=task)
         self._policy = policy
@@ -209,6 +214,7 @@ class RTCInferenceEngine(InferenceEngine):
         self._use_torch_compile = use_torch_compile
         self._compile_warmup_inferences = compile_warmup_inferences
         self._rtc_queue_threshold = rtc_queue_threshold
+        self._diagnostics_recorder = diagnostics_recorder
 
         self._action_queue: ActionQueue | None = None
         self._obs_holder: dict[str, Any] = {}
@@ -281,6 +287,8 @@ class RTCInferenceEngine(InferenceEngine):
     def start(self) -> None:
         """Launch the RTC background thread."""
         self._action_queue = ActionQueue(self._rtc_config)
+        if self._diagnostics_recorder is not None:
+            self._diagnostics_recorder.set_action_queue(self._action_queue)
         self._obs_holder = {
             "obs": None,
             "robot_type": self._robot.robot_type,
@@ -306,6 +314,10 @@ class RTCInferenceEngine(InferenceEngine):
             else:
                 logger.info("RTC inference thread stopped")
             self._rtc_thread = None
+
+        if self._diagnostics_recorder is not None:
+            chunk_records = self._action_queue.get_chunk_records() if self._action_queue is not None else None
+            self._diagnostics_recorder.finalize(chunk_records=chunk_records)
 
     def pause(self) -> None:
         """Pause the RTC background thread."""
@@ -525,6 +537,46 @@ class RTCInferenceEngine(InferenceEngine):
                         else:
                             latency_tracker.add(new_latency)
 
+                        if self._diagnostics_recorder is not None and not is_warmup:
+                            # 1. Image
+                            raw_img = None
+                            if "observation.images.global_view" in obs:
+                                raw_img = obs["observation.images.global_view"]
+                            elif "global_view" in obs:
+                                raw_img = obs["global_view"]
+                            else:
+                                for k in obs_batch:
+                                    if "images" in k and isinstance(obs_batch[k], torch.Tensor):
+                                        raw_img = obs_batch[k]
+                                        break
+                            if raw_img is None:
+                                for k, v in obs.items():
+                                    if isinstance(v, np.ndarray) and v.ndim == 3 and v.shape[2] in (1, 3):
+                                        raw_img = v
+                                        break
+
+                            # 2. Robot state
+                            raw_state = obs_batch.get("observation.state")
+                            if raw_state is None:
+                                raw_state = obs.get("observation.state")
+
+                            # 3. Policy Tokens
+                            diag_info = getattr(self._policy, "get_last_diagnostics", lambda: None)()
+                            toks = diag_info.get("prefix_tokens") if diag_info else None
+
+                            self._diagnostics_recorder.record(
+                                image=raw_img,
+                                action_processed=processed,
+                                robot_state=raw_state,
+                                action_original=original,
+                                prefix_tokens=toks,
+                                timestamp=time.time(),
+                                latency_ms=new_latency * 1000.0,
+                                rtc_delay=delay,
+                                queue_size=queue.qsize(),
+                                extra_info={"task": task, "task_changed": task_changed},
+                            )
+
                         if (
                             not is_warmup
                             and self._rtc_config.mode == "trained"
@@ -605,3 +657,7 @@ class RTCInferenceEngine(InferenceEngine):
             # Signal the top-level shutdown so strategies exit their control loops
             if self._global_shutdown_event is not None:
                 self._global_shutdown_event.set()
+        finally:
+            if self._diagnostics_recorder is not None:
+                chunk_records = self._action_queue.get_chunk_records() if self._action_queue is not None else None
+                self._diagnostics_recorder.finalize(chunk_records=chunk_records)

@@ -76,7 +76,7 @@ class UnitreeG1Config(RobotConfig):
     is_simulation: bool = True
 
     # Socket config for ZMQ bridge
-    robot_ip: str = "192.168.123.164"  # default G1 IP
+    robot_ip: str = "10.3.42.221"  # default G1 IP
 
     # Cameras (ZMQ-based remote cameras)
     cameras: dict[str, CameraConfig] = field(default_factory=_default_unitree_g1_cameras)
@@ -102,5 +102,21 @@ class UnitreeG1Config(RobotConfig):
 
     # Connection timeout in seconds waiting for initial lowstate
     connect_timeout: float = 60.0
+
+    # Gripper configuration
+    enable_gripper: bool = True
+
+    # Dex1 Gripper actuator name lists
+    gripper_actuators_left: list[str] = field(
+        default_factory=lambda: ["left_dex1_finger_joint_1", "left_dex1_finger_joint_2"]
+    )
+    gripper_actuators_right: list[str] = field(
+        default_factory=lambda: ["right_dex1_finger_joint_1", "right_dex1_finger_joint_2"]
+    )
+
+    # Command range from client and target joint position range in MuJoCo
+    gripper_cmd_range: tuple[float, float] = (0.0, 5.0)
+    gripper_pos_range: tuple[float, float] = (-0.02, 0.0245)
+
 
 

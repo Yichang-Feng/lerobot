@@ -1,187 +1,315 @@
-# Unitree G1 遥操数据整理与清洗复用指南 (SonicStar / WBC)
+# Unitree G1 具身数据集清洗、Sub-task 切片与消抖处理标准操作规程 (SOP)
+## Dataset Cleaning, Sub-task Segmentation & State-as-Action Guide (`Dataset_Cleaning_Guide.md`)
 
-本指南针对在 Unitree G1 上使用 **SonicStar / GR00T-WBC** 进行 VR 遥控采集时产生的数据，详细说明**底层数据结构、需要整理哪些文件、为何不能手动单点删除**，并提供**一键自动化清洗脚本**，方便在切换 Agent、多终端或后续长期项目中快速复用。
-
----
-
-## 一、为什么需要数据整理？
-
-在真机遥控采集（如抱箱转身放桌子）过程中，必然会遇到以下几类常见情况：
-1. **起手等待期过长**：VR 佩戴者在按下开始录制后，前几秒还在调整站姿或等待机器人站稳，导致轨迹前段有数秒是无用的原地静止（如 Episode 2 前 13 秒未抱箱）；
-2. **操作失误/脱手掉箱**：某些轨迹中途箱子滑落或步态绊倒，需要将整条失败轨迹废弃；
-3. **索引空洞**：若直接手动用 `rm` 删除了某个 `episode_000005.mp4`，会导致编号断层（0, 1, 2, 3, 4, 6...），使得后续 `run_data_exporter.py` 断点续采混乱，甚至使下游 LeRobot DataLoader 抛出找不到文件的异常。
-
-> [!CAUTION]
-> **绝对不能仅在文件夹里手动删视频或删单张表格！**
-> 采集系统是一个闭环，包含 Parquet 动作表、MP4 视频流以及 3 个索引元数据文件，各文件之间存在严格的帧数、时间戳与全局索引映射。一旦单点删除导致不一致，会导致**数据导出器崩溃**或**模型训练报错退出**。
+- **更新时间**: 2026-09-10
+- **工作目录**: `/home/yichangfeng/lerobot`
+- **适用硬件**: Unitree G1 (29-DoF) 人形机器人 + 固定橡胶手 (Rubber Hand)
+- **核心工具目录**: [`dataset_tools/`](./dataset_tools/)
 
 ---
 
-## 二、数据集必须同步整理的 5 大核心要素
+## 目录
+1. [核心背景与数据缺陷剖析](#一核心背景与数据缺陷剖析)
+2. [全链路数据拓扑与处理架构图](#二全链路数据拓扑与处理架构图)
+3. [SOP 阶段 1：原始采集数据转换与末尾截断](#三sop-阶段-1原始采集数据转换与末尾截断)
+4. [SOP 阶段 2：失败示范数据审计与剔除](#四sop-阶段-2失败示范数据审计与剔除)
+5. [SOP 阶段 3：3 阶段 Sub-task 语言切片与时序融合判定](#五sop-阶段-33-阶段-sub-task-语言切片与时序融合判定)
+6. [SOP 阶段 4：State-as-Action 物理状态替代动作与消抖处理](#六sop-阶段-4state-as-action-物理状态替代动作与消抖处理)
+7. [SOP 阶段 5：数据集质量验证、消抖评估与仿真回放](#七sop-阶段-5数据集质量验证消抖评估与仿真回放)
+8. [SOP 阶段 6：下游模型微调训练启动指南](#八sop-阶段-6下游模型微调训练启动指南)
+9. [数据处理工具集与文件索引](#九数据处理工具集与文件索引)
 
-原始采集数据存储于 `~/SonicStar/wbc/outputs/<dataset_name>/`（例如 `outputs/g1_rubberhand_pick_turn`）：
+---
+
+## 一、核心背景与数据缺陷剖析
+
+在针对 Unitree G1 机器人搬运箱子任务进行遥操采集与策略微调的过程中，系统实测暴露了三大底层数据缺陷：
+
+1. **控制动作严重抖动（高频震颤达 12 mrad）**：
+   - **成因 1（VR 光学追踪遮挡）**：PICO 4 VR 手柄在双臂合抱箱体时被箱体和人体遮挡，算法频繁在红外定位与 IMU 积分间跳变，引入高频空间噪声。
+   - **成因 2（逆运动学非线性放大）**：WBC（全身运控）逆运动学在抱箱构型下接近奇异值（Singularity），末端微小的位姿波动被雅可比伪逆矩阵数学放大为机械臂各关节角度的剧烈阶跃。
+   - **对比基准**：物理电机编码器测得的实测状态 $q_{\text{state}}$ 受机械臂转动惯量与阻尼物理滤波，抖动仅 **$1.24\text{ mrad}$**；而控制目标 $q_{\text{action}}$ 抖动高达 **$12.01\text{ mrad}$**（膨胀近 10 倍）。
+2. **长程单一 Prompt 导致的因果混淆（Causal Confusion）**：
+   - 原始数据仅使用单一粗粒度指令：`"pick up the box, turn right, and place it on the table"`。
+   - 模型在复杂时空长程序列下难以准确把握动作意图切换，常出现“双手未碰触箱子便提前举手外展转身”的因果错乱。
+3. **任务末尾无效待机与“举手投降”姿态**：
+   - 操作员在放箱后为了防刮碰本能抬手悬空，且按下停止键有 2~3 秒反应延迟，导致尾部记录了多余的悬空姿态并被策略误学为终局必选行为。
+
+为此，本项目制定并落地了完整的**数据清洗、3-Subtask 细粒度标注与 State-as-Action 消抖处理 SOP**。
+
+---
+
+## 二、全链路数据拓扑与处理架构图
 
 ```text
-g1_rubberhand_pick_turn/
-├── data/
-│   └── chunk-000/
-│       ├── episode_000000.parquet  <- [要素1] 动作与关节时序表 (43维状态/动作、四元数等)
-│       ├── episode_000001.parquet
-│       └── ...
-├── videos/
-│   └── chunk-000/
-│       └── observation.images.ego_view/
-│           ├── episode_000000.mp4  <- [要素2] 第一视角 50Hz RGB 视频流 (帧数必须与 Parquet 严格 1:1)
-│           ├── episode_000001.mp4
-│           └── ...
-└── meta/
-    ├── info.json                   <- [要素3] 总样本数、总帧数、视频总数、train split
-    ├── episodes.jsonl              <- [要素4] 每条 Episode 的编号、任务 Prompt、帧数长度
-    └── episodes_stats.jsonl        <- [要素5] 每条 Episode 所有维度的 min/max/mean/std 归一化统计
-```
-
-### 整理规范要求：
-1. **帧数严格一致**：每条 Episode 的 `Parquet 行数` 与 `MP4 视频总帧数` 必须 `Diff = 0`；
-2. **序号严格连续**：所有样本必须从 `episode_000000` 开始连续递增至 `episode_{N-1}`，中间不得跳号；
-3. **时序严格归零**：若做了时间裁剪，裁剪后的 `timestamp` 必须重新以 `0.0s` 起步，`frame_index` 必须重新以 `0` 起步；
-4. **全局索引自增**：Parquet 中的 `index` 字段记录全数据集的累加帧号，必须连续递增无重叠。
-
----
-
-## 三、一键自动化整理工具：`sanitize_sonic_dataset.py`
-
-为了避免繁琐的人工核算与出错，本仓库提供了开箱即用的通用清洗工具：
-[`sanitize_sonic_dataset.py`](file:///home/yichangfeng/lerobot/sanitize_sonic_dataset.py)。
-
-### 工具特性：
-* **全自动安全备份**：运行前自动生成带时间戳的完整备份，误操作可随时秒级还原；
-* **支持指定删除**：一键剔除失败的 Episode；
-* **毫秒级时间裁剪**：裁剪视频与表格（精确到单帧重编码），音画严格对齐；
-* **全量自动重编排**：自动消灭断层序号，重新生成 `info.json`、`episodes.jsonl` 与 `episodes_stats.jsonl`；
-* **终局严密自检**：处理完毕后自动逐条校验 Parquet 与 MP4 帧数，确保 100% 完美对齐。
-
----
-
-## 四、高频使用场景与命令速查
-
-在上位机执行清洗命令（推荐在 `miniforge3/envs/lerobot` 或 `.venv_data_collection` 环境下运行）：
-
-### 场景 1：删除指定失败的 Episode
-若采集过程中第 5 条和第 14 条操作失误，需将其废弃：
-```bash
-python ~/lerobot/sanitize_sonic_dataset.py --delete-episodes 5 14
-```
-
-### 场景 2：对某个 Episode 进行起手裁剪（剪掉前置等待期）
-若第 2 条数据前 13 秒是在原地等待，希望从第 13.0 秒起步保存：
-```bash
-python ~/lerobot/sanitize_sonic_dataset.py --trim-start 2:13.0
-```
-
-### 场景 3：复合操作（一边裁剪、一边删除失败样本）
-```bash
-python ~/lerobot/sanitize_sonic_dataset.py \
-    --trim-start 2:13.0 \
-    --delete-episodes 5 14
-```
-
-### 场景 4：仅检查与连续重排（消除断层空洞）
-如果您手动移动了某些文件或想要重新校准元数据，直接无参运行即可：
-```bash
-python ~/lerobot/sanitize_sonic_dataset.py
-```
-
-### 场景 5：演练模式（Dry-Run，不修改任何文件）
-在执行任何改动前，加上 `--dry-run` 预览清洗规划：
-```bash
-python ~/lerobot/sanitize_sonic_dataset.py \
-    --trim-start 2:13.0 \
-    --delete-episodes 5 14 \
-    --dry-run
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│ 原始采集数据 (SonicStar 43D Parquet)                                                    │
+│ 路径: ~/SonicStar/wbc/outputs/g1_rubberhand_pick_turn (87 Episodes, 60,809 帧)        │
+└─────────────────────────────────────────┬──────────────────────────────────────────────┘
+                                          │
+                        [步骤 1: 格式转换与清洗截断]
+                        • convert_rubberhand_to_g1_v30.py (43D -> 29D/18D, 计算偏航速度)
+                        • sanitize_sonic_dataset.py (截断末尾 2~3s 反应延迟帧)
+                                          ▼
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│ LeRobot v3.0 基准数据集                                                                │
+│ 路径: datasets/g1_box_pick_turn_v30 (87 Episodes, 单一 Prompt)                         │
+└─────────────────────────────────────────┬──────────────────────────────────────────────┘
+                                          │
+                        [步骤 2 & 3: 剔除失败样本 + 3-Subtask 物理切分]
+                        • 审计剔除未完成转向的 Episode 32, 48
+                        • create_subtask_dataset.py (偏航角积分 + 双臂姿态判定)
+                                          ▼
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│ 3-Subtask 细粒度子任务数据集 (保留原始 Action)                                            │
+│ 路径: datasets/g1_box_pick_turn_v30_subtasks (85 Episodes, 59,825 帧, 3 Tasks)          │
+│ Task 0: clamp and lift the box                                                         │
+│ Task 1: hold the box and turn right                                                    │
+│ Task 2: place the box on the table and release                                         │
+└─────────────────────────────────────────┬──────────────────────────────────────────────┘
+                                          │
+                        [步骤 4: State 替代 Action 消抖处理]
+                        • replace_action_with_state.py
+                        • action[0:14] = state[15:29], 保留 action[14:18] 转向速度
+                        • 注入基模分位数, 彻底消除高频控制振颤
+                                          ▼
+                ┌─────────────────────────┴─────────────────────────┐
+                ▼ (时序因果迁移 a_t = s_{t+1})                        ▼ (当前观测复制 a_t = s_t)
+┌──────────────────────────────────────────────┐    ┌──────────────────────────────────────────────┐
+│ 推荐版本: shift=1                            │    │ 消融对比版本: shift=0                         │
+│ datasets/g1_box_pick_turn_v30_subtasks_      │    │ datasets/g1_box_pick_turn_v30_subtasks_      │
+│ state_as_action                              │    │ state_as_action_shift0                       │
+│ (动作作为下一时刻状态转移目标，消除抽搐)       │    │ (作为基线对比组)                              │
+└──────────────────────────────────────────────┘    └──────────────────────────────────────────────┘
 ```
 
 ---
 
-## 五、跨 Agent / 跨会话完整工作流（SOP）
+## 三、SOP 阶段 1：原始采集数据转换与末尾截断
 
-采集与整理支持两种标准工作流：
-* **模式 A（连续增量模式）**：所有数据直接追加到同一主目录中，中途暂停清洗；
-* **模式 B（分批模块化模式，强烈推荐）**：每次启动录制生成独立的带时间戳文件夹，单独整理质检后，一键合并入主数据集。
+### 1.1 核心原理
+原始数据由 SonicStar 记录为 43 维结构（包含了未配备电机的灵巧手空槽位）。需执行：
+1. **维度重排与去冗余**：剔除 14 个虚拟手部关节，组织为 29 维状态（`observation.state`）与 18 维动作（`action`：双臂 14 关节角 + 4 轴底盘速度）。
+2. **底盘速度提取**：通过机身 IMU 四元数差分计算瞬时偏航角速度：$\text{remote.rx} = -\frac{\Delta \text{yaw}}{\Delta t}$。
+3. **尾部待机帧截断**：放箱着地瞬间后截除冗余的双手悬空帧。
 
-```mermaid
-flowchart TD
-    subgraph 模式B: 分批独立采集与合并（推荐）
-        B1["终端4: 启动录制 (自动带时间戳)\ng1_rubberhand_pick_turn_$(date +%Y%m%d_%H%M%S)"] --> B2["检查本批次视频质量\n手动删除失败视频或指定裁剪"]
-        B2 --> B3["运行 sanitize_sonic_dataset.py\n--dataset-dir <本批次目录>"]
-        B3 --> B4["本批次质检通过 (Diff=0)"]
-        B4 --> B5["运行 merge_sonic_datasets.py\n将多个批次一键合并入统一主目录"]
-    end
-    B5 --> M["最终转码: convert_rubberhand_to_g1_v30.py"]
-    M --> T["启动 Pi0.5 策略微调"]
-```
-
----
-
-### 【模式 B】分批带时间戳采集与整合全流程操作（推荐）
-
-#### 步骤 1：在终端 4 录制新批次（另起独立时间戳目录）
-在启动采集器时，利用 `$(date +%Y%m%d_%H%M%S)` 自动生成唯一的批次文件夹：
+### 1.2 执行命令
 ```bash
-source ~/GR00T-WholeBodyControl/.venv_data_collection/bin/activate
-cd ~/SonicStar/wbc
+export LD_LIBRARY_PATH="/home/yichangfeng/miniforge3/envs/lerobot/lib:${LD_LIBRARY_PATH}"
+PYTHON="/home/yichangfeng/miniforge3/envs/lerobot/bin/python"
 
-python gear_sonic/scripts/run_data_exporter.py \
-    --task-prompt "pick up the box, turn right, and place it on the table" \
-    --dataset-name "g1_rubberhand_pick_turn_$(date +%Y%m%d_%H%M%S)" \
-    --camera-host 192.168.123.164 \
-    --camera-port 5555 \
-    --data-collection-frequency 50
-```
-> 例如本次录制将保存在：`~/SonicStar/wbc/outputs/g1_rubberhand_pick_turn_20260904_113000`
-
-#### 步骤 2：对该批次进行独立整理与质检
-录制完成后，按 `Ctrl+C` 退出。进入该批次的 `videos/...` 目录浏览视频：
-- 如果某条轨迹失误，直接删除该 MP4 视频即可；
-- 然后运行独立清洗工具（自动识别被删视频并重排，无需手动算序号）：
-```bash
-/home/yichangfeng/miniforge3/envs/lerobot/bin/python ~/lerobot/sanitize_sonic_dataset.py \
-    --dataset-dir ~/SonicStar/wbc/outputs/g1_rubberhand_pick_turn_<时间戳>
-```
-> 该批次将立即重排为干净、连续、Diff = 0 的完美独立数据集。
-
-#### 步骤 3：一键整合所有批次为一个完整主数据集
-当采集整理好若干个独立批次后，运行合并工具一键整合：
-```bash
-/home/yichangfeng/miniforge3/envs/lerobot/bin/python ~/lerobot/merge_sonic_datasets.py \
-    --src-dirs ~/SonicStar/wbc/outputs/g1_rubberhand_pick_turn_* \
-    --output-dir ~/SonicStar/wbc/outputs/g1_rubberhand_pick_turn
-```
-* **自动按时间排序**：按批次顺序依次累加全局帧号与连续 Episode 序号；
-* **自动隔离安全备份**：如果目标主目录已存在，自动生成带时间戳备份；
-* **终局自检**：逐条校验所有合并轨迹的音视频与动作表对齐情况。
-
-#### 步骤 4：转码为 LeRobot v3.0 进行微调
-```bash
-cd ~/lerobot
-
-/home/yichangfeng/miniforge3/envs/lerobot/bin/python convert_rubberhand_to_g1_v30.py \
+# 1. 转换原始数据为 LeRobot v3.0 格式
+$PYTHON dataset_tools/convert_rubberhand_to_g1_v30.py \
     --src-dir ~/SonicStar/wbc/outputs/g1_rubberhand_pick_turn \
-    --dst-dir ~/lerobot/datasets/g1_box_pick_turn_v30 \
-    --fps 30 \
-    --task "pick up the box, turn right, and place it on the table"
+    --dst-dir datasets/g1_box_pick_turn_v30
+
+# 2. 验证转化前后数值无损（绝对误差 < 1e-7）
+$PYTHON dataset_tools/verify_raw_vs_converted.py
 ```
 
 ---
 
-## 六、安全回滚机制
+## 四、SOP 阶段 2：失败示范数据审计与剔除
 
-所有脚本（包括清洗与合并）在每次修改前，都会在 `outputs/` 下自动生成时间戳备份目录，例如：
-`~/SonicStar/wbc/outputs/g1_rubberhand_pick_turn_backup_20260904_112058`
+### 2.1 审计结论
+对全量 87 条 Episode 进行转向角积分 $\psi_{\text{total}} = \int (-\text{remote.rx}) dt$ 扫描，发现两条异常数据：
+- **Episode 32**: 累计转向角度仅 **$-4.58^\circ$**（操作员未执行踏步转向便放箱）。
+- **Episode 48**: 累计转向角度仅 **$-7.19^\circ$**（操作员未执行踏步转向便放箱）。
 
-若在操作中有任何误操作或需要还原，只需秒级恢复：
+### 2.2 处理规约
+这两条样本属于严重的“未按规范执行任务”的失败示范，在构建下游任务数据集时必须**硬性彻底剔除**：
+- 剔除前：87 个 Episode，60,809 帧。
+- 剔除后：**85 个高质量 Episode，59,825 帧**。
+
+---
+
+## 五、SOP 阶段 3：3 阶段 Sub-task 语言切片与时序融合判定
+
+### 5.1 物理切分算法机理
+单纯依赖瞬时速度切分会导致开局重心摆动误触发与踏步过零点频繁跳变。算法采用**多信号融合滤波**：
+1. **偏航积分角**：$\psi(t) = \int (-\text{remote.rx}) dt$，右转单调累积至 $-90^\circ$。
+2. **转弯起点 $t_{\text{split1}}$（阶段 0 $\to$ 阶段 1）**：
+   - 偏航角开始单调下穿 $-13^\circ$（目标角度 15% 处）；
+   - 向前沿回溯至平滑角速度上升沿，确保此时箱子已被双臂夹稳并离开桌面；
+   - 标注为：`"clamp and lift the box"`。
+3. **转弯终点 $t_{\text{split2}}$（阶段 1 $\to$ 阶段 2）**：
+   - 偏航角累积达到目标转角 88%（约 $-78^\circ \sim -88^\circ$）；
+   - 且平滑角速度平稳回落至 $< 0.15\text{ rad/s}$（原地踏步已稳妥到位）；
+   - 阶段 1 标注为：`"hold the box and turn right"`。
+4. **放箱完成 $t_{\text{end}}$（阶段 2）**：
+   - 机器人正对目标桌，双臂下俯将箱子平稳放置并脱开双手；
+   - 阶段 2 标注为：`"place the box on the table and release"`。
+
+### 5.2 生成 Subtask 数据集命令
 ```bash
-# 还原示例
-rm -rf ~/SonicStar/wbc/outputs/g1_rubberhand_pick_turn
-cp -r ~/SonicStar/wbc/outputs/g1_rubberhand_pick_turn_backup_<时间戳> ~/SonicStar/wbc/outputs/g1_rubberhand_pick_turn
+export LD_LIBRARY_PATH="/home/yichangfeng/miniforge3/envs/lerobot/lib:${LD_LIBRARY_PATH}"
+PYTHON="/home/yichangfeng/miniforge3/envs/lerobot/bin/python"
+
+$PYTHON dataset_tools/create_subtask_dataset.py \
+    --src-dir datasets/g1_box_pick_turn_v30 \
+    --dst-dir datasets/g1_box_pick_turn_v30_subtasks \
+    --exclude-episodes 32 48
 ```
-安全无忧，放心使用！
+
+### 5.3 切片报告可视化校验
+运行切片可视化脚本，在 `outputs/subtask_reports/` 下生成切片诊断波形图与 $t_0, t_{\text{split1}}, t_{\text{split2}}, t_{\text{end}}$ 四张相机真机画面拼图：
+```bash
+$PYTHON dataset_tools/verify_subtask_splits.py
+```
+
+---
+
+## 六、SOP 阶段 4：State-as-Action 物理状态替代动作与消抖处理
+
+### 6.1 核心理论与因果对齐设计
+为彻底根除训练数据注入策略模型带来的高频机械抖动，采用物理编码器实测关节角替换动作：
+
+1. **双臂前 14 维替换**：`action[0:14] = observation.state[15:29]`。
+2. **因果时序映射对比（`shift=1` vs `shift=0`）**：
+   - **`shift = 1`（推荐，因果状态转移目标）**：
+     $$a_t^{\text{arm}} = s_{t+1}^{\text{arm}} \quad (\forall t < T-1); \quad a_{T-1}^{\text{arm}} = s_{T-1}^{\text{arm}}$$
+     *物理内涵*：在行为克隆（BC）中，$a_t$ 的本质是“由当前状态 $s_t$ 驱动系统转移到下一状态 $s_{t+1}$ 的控制律”。以 $s_{t+1}$ 为目标具有明确的方向性前馈引导，机械臂运行平滑且响应灵敏。
+   - **`shift = 0`（对比组，当前步恒等复制）**：
+     $$a_t^{\text{arm}} = s_t^{\text{arm}}$$
+     *物理内涵*：动作直接等于当前测量状态。在实机闭环时容易由于误差为零而陷入迟钝、停滞，仅用于消融对比。
+3. **底盘速度保留不变**：
+   - 后 4 维遥控速度 `action[14:18]`（尤其是 `remote.rx`）必须完整保留，否则底盘将丧失原地踏步转向能力。
+4. **统计量重算与基模分位数对齐 (`align_velocity`)**：
+   - 替换双臂动作后，自动重算前 14 维的 `min`、`max`、`mean`、`std` 与 `q01..q99` 分位数；
+   - 数据集内横移速度恒为 0，若直接取经验分位数会导致 `q99 - q01 ≈ 0`，引发 QUANTILES 归一化除零与数值爆炸。脚本自动注入 `model/box_pick` 基模的标准底盘速度分位数，确保归一化严密稳定。
+
+### 6.2 两个版本的生成命令
+
+#### 版本 A：生成推荐的 `shift=1` 数据集
+```bash
+export LD_LIBRARY_PATH="/home/yichangfeng/miniforge3/envs/lerobot/lib:${LD_LIBRARY_PATH}"
+PYTHON="/home/yichangfeng/miniforge3/envs/lerobot/bin/python"
+
+$PYTHON dataset_tools/replace_action_with_state.py \
+    --src-dir datasets/g1_box_pick_turn_v30_subtasks \
+    --dst-dir datasets/g1_box_pick_turn_v30_subtasks_state_as_action \
+    --shift 1
+```
+
+#### 版本 B：生成消融对比的 `shift=0` 数据集
+```bash
+export LD_LIBRARY_PATH="/home/yichangfeng/miniforge3/envs/lerobot/lib:${LD_LIBRARY_PATH}"
+PYTHON="/home/yichangfeng/miniforge3/envs/lerobot/bin/python"
+
+$PYTHON dataset_tools/replace_action_with_state.py \
+    --src-dir datasets/g1_box_pick_turn_v30_subtasks \
+    --dst-dir datasets/g1_box_pick_turn_v30_subtasks_state_as_action_shift0 \
+    --shift 0
+```
+
+---
+
+## 七、SOP 阶段 5：数据集质量验证、消抖评估与仿真回放
+
+### 7.1 数值健康自检
+运行自检确认两套数据集的帧数、分词及归一化表现：
+```bash
+export LD_LIBRARY_PATH="/home/yichangfeng/miniforge3/envs/lerobot/lib:${LD_LIBRARY_PATH}"
+PYTHON="/home/yichangfeng/miniforge3/envs/lerobot/bin/python"
+
+$PYTHON -c "
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+for name in ['g1_box_pick_turn_v30_subtasks_state_as_action', 'g1_box_pick_turn_v30_subtasks_state_as_action_shift0']:
+    ds = LeRobotDataset(name, root=f'datasets/{name}')
+    print(f'[{name}] Episodes: {ds.num_episodes}, Frames: {len(ds)}, Task0: {ds[0][\"task\"]}')
+"
+```
+
+### 7.2 二阶抖动量化指标对比
+根据离散二阶加速度差分：$\text{Jitter} = \frac{1}{N}\sum |q_{t+1} - 2q_t + q_{t-1}|$：
+
+| 数据集版本 | 双臂 Action 抖动均值 | 相比原始 Action 改善幅度 |
+| :--- | :--- | :--- |
+| 原始采集数据 (`g1_box_pick_turn_v30`) | **$12.007\text{ mrad}$** | 基准（剧烈高频震颤） |
+| **新生成数据集 (`state_as_action`, shift=1)** | **$1.655\text{ mrad}$** | **大幅降低 86.2%（极度平滑）** |
+| 物理电机实测状态 (`state`) | **$1.652\text{ mrad}$** | 物理机械基线（完全重合） |
+
+### 7.3 MuJoCo 仿真 3D 回放验证
+在终端启动 3D 仿真回放工具，验证机械臂平滑轨迹与底盘转向，界面抬头显示器（HUD）将动态显示当前子任务名称：
+```bash
+# 回放新数据集动作 (Action 模式)
+$PYTHON dataset_tools/replay_g1_dataset.py \
+    --dataset-dir datasets/g1_box_pick_turn_v30_subtasks_state_as_action \
+    --mode action \
+    --episode 0
+```
+
+---
+
+## 八、SOP 阶段 6：下游模型微调训练启动指南
+
+### 8.1 统一配置文件快捷启动 (推荐)
+已在 `train_pi05_config.yaml` 中将全部超参数统一对齐（5000 步、余弦衰减至 5000 步、每 1000 步存盘、关闭在线 WandB、显存占用 ~16GB）：
+
+```bash
+cd /home/yichangfeng/lerobot
+
+# 方式 1: 直接使用默认配置启动推荐组 (shift=1 数据集)
+./run_train.sh
+
+# 方式 2: 一键启动消融对照组 (shift=0 数据集)
+./run_train.sh \
+    --dataset.repo_id="g1_box_pick_turn_v30_subtasks_state_as_action_shift0" \
+    --dataset.root="datasets/g1_box_pick_turn_v30_subtasks_state_as_action_shift0" \
+    --output_dir="outputs/train/pi05_subtasks_state_as_action_shift0" \
+    --job_name="pi05_subtasks_state_as_action_shift0"
+
+# 方式 3: 后台持久化挂起运行并实时看日志
+nohup ./run_train.sh > train.log 2>&1 &
+tail -f train.log
+```
+
+### 8.2 等价的全量显式 CLI 启动命令
+上述 `./run_train.sh` 脚本背后加载 `train_pi05_config.yaml`，其完整行为与以下显式命令 100% 严格等价：
+
+```bash
+export LD_LIBRARY_PATH="/home/yichangfeng/miniforge3/envs/lerobot/lib:${LD_LIBRARY_PATH}"
+PYTHON="/home/yichangfeng/miniforge3/envs/lerobot/bin/python"
+
+$PYTHON -m lerobot.scripts.lerobot_train \
+    --config_path="train_pi05_config.yaml" \
+    --dataset.repo_id="g1_box_pick_turn_v30_subtasks_state_as_action" \
+    --dataset.root="datasets/g1_box_pick_turn_v30_subtasks_state_as_action" \
+    --policy.path="model/box_pick" \
+    --policy.train_expert_only=true \
+    --policy.compile_model=false \
+    --output_dir="outputs/train/pi05_subtasks_state_as_action_shift1" \
+    --job_name="pi05_subtasks_state_as_action_shift1" \
+    --batch_size=8 \
+    --steps=5000 \
+    --save_freq=1000 \
+    --log_freq=50 \
+    --policy.device="cuda" \
+    --wandb.enable=false
+```
+
+---
+
+## 九、数据处理工具集与文件索引
+
+数据处理相关脚本已全部收归至专属目录 [`dataset_tools/`](./dataset_tools/) 统一定位与维护：
+
+```text
+dataset_tools/
+├── convert_rubberhand_to_g1_v30.py     # 格式转换：Sonic 43D -> LeRobot 29D/18D
+├── sanitize_sonic_dataset.py           # 样本清洗：截断任务终局多余悬停帧
+├── merge_sonic_datasets.py             # 数据合并：多批次 Parquet 拼接
+├── align_velocity_dataset.py           # 速度对齐：底盘遥控速度分位数注入
+├── verify_raw_vs_converted.py          # 精度校验：逐帧核验转换绝对误差
+├── create_subtask_dataset.py           # 转向任务 3-Subtask 切片：剔除失败 Episode，注入 3-Subtask 标签
+├── create_subtask_dataset_inplace.py   # 原地任务 2-Subtask 切片：基于手腕高度与下放速度启动沿自动切分
+├── verify_subtask_splits.py            # 转向任务切片可视化：生成时序分割曲线与相机关键帧拼图
+├── verify_subtask_splits_inplace.py    # 原地任务切片可视化：手腕高度、下放速度与实景拼图
+├── replace_action_with_state.py        # State 替代 Action：消抖处理，支持 shift=1 与 shift=0
+├── evaluate_state_action.py            # 评估工具：计算抖动度与位置偏差学术报表
+├── replay_g1_dataset.py                # 仿真回放：MuJoCo 3D 动态回放与 Subtask HUD 显示
+└── README.md                           # 工具包索引与说明
+```
+
+> **总结**：
+> 通过本 SOP 规程处理后的两个数据集已全部就绪。新数据集完全继承了清洗后的 85 条演示与 3-Subtask 标注，同时将机械臂高频动作抖动降低了 **86.2%**，为 $\pi_{0.5}$ 模型在 MuJoCo 仿真与物理 G1 实机上的平滑、鲁棒部署奠定了高质量的数据基础。

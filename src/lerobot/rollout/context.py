@@ -146,6 +146,8 @@ def _resolve_action_key_order(
     if not policy_action_names:
         return dataset_action_names
     policy_action_names = list(policy_action_names)
+    if len(policy_action_names) == 1 and isinstance(policy_action_names[0], (list, tuple)):
+        policy_action_names = list(policy_action_names[0])
     if len(policy_action_names) != len(dataset_action_names):
         logger.warning(
             "policy.action_feature_names length (%d) != dataset action dim (%d); using dataset order",
@@ -165,6 +167,9 @@ def _align_state_feature_order(
     """Order scalar state features to match the checkpoint's joint order."""
     if not policy_action_names:
         return observation_features_hw
+
+    if len(policy_action_names) == 1 and isinstance(policy_action_names[0], (list, tuple)):
+        policy_action_names = list(policy_action_names[0])
 
     scalar_names = [
         name for name, feature in observation_features_hw.items() if not isinstance(feature, tuple)
@@ -261,6 +266,10 @@ class RolloutContext:
     policy: PolicyContext
     processors: ProcessorContext
     data: DatasetContext
+
+    @property
+    def robot_wrapper(self) -> ThreadSafeRobot | None:
+        return self.hardware.robot_wrapper if self.hardware else None
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +574,28 @@ def build_rollout_context(
         cfg.inference.type if hasattr(cfg.inference, "type") else "sync",
     )
     task_str = cfg.dataset.single_task if cfg.dataset else cfg.task
+
+    diagnostics_recorder = None
+    if getattr(cfg, "record_diagnostics", False) or getattr(cfg, "record", False):
+        from .inference.diagnostics import AsyncDiagnosticsRecorder
+
+        diag_dir = getattr(cfg, "diagnostics_dir", None)
+        robot_cfg = getattr(cfg, "robot", None)
+        robot_ip = getattr(robot_cfg, "robot_ip", "") if robot_cfg else ""
+        pol_cfg = getattr(cfg, "policy", None)
+        policy_path = getattr(pol_cfg, "pretrained_path", "") if pol_cfg else ""
+
+        diagnostics_recorder = AsyncDiagnosticsRecorder(
+            output_dir=diag_dir,
+            fps=cfg.fps,
+            task=task_str,
+            policy_path=policy_path,
+            robot_ip=robot_ip,
+        )
+        if hasattr(policy, "set_capture_diagnostics"):
+            policy.set_capture_diagnostics(True)
+            logger.info("Enabled policy diagnostic token capture")
+
     inference_strategy = create_inference_engine(
         cfg.inference,
         policy=policy,
@@ -580,6 +611,7 @@ def build_rollout_context(
         use_torch_compile=torch_compile_active,
         compile_warmup_inferences=cfg.compile_warmup_inferences,
         shutdown_event=shutdown_event,
+        diagnostics_recorder=diagnostics_recorder,
     )
 
     # --- 8. Assemble ---------------------------------------------------

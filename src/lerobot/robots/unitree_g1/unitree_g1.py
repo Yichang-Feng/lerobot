@@ -38,10 +38,16 @@ from .g1_kinematics import G1_29_ArmIK
 from .g1_utils import (
     NUM_MOTORS,
     REMOTE_AXES,
+    DEX1_ALL_FINGER_ACTUATORS,
+    DEX1_LEFT_FINGER_ACTUATORS,
+    DEX1_RIGHT_FINGER_ACTUATORS,
     G1_29_JointArmIndex,
     G1_29_JointIndex,
     default_remote_input,
+    map_gripper_cmd_to_pos,
+    map_pos_to_gripper_val,
 )
+
 
 if TYPE_CHECKING or _unitree_sdk_available:
     from unitree_sdk2py.core.channel import (
@@ -196,6 +202,14 @@ class UnitreeG1(Robot):
         self.subscribe_thread = None
         self.arm_ik = G1_29_ArmIK() if config.gravity_compensation else None
 
+        # Gripper state variables
+        self._gripper_lock = threading.Lock()
+        self._gripper_cmd = {"left": 1.0, "right": 1.0}
+        self._gripper_actuator_ids: dict[str, list[int]] = {"left": [], "right": []}
+
+
+
+
         # Controller loaded dynamically
         self.controller: RobotController | None = make_robot_controller(config.controller)
         # Controller thread state
@@ -229,7 +243,32 @@ class UnitreeG1(Robot):
             # Step simulation if in simulation mode
             if self.config.is_simulation and self.sim_env is not None:
                 with self._control_lock:
+                    if getattr(self.config, "enable_gripper", True):
+                        raw_sim = getattr(self.sim_env, "sim_env", self.sim_env)
+                        if hasattr(raw_sim, "mj_model") and hasattr(raw_sim, "mj_data"):
+                            with self._gripper_lock:
+                                l_cmd = self._gripper_cmd.get("left", 1.0)
+                                r_cmd = self._gripper_cmd.get("right", 1.0)
+
+                            l_pos = map_gripper_cmd_to_pos(l_cmd)
+                            r_pos = map_gripper_cmd_to_pos(r_cmd)
+
+                            for act_name in getattr(self.config, "gripper_actuators_left", DEX1_LEFT_FINGER_ACTUATORS):
+                                try:
+                                    act_id = raw_sim.mj_model.actuator(act_name).id
+                                    raw_sim.mj_data.ctrl[act_id] = l_pos
+                                except Exception:
+                                    pass
+
+                            for act_name in getattr(self.config, "gripper_actuators_right", DEX1_RIGHT_FINGER_ACTUATORS):
+                                try:
+                                    act_id = raw_sim.mj_model.actuator(act_name).id
+                                    raw_sim.mj_data.ctrl[act_id] = r_pos
+                                except Exception:
+                                    pass
+
                     self.sim_env.step()
+
 
             msg = self.lowstate_subscriber.Read()
             if msg is not None:
@@ -652,6 +691,31 @@ class UnitreeG1(Robot):
             if getattr(cam, "use_depth", False):
                 obs[f"{cam_name}_depth"] = cam.read_latest_depth()
 
+        if getattr(self.config, "enable_gripper", True):
+            with self._gripper_lock:
+                l_val = float(self._gripper_cmd.get("left", 1.0))
+                r_val = float(self._gripper_cmd.get("right", 1.0))
+
+
+            if self.config.is_simulation and self.sim_env is not None:
+                raw_sim = getattr(self.sim_env, "sim_env", self.sim_env)
+                if hasattr(raw_sim, "mj_model") and hasattr(raw_sim, "mj_data"):
+                    try:
+                        act_id = raw_sim.mj_model.actuator(getattr(self.config, "gripper_actuators_left", DEX1_LEFT_FINGER_ACTUATORS)[0]).id
+                        jnt_id = raw_sim.mj_model.actuator_trnid[act_id, 0]
+                        qpos_adr = raw_sim.mj_model.jnt_qposadr[jnt_id]
+                        l_val = map_pos_to_gripper_val(raw_sim.mj_data.qpos[qpos_adr])
+
+                        act_id_r = raw_sim.mj_model.actuator(getattr(self.config, "gripper_actuators_right", DEX1_RIGHT_FINGER_ACTUATORS)[0]).id
+                        jnt_id_r = raw_sim.mj_model.actuator_trnid[act_id_r, 0]
+                        qpos_adr_r = raw_sim.mj_model.jnt_qposadr[jnt_id_r]
+                        r_val = map_pos_to_gripper_val(raw_sim.mj_data.qpos[qpos_adr_r])
+                    except Exception:
+                        pass
+
+            obs["gripper.left"] = l_val
+            obs["gripper.right"] = r_val
+
         return obs
 
     def send_action(self, action: RobotAction) -> RobotAction:
@@ -662,6 +726,52 @@ class UnitreeG1(Robot):
             SonicIODumper.get_instance().log_pi05_action(action)
         except Exception:
             pass
+
+        # Process and extract gripper action if present
+        if getattr(self.config, "enable_gripper", True):
+            g = action.get("gripper", None)
+            if isinstance(g, dict):
+                left_cmd = g.get("left", g.get("gripper_left", None))
+                right_cmd = g.get("right", g.get("gripper_right", None))
+            else:
+                left_cmd = action.get("gripper.left", action.get("gripper_left", action.get("kLeftGripper.q", None)))
+                right_cmd = action.get("gripper.right", action.get("gripper_right", action.get("kRightGripper.q", None)))
+
+            if isinstance(left_cmd, dict):
+                left_cmd = left_cmd.get("q", left_cmd.get("pos", None))
+            if isinstance(right_cmd, dict):
+                right_cmd = right_cmd.get("q", right_cmd.get("pos", None))
+
+            with self._gripper_lock:
+                if left_cmd is not None:
+                    self._gripper_cmd["left"] = float(left_cmd)
+                if right_cmd is not None:
+                    self._gripper_cmd["right"] = float(right_cmd)
+
+            # In simulation, directly apply gripper position actuators during send_action for immediate response
+            if self.config.is_simulation and self.sim_env is not None:
+                raw_sim = getattr(self.sim_env, "sim_env", self.sim_env)
+                if hasattr(raw_sim, "mj_model") and hasattr(raw_sim, "mj_data"):
+                    with self._gripper_lock:
+                        l_cmd = self._gripper_cmd.get("left", 1.0)
+                        r_cmd = self._gripper_cmd.get("right", 1.0)
+
+                    l_pos = map_gripper_cmd_to_pos(l_cmd)
+                    r_pos = map_gripper_cmd_to_pos(r_cmd)
+
+                    for act_name in getattr(self.config, "gripper_actuators_left", DEX1_LEFT_FINGER_ACTUATORS):
+                        try:
+                            act_id = raw_sim.mj_model.actuator(act_name).id
+                            raw_sim.mj_data.ctrl[act_id] = l_pos
+                        except Exception:
+                            pass
+
+                    for act_name in getattr(self.config, "gripper_actuators_right", DEX1_RIGHT_FINGER_ACTUATORS):
+                        try:
+                            act_id = raw_sim.mj_model.actuator(act_name).id
+                            raw_sim.mj_data.ctrl[act_id] = r_pos
+                        except Exception:
+                            pass
 
         action_to_publish = action
         if self.controller is not None:
@@ -706,6 +816,7 @@ class UnitreeG1(Robot):
 
         self.publish_lowcmd(action_to_publish, tau=tau)
         return action
+
 
     def _update_controller_action(self, action: RobotAction) -> None:
         """Forward incoming teleop action values into ``controller_input``; each controller

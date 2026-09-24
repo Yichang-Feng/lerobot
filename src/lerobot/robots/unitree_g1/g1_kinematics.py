@@ -54,6 +54,32 @@ class WeightedMovingFilter:
         return self._filtered_data
 
 
+def rot6d_to_matrix(col1: np.ndarray, col2: np.ndarray) -> np.ndarray:
+    """
+    Gram-Schmidt orthonormalization of 6D rotation (two 3D columns) into 3x3 SO(3) matrix.
+    col1: first column of rotation matrix
+    col2: second column of rotation matrix (prior to orthogonalization)
+    """
+    c1 = np.asarray(col1, dtype=np.float64).flatten()
+    c2 = np.asarray(col2, dtype=np.float64).flatten()
+    n1 = np.linalg.norm(c1)
+    if n1 > 1e-8:
+        c1 = c1 / n1
+    else:
+        c1 = np.array([1.0, 0.0, 0.0])
+    proj = np.dot(c1, c2)
+    c2_ortho = c2 - proj * c1
+    n2 = np.linalg.norm(c2_ortho)
+    if n2 > 1e-8:
+        c2 = c2_ortho / n2
+    else:
+        c2 = np.array([0.0, 1.0, 0.0]) if abs(c1[1]) < 0.9 else np.array([1.0, 0.0, 0.0])
+        c2 = c2 - np.dot(c1, c2) * c1
+        c2 = c2 / np.linalg.norm(c2)
+    c3 = np.cross(c1, c2)
+    return np.column_stack([c1, c2, c3])
+
+
 class G1_29_ArmIK:  # noqa: N801
     def __init__(self, unit_test=False):
         import casadi
@@ -80,7 +106,6 @@ class G1_29_ArmIK:  # noqa: N801
 
         urdf_path = os.path.join(self.repo_path, "assets", "g1_body29_hand14.urdf")
         mesh_dir = os.path.join(self.repo_path, "assets")
-
 
         self.robot = self._pin.RobotWrapper.BuildFromURDF(urdf_path, mesh_dir)
 
@@ -167,6 +192,8 @@ class G1_29_ArmIK:  # noqa: N801
                 self._pin.FrameType.OP_FRAME,
             )
         )
+        # Re-create pinocchio data so frame buffer contains added frames
+        self.reduced_robot.data = self.reduced_robot.model.createData()
 
         # Creating Casadi models and data for symbolic computing
         self.cmodel = cpin.Model(self.reduced_robot.model)
@@ -234,7 +261,7 @@ class G1_29_ArmIK:  # noqa: N801
         )
 
         opts = {
-            "ipopt": {"print_level": 0, "max_iter": 50, "tol": 1e-6},
+            "ipopt": {"print_level": 0, "max_iter": 20, "tol": 1e-3},
             "print_time": False,  # print or not
             "calc_lam_p": False,  # https://github.com/casadi/casadi/wiki/FAQ:-Why-am-I-getting-%22NaN-detected%22in-my-optimization%3F
         }
@@ -243,9 +270,71 @@ class G1_29_ArmIK:  # noqa: N801
         self.init_data = np.zeros(self.reduced_robot.model.nq)
         self.smooth_filter = WeightedMovingFilter(np.array([0.4, 0.3, 0.2, 0.1]), 14)
 
+    def compute_fk(self, q_14: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Compute end-effector 4x4 transformation matrices for left and right arm joints (14-DoF).
+
+        Args:
+            q_14: Joint angles in G1 motor order (14-DoF).
+        """
+        q = np.asarray(q_14, dtype=np.float64).flatten()
+        if len(q) < 14:
+            q_full = np.zeros(14, dtype=np.float64)
+            q_full[:len(q)] = q
+            q = q_full
+        else:
+            q = q[:14]
+
+        # G1 motor order → Pinocchio internal q order
+        q = q[self._arm_reorder_g1_to_pin]
+
+        self._pin.forwardKinematics(self.reduced_robot.model, self.reduced_robot.data, q)
+        self._pin.updateFramePlacements(self.reduced_robot.model, self.reduced_robot.data)
+
+        T_L = self.reduced_robot.data.oMf[self.L_hand_id].homogeneous.copy()
+        T_R = self.reduced_robot.data.oMf[self.R_hand_id].homogeneous.copy()
+        return T_L, T_R
+
+    def compute_proprio_23d(
+        self,
+        raw_state: np.ndarray,
+        default_grippers: tuple[float, float] = (4.0, 4.0),
+    ) -> np.ndarray:
+        """
+        Compute 23-DoF proprioception [L_xyz (3), L_6d (6), R_xyz (3), R_6d (6), grippers (2), waist (3)]
+        from robot joint state (29-DoF or 14-DoF).
+        """
+        s = np.asarray(raw_state, dtype=np.float64).flatten()
+        if len(s) >= 29:
+            q_left = s[15:22]
+            q_right = s[22:29]
+            waist = s[12:15]
+        elif len(s) >= 14:
+            q_left = s[0:7]
+            q_right = s[7:14]
+            waist = np.zeros(3, dtype=np.float64)
+        else:
+            q_left = np.zeros(7, dtype=np.float64)
+            q_right = np.zeros(7, dtype=np.float64)
+            waist = np.zeros(3, dtype=np.float64)
+
+        q_14 = np.concatenate([q_left, q_right])
+        T_L, T_R = self.compute_fk(q_14)
+
+        L_xyz = T_L[:3, 3]
+        L_rot = T_L[:3, :3]
+        L_6d = np.concatenate([L_rot[:, 0], L_rot[:, 1]])
+
+        R_xyz = T_R[:3, 3]
+        R_rot = T_R[:3, :3]
+        R_6d = np.concatenate([R_rot[:, 0], R_rot[:, 1]])
+
+        grippers = np.array(default_grippers, dtype=np.float64)
+        return np.concatenate([L_xyz, L_6d, R_xyz, R_6d, grippers, waist]).astype(np.float32)
+
     def solve_ik(self, left_wrist, right_wrist, current_lr_arm_motor_q=None, current_lr_arm_motor_dq=None):
         if current_lr_arm_motor_q is not None:
-            self.init_data = current_lr_arm_motor_q
+            # Convert from G1 motor order to Pinocchio internal order
+            self.init_data = np.asarray(current_lr_arm_motor_q, dtype=np.float64)[self._arm_reorder_g1_to_pin]
         self.opti.set_initial(self.var_q, self.init_data)
 
         self.opti.set_value(self.param_tf_l, left_wrist)
@@ -258,7 +347,7 @@ class G1_29_ArmIK:  # noqa: N801
             sol_q = self.opti.value(self.var_q)
         except Exception as e:
             converged = False
-            logger.error(f"IK convergence error: {e}")
+            logger.debug(f"IK convergence warning: {e}")
             sol_q = self.opti.debug.value(self.var_q)
 
         self.smooth_filter.add_data(sol_q)
@@ -266,10 +355,9 @@ class G1_29_ArmIK:  # noqa: N801
         self.init_data = sol_q
 
         if not converged:
-            logger.error(
-                f"sol_q:{sol_q} \nmotorstate: \n{current_lr_arm_motor_q} \nleft_pose: \n{left_wrist} \nright_pose: \n{right_wrist}"
-            )
-            return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
+            # current_lr_arm_motor_q is already in G1 order; sol_q is in Pinocchio order
+            fallback = current_lr_arm_motor_q if current_lr_arm_motor_q is not None else sol_q[self._arm_reorder_pin_to_g1]
+            return fallback, np.zeros(self.reduced_robot.model.nv)
 
         sol_tauff = self._pin.rnea(
             self.reduced_robot.model,
@@ -279,7 +367,33 @@ class G1_29_ArmIK:  # noqa: N801
             np.zeros(self.reduced_robot.model.nv),
         )
 
-        return sol_q, sol_tauff
+        # Convert from Pinocchio order back to G1 motor order
+        return sol_q[self._arm_reorder_pin_to_g1], sol_tauff[self._arm_reorder_pin_to_g1]
+
+    def solve_ik_chunk(
+        self,
+        T_L_seq: list[np.ndarray] | np.ndarray,
+        T_R_seq: list[np.ndarray] | np.ndarray,
+        q_init: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """
+        Sequentially solve IK for a chunk of poses with warm starting between consecutive steps.
+
+        Args:
+            q_init: Initial joint seed in G1 motor order (14-DoF). If None, uses internal state.
+
+        Returns: (num_steps, 14) array of joint angles in G1 motor order.
+        """
+        num_steps = min(len(T_L_seq), len(T_R_seq))
+        sol_seq = np.zeros((num_steps, 14), dtype=np.float32)
+        # self.init_data is in Pinocchio order; convert to G1 motor order for solve_ik interface
+        cur_q = q_init if q_init is not None else self.init_data[self._arm_reorder_pin_to_g1]
+
+        for t in range(num_steps):
+            cur_q, _ = self.solve_ik(T_L_seq[t], T_R_seq[t], current_lr_arm_motor_q=cur_q)
+            sol_seq[t] = cur_q
+
+        return sol_seq
 
     def solve_tau(self, current_lr_arm_motor_q=None, current_lr_arm_motor_dq=None):
         try:

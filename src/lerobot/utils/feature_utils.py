@@ -131,7 +131,19 @@ def build_dataset_frame(
         elif ft["dtype"] == "float32" and len(ft["shape"]) == 1:
             frame[key] = np.array([values[name] for name in ft["names"]], dtype=np.float32)
         elif ft["dtype"] in ["image", "video"]:
-            frame[key] = values[key.removeprefix(f"{prefix}.images.")]
+            cam_k = key.removeprefix(f"{prefix}.images.")
+            if cam_k in values:
+                frame[key] = values[cam_k]
+            elif key in values:
+                frame[key] = values[key]
+            else:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Image key '%s' (or '%s') not found in observation values; using zero array fallback to avoid crash.",
+                    cam_k,
+                    key,
+                )
+                frame[key] = np.zeros(ft["shape"], dtype=np.uint8)
 
     return frame
 

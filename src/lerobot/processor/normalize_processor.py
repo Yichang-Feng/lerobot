@@ -95,6 +95,7 @@ class _NormalizationMixin:
     device: torch.device | str | None = None
     dtype: torch.dtype | None = None
     eps: float = 1e-8
+    min_denominator: float = 0.01
     normalize_observation_keys: set[str] | None = None
 
     _tensor_stats: dict[str, dict[str, Tensor]] = field(default_factory=dict, init=False, repr=False)
@@ -254,6 +255,7 @@ class _NormalizationMixin:
         """
         config = {
             "eps": self.eps,
+            "min_denominator": getattr(self, "min_denominator", 0.01),
             "features": {
                 key: {"type": ft.type.value, "shape": ft.shape} for key, ft in self.features.items()
             },
@@ -371,12 +373,9 @@ class _NormalizationMixin:
 
             min_val, max_val = stats["min"], stats["max"]
             denom = max_val - min_val
-            # When min_val == max_val, substitute the denominator with a small epsilon
-            # to prevent division by zero. This consistently maps an input equal to
-            # min_val to -1, ensuring a stable transformation.
-            denom = torch.where(
-                denom == 0, torch.tensor(self.eps, device=tensor.device, dtype=tensor.dtype), denom
-            )
+            # When min_val == max_val or range is near-zero, clamp with min_denominator to prevent division by zero and noise explosion
+            min_denom = max(self.eps, getattr(self, "min_denominator", 0.01))
+            denom = torch.clamp(denom, min=min_denom)
             if inverse:
                 # Map from [-1, 1] back to [min, max]
                 return (tensor + 1) / 2 * denom + min_val
@@ -392,10 +391,9 @@ class _NormalizationMixin:
                 )
 
             denom = q99 - q01
-            # Avoid division by zero by adding epsilon when quantiles are identical
-            denom = torch.where(
-                denom == 0, torch.tensor(self.eps, device=tensor.device, dtype=tensor.dtype), denom
-            )
+            # Avoid division by zero and extreme noise amplification on stationary joints (deadzone protection)
+            min_denom = max(self.eps, getattr(self, "min_denominator", 0.01))
+            denom = torch.clamp(denom, min=min_denom)
             if inverse:
                 return (tensor + 1.0) * denom / 2.0 + q01
             return 2.0 * (tensor - q01) / denom - 1.0
@@ -409,10 +407,9 @@ class _NormalizationMixin:
                 )
 
             denom = q90 - q10
-            # Avoid division by zero by adding epsilon when quantiles are identical
-            denom = torch.where(
-                denom == 0, torch.tensor(self.eps, device=tensor.device, dtype=tensor.dtype), denom
-            )
+            # Avoid division by zero and extreme noise amplification on stationary joints (deadzone protection)
+            min_denom = max(self.eps, getattr(self, "min_denominator", 0.01))
+            denom = torch.clamp(denom, min=min_denom)
             if inverse:
                 return (tensor + 1.0) * denom / 2.0 + q10
             return 2.0 * (tensor - q10) / denom - 1.0
@@ -441,6 +438,7 @@ class NormalizerProcessorStep(_NormalizationMixin, ProcessorStep):
         *,
         normalize_observation_keys: set[str] | None = None,
         eps: float = 1e-8,
+        min_denominator: float = 0.01,
         device: torch.device | str | None = None,
     ) -> NormalizerProcessorStep:
         """
@@ -452,6 +450,7 @@ class NormalizerProcessorStep(_NormalizationMixin, ProcessorStep):
             norm_map: The mapping from feature types to normalization modes.
             normalize_observation_keys: An optional set of observation keys to normalize.
             eps: A small epsilon value for numerical stability.
+            min_denominator: Minimum denominator deadzone to prevent numerical explosion.
             device: The target device for the processor.
 
         Returns:
@@ -463,6 +462,7 @@ class NormalizerProcessorStep(_NormalizationMixin, ProcessorStep):
             stats=dataset.meta.stats,
             normalize_observation_keys=normalize_observation_keys,
             eps=eps,
+            min_denominator=min_denominator,
             device=device,
         )
 
@@ -514,6 +514,7 @@ class UnnormalizerProcessorStep(_NormalizationMixin, ProcessorStep):
         features: dict[str, PolicyFeature],
         norm_map: dict[FeatureType, NormalizationMode],
         *,
+        min_denominator: float = 0.01,
         device: torch.device | str | None = None,
     ) -> UnnormalizerProcessorStep:
         """
@@ -523,12 +524,19 @@ class UnnormalizerProcessorStep(_NormalizationMixin, ProcessorStep):
             dataset: The dataset from which to extract normalization statistics.
             features: The feature definition for the processor.
             norm_map: The mapping from feature types to normalization modes.
+            min_denominator: Minimum denominator deadzone to prevent numerical explosion.
             device: The target device for the processor.
 
         Returns:
             A new instance of `UnnormalizerProcessorStep`.
         """
-        return cls(features=features, norm_map=norm_map, stats=dataset.meta.stats, device=device)
+        return cls(
+            features=features,
+            norm_map=norm_map,
+            stats=dataset.meta.stats,
+            min_denominator=min_denominator,
+            device=device,
+        )
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         new_transition = transition.copy()

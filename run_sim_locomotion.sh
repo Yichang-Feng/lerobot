@@ -35,6 +35,7 @@ echo "==========================================================================
 
 exec "$PYTHON_BIN" -m lerobot.robots.unitree_g1.run_g1_locomotion_server \
     --sim \
+    --enable-gripper \
     --controller="${CONTROLLER}" \
     --state-port="${STATE_PORT}" \
     --action-port="${ACTION_PORT}" \

@@ -15,21 +15,35 @@
 # limitations under the License.
 
 """
-High-Performance Universal ZMQ Video Streamer for LeRobot Rollout.
-Supports AV1, H.264, VP9 using PyAV (with OpenCV fallback).
-Supports precise time/frame offsets (--start_time, --end_time, --start_frame, --end_frame).
+High-Performance Universal ZMQ Multi-Camera Video Streamer for LeRobot Rollout.
+Supports:
+1. Native LeRobotDataset multi-camera streaming (--dataset-root <path> --episode <idx>)
+   with perfect time-lockstep across cam_high (5556), cam_left_wrist (5557), cam_right_wrist (5558).
+2. Explicit multi-video streaming (--video-path <high> --left-video-path <left> --right-video-path <right>).
+3. Single video broadcasting across all ports as fallback.
+4. Auto-reconnect and infinite looping at accurate target FPS.
 """
+
+import os
+import sys
+
+# Ensure conda env C++ libs are prioritized to prevent CXXABI errors
+py_lib = os.path.abspath(os.path.join(os.path.dirname(sys.executable), "..", "lib"))
+if os.path.exists(os.path.join(py_lib, "libstdc++.so.6")):
+    cur_ld = os.environ.get("LD_LIBRARY_PATH", "")
+    if py_lib not in cur_ld.split(":"):
+        os.environ["LD_LIBRARY_PATH"] = f"{py_lib}:{cur_ld}" if cur_ld else py_lib
 
 import argparse
 import base64
 import json
 import logging
 import signal
-import sys
 import time
 from pathlib import Path
 
 import cv2
+import numpy as np
 import zmq
 
 try:
@@ -62,7 +76,7 @@ def parse_time_str(val: str | float | None) -> float | None:
     return float(val_str)
 
 
-def encode_bgr_frame(frame_bgr, quality: int = 80) -> str:
+def encode_bgr_frame(frame_bgr: np.ndarray, quality: int = 80) -> str:
     """Encodes an OpenCV BGR numpy array into a Base64 JPEG string."""
     success, buffer = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
     if not success:
@@ -73,159 +87,288 @@ def encode_bgr_frame(frame_bgr, quality: int = 80) -> str:
 class ZMQVideoStreamer:
     def __init__(
         self,
-        video_path: str | Path,
+        video_path: str | Path | None = None,
+        left_video_path: str | Path | None = None,
+        right_video_path: str | Path | None = None,
+        dataset_root: str | Path | None = None,
+        episode_idx: int = 0,
         port: int = 5556,
-        camera_names: list[str] | None = None,
+        left_wrist_port: int = 5557,
+        right_wrist_port: int = 5558,
+        multi_port: bool = True,
         fps: float = 30.0,
         loop: bool = True,
         quality: int = 80,
-        start_time: str | float | None = None,
-        end_time: str | float | None = None,
-        start_frame: int | None = None,
-        end_frame: int | None = None,
     ):
-        self.video_path = Path(video_path).expanduser().resolve()
-        if not self.video_path.exists():
-            raise FileNotFoundError(f"Video file not found: {self.video_path}")
+        self.dataset_root = Path(dataset_root).expanduser().resolve() if dataset_root else None
+        self.episode_idx = episode_idx
+        self.video_path = Path(video_path).expanduser().resolve() if video_path else None
+        self.left_video_path = Path(left_video_path).expanduser().resolve() if left_video_path else None
+        self.right_video_path = Path(right_video_path).expanduser().resolve() if right_video_path else None
 
         self.port = port
-        self.camera_names = camera_names or ["head_camera", "global_view"]
+        self.left_wrist_port = left_wrist_port
+        self.right_wrist_port = right_wrist_port
+        self.multi_port = multi_port
+
         self.fps = fps
         self.interval = 1.0 / fps if fps > 0 else 0.0333
         self.loop = loop
         self.quality = quality
 
-        self.start_sec = parse_time_str(start_time) or 0.0
-        self.end_sec = parse_time_str(end_time)
-        self.start_frame = start_frame
-        self.end_frame = end_frame
-
         self.running = False
         self.context = None
-        self.socket = None
+        self.sockets = {}
 
     def _init_zmq(self):
-        """Initializes the ZMQ PUB socket."""
+        """Initializes the ZMQ PUB sockets for all camera streams."""
         self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.PUB)
-        self.socket.setsockopt(zmq.SNDHWM, 20)
-        self.socket.setsockopt(zmq.LINGER, 0)
-        self.socket.bind(f"tcp://*:{self.port}")
-        logger.info(f"ZMQ PUB socket bound to tcp://*:{self.port}")
+        self.sockets = {}
 
-    def publish_frame(self, img_dict: dict[str, str], ts: float):
-        """Publishes a single frame JSON packet over ZMQ."""
-        payload = {
-            "timestamps": {cam: ts for cam in self.camera_names},
-            "images": img_dict,
+        # 1. Main / Head camera socket (Port 5556)
+        s_main = self.context.socket(zmq.PUB)
+        s_main.setsockopt(zmq.SNDHWM, 20)
+        s_main.setsockopt(zmq.LINGER, 0)
+        s_main.bind(f"tcp://*:{self.port}")
+        self.sockets["main"] = s_main
+        logger.info(f"✓ ZMQ Head Camera (global_view) bound to tcp://*:{self.port}")
+
+        # 2. Left wrist socket (Port 5557)
+        if self.multi_port and self.left_wrist_port:
+            s_lw = self.context.socket(zmq.PUB)
+            s_lw.setsockopt(zmq.SNDHWM, 20)
+            s_lw.setsockopt(zmq.LINGER, 0)
+            s_lw.bind(f"tcp://*:{self.left_wrist_port}")
+            self.sockets["left_wrist"] = s_lw
+            logger.info(f"✓ ZMQ Left Wrist Camera bound to tcp://*:{self.left_wrist_port}")
+
+        # 3. Right wrist socket (Port 5558)
+        if self.multi_port and self.right_wrist_port:
+            s_rw = self.context.socket(zmq.PUB)
+            s_rw.setsockopt(zmq.SNDHWM, 20)
+            s_rw.setsockopt(zmq.LINGER, 0)
+            s_rw.bind(f"tcp://*:{self.right_wrist_port}")
+            self.sockets["right_wrist"] = s_rw
+            logger.info(f"✓ ZMQ Right Wrist Camera bound to tcp://*:{self.right_wrist_port}")
+
+    def publish_frame(
+        self,
+        main_b64: str,
+        left_b64: str | None = None,
+        right_b64: str | None = None,
+        ts: float | None = None,
+    ):
+        """Publishes camera frames across ZMQ ports formatted for ZMQCamera clients."""
+        if ts is None:
+            ts = time.time()
+
+        if left_b64 is None:
+            left_b64 = main_b64
+        if right_b64 is None:
+            right_b64 = main_b64
+
+        # 1. Head / Main socket payload (port 5556)
+        payload_main = {
+            "timestamps": {"head_camera": ts, "global_view": ts, "left_wrist": ts, "right_wrist": ts},
+            "images": {
+                "head_camera": main_b64,
+                "global_view": main_b64,
+                "cam_high": main_b64,
+                "left_wrist": left_b64,
+                "right_wrist": right_b64,
+            },
+            "head_camera": main_b64,
+            "global_view": main_b64,
         }
-        for cam, b64_img in img_dict.items():
-            payload[cam] = b64_img
-
-        json_str = json.dumps(payload)
         try:
-            self.socket.send_string(json_str, flags=zmq.NOBLOCK)
+            self.sockets["main"].send_string(json.dumps(payload_main), flags=zmq.NOBLOCK)
         except zmq.Again:
             pass
 
-    def _stream_with_pyav(self):
-        """Streams video using PyAV with seeking and timestamp filtering."""
-        logger.info("Using PyAV video decoding backend (libdav1d / ffmpeg)")
-        cycle_count = 0
-        total_published = 0
-        stream_start_time = time.perf_counter()
+        # 2. Left wrist socket payload (port 5557)
+        if "left_wrist" in self.sockets:
+            payload_left = {
+                "timestamps": {"left_wrist": ts, "cam_left_wrist": ts},
+                "images": {
+                    "left_wrist": left_b64,
+                    "cam_left_wrist": left_b64,
+                },
+                "left_wrist": left_b64,
+            }
+            try:
+                self.sockets["left_wrist"].send_string(json.dumps(payload_left), flags=zmq.NOBLOCK)
+            except zmq.Again:
+                pass
+
+        # 3. Right wrist socket payload (port 5558)
+        if "right_wrist" in self.sockets:
+            payload_right = {
+                "timestamps": {"right_wrist": ts, "cam_right_wrist": ts},
+                "images": {
+                    "right_wrist": right_b64,
+                    "cam_right_wrist": right_b64,
+                },
+                "right_wrist": right_b64,
+            }
+            try:
+                self.sockets["right_wrist"].send_string(json.dumps(payload_right), flags=zmq.NOBLOCK)
+            except zmq.Again:
+                pass
+
+    def _stream_dataset(self):
+        """Streams native multi-camera dataset in 100% frame-level lockstep."""
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+        repo_name = self.dataset_root.name
+        logger.info(f"Loading LeRobot dataset '{repo_name}' from: {self.dataset_root}")
+        ds = LeRobotDataset(repo_name, root=str(self.dataset_root))
+
+        total_episodes = ds.num_episodes
+        ep_idx = min(self.episode_idx, total_episodes - 1)
+
+        # Calculate episode frame range
+        from_idx = sum(ds.meta.episodes[i]["length"] for i in range(ep_idx))
+        ep_len = ds.meta.episodes[ep_idx]["length"]
+        to_idx = from_idx + ep_len
+
+        logger.info(f"Selected Episode #{ep_idx} (Frames {from_idx} -> {to_idx}, total {ep_len} frames)")
+
+        # Find camera feature names
+        high_key = "observation.images.cam_high"
+        left_key = "observation.images.cam_left_wrist"
+        right_key = "observation.images.cam_right_wrist"
+
+        cycle = 0
+        total_pub = 0
+        t_start = time.perf_counter()
 
         while self.running:
-            cycle_count += 1
-            start_desc = f"{self.start_sec:.1f}s" if self.start_sec > 0 else "0.0s"
-            end_desc = f"{self.end_sec:.1f}s" if self.end_sec else "end"
-            logger.info(f"--- Starting video cycle #{cycle_count} (Range: {start_desc} -> {end_desc}) ---")
+            cycle += 1
+            logger.info(f"--- [Cycle #{cycle}] Starting playback of Episode #{ep_idx} ---")
+            cycle_pub = 0
 
-            with av.open(str(self.video_path)) as container:
-                stream = container.streams.video[0]
-                total_frames = stream.frames or "unknown"
-                native_fps = float(stream.average_rate) if stream.average_rate else 30.0
+            for f_idx in range(from_idx, to_idx):
+                if not self.running:
+                    break
+                t0 = time.perf_counter()
+                item = ds[f_idx]
 
-                if cycle_count == 1:
-                    logger.info(
-                        f"Video opened: {self.video_path.name} | Codec: {stream.codec_context.name} | "
-                        f"Resolution: {stream.width}x{stream.height} | Total Frames: {total_frames} | Native FPS: {native_fps:.1f}"
-                    )
+                # Convert torch tensors (C, H, W in [0, 1]) to OpenCV BGR uint8
+                t_h = item[high_key]
+                t_l = item[left_key] if left_key in item else t_h
+                t_r = item[right_key] if right_key in item else t_h
 
-                # Seek to start time if requested
-                if self.start_sec > 0:
-                    seek_target = int(self.start_sec / stream.time_base)
-                    container.seek(seek_target, stream=stream, backward=True)
+                bgr_h = cv2.cvtColor((t_h.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR)
+                bgr_l = cv2.cvtColor((t_l.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR)
+                bgr_r = cv2.cvtColor((t_r.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR)
 
-                raw_frame_idx = 0
-                published_in_cycle = 0
+                b64_h = encode_bgr_frame(bgr_h, quality=self.quality)
+                b64_l = encode_bgr_frame(bgr_l, quality=self.quality)
+                b64_r = encode_bgr_frame(bgr_r, quality=self.quality)
 
-                for frame in container.decode(video=0):
-                    if not self.running:
-                        break
+                self.publish_frame(b64_h, b64_l, b64_r)
 
-                    raw_frame_idx += 1
-                    cur_time = float(frame.pts * stream.time_base) if frame.pts is not None else (raw_frame_idx / native_fps)
+                cycle_pub += 1
+                total_pub += 1
 
-                    # Filter by start time
-                    if cur_time < self.start_sec - 0.01:
-                        continue
+                if cycle_pub % 60 == 0:
+                    fps_real = total_pub / (time.perf_counter() - t_start)
+                    logger.info(f"Cycle #{cycle} | 3-Cam Synced Frames: {cycle_pub}/{ep_len} | Real-Time FPS: {fps_real:.1f}")
 
-                    # Filter by start frame
-                    if self.start_frame is not None and raw_frame_idx < self.start_frame:
-                        continue
-
-                    # Filter by end time
-                    if self.end_sec is not None and cur_time > self.end_sec:
-                        logger.info(f"Reached end time ({self.end_sec:.1f}s). Looping.")
-                        break
-
-                    # Filter by end frame
-                    if self.end_frame is not None and raw_frame_idx > self.end_frame:
-                        logger.info(f"Reached end frame ({self.end_frame}). Looping.")
-                        break
-
-                    t0 = time.perf_counter()
-                    frame_bgr = frame.to_ndarray(format="bgr24")
-                    encoded_jpg = encode_bgr_frame(frame_bgr, quality=self.quality)
-                    img_dict = {cam: encoded_jpg for cam in self.camera_names}
-                    ts = time.time()
-                    self.publish_frame(img_dict, ts)
-
-                    published_in_cycle += 1
-                    total_published += 1
-
-                    if published_in_cycle % 60 == 0:
-                        elapsed_total = time.perf_counter() - stream_start_time
-                        cur_fps = total_published / elapsed_total if elapsed_total > 0 else 0
-                        logger.info(
-                            f"Cycle #{cycle_count} | Video Time: {cur_time:.1f}s | "
-                            f"Frames Pub: {published_in_cycle} | Avg FPS: {cur_fps:.1f}"
-                        )
-
-                    elapsed = time.perf_counter() - t0
-                    sleep_time = self.interval - elapsed
-                    if sleep_time > 0:
-                        time.sleep(sleep_time)
+                sleep_time = self.interval - (time.perf_counter() - t0)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
 
             if not self.loop:
-                logger.info("Video stream finished (loop=False). Stopping.")
+                logger.info("Dataset episode playback completed (loop=False). Exiting.")
+                break
+
+    def _stream_video_files(self):
+        """Streams from single or 3 video files using PyAV for AV1/H264 support."""
+        if not HAS_AV:
+            raise RuntimeError("PyAV is required for decoding AV1/H264 video files. Please run: pip install av")
+
+        logger.info(f"Opening main video via PyAV: {self.video_path}")
+        cycle = 0
+        total_pub = 0
+        t_start = time.perf_counter()
+
+        while self.running:
+            cycle += 1
+            logger.info(f"--- [Cycle #{cycle}] Starting video playback loop ---")
+            cycle_pub = 0
+
+            container_main = av.open(str(self.video_path))
+            stream_main = container_main.decode(video=0)
+
+            container_left = av.open(str(self.left_video_path)) if (self.left_video_path and self.left_video_path.exists()) else None
+            stream_left = container_left.decode(video=0) if container_left else None
+
+            container_right = av.open(str(self.right_video_path)) if (self.right_video_path and self.right_video_path.exists()) else None
+            stream_right = container_right.decode(video=0) if container_right else None
+
+            while self.running:
+                t0 = time.perf_counter()
+                try:
+                    f_main = next(stream_main)
+                    frame_main = f_main.to_ndarray(format="bgr24")
+                except StopIteration:
+                    break
+
+                frame_l = None
+                if stream_left:
+                    try:
+                        f_l = next(stream_left)
+                        frame_l = f_l.to_ndarray(format="bgr24")
+                    except StopIteration:
+                        pass
+
+                frame_r = None
+                if stream_right:
+                    try:
+                        f_r = next(stream_right)
+                        frame_r = f_r.to_ndarray(format="bgr24")
+                    except StopIteration:
+                        pass
+
+                b64_main = encode_bgr_frame(frame_main, quality=self.quality)
+                b64_left = encode_bgr_frame(frame_l, quality=self.quality) if frame_l is not None else b64_main
+                b64_right = encode_bgr_frame(frame_r, quality=self.quality) if frame_r is not None else b64_main
+
+                self.publish_frame(b64_main, b64_left, b64_right)
+
+                cycle_pub += 1
+                total_pub += 1
+
+                if cycle_pub % 60 == 0:
+                    fps_real = total_pub / (time.perf_counter() - t_start)
+                    logger.info(f"Cycle #{cycle} | Frames: {cycle_pub} | Real-Time FPS: {fps_real:.1f}")
+
+                sleep_time = self.interval - (time.perf_counter() - t0)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+            container_main.close()
+            if container_left:
+                container_left.close()
+            if container_right:
+                container_right.close()
+
+            if not self.loop:
                 break
 
     def run(self):
-        """Main streaming entry point."""
+        """Starts streaming."""
         self._init_zmq()
         self.running = True
-        logger.info(
-            f"Streaming at {self.fps} Hz on port {self.port} "
-            f"(camera_names={self.camera_names}, loop={self.loop}, start_time={self.start_sec}s)..."
-        )
 
         try:
-            if HAS_AV:
-                self._stream_with_pyav()
+            if self.dataset_root is not None:
+                self._stream_dataset()
+            elif self.video_path is not None:
+                self._stream_video_files()
             else:
-                raise RuntimeError("PyAV is required for streaming. Please ensure 'av' is installed in the conda environment.")
+                raise ValueError("Must provide either --dataset-root or --video-path!")
         except KeyboardInterrupt:
             logger.info("Stream interrupted by user.")
         finally:
@@ -234,9 +377,9 @@ class ZMQVideoStreamer:
     def stop(self):
         """Cleans up ZMQ resources."""
         self.running = False
-        if self.socket:
-            self.socket.close()
-            self.socket = None
+        for s in self.sockets.values():
+            s.close()
+        self.sockets.clear()
         if self.context:
             self.context.term()
             self.context = None
@@ -244,38 +387,50 @@ class ZMQVideoStreamer:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Universal ZMQ Video Streamer for LeRobot Rollout")
+    parser = argparse.ArgumentParser(description="Universal ZMQ Multi-Camera Video Streamer for LeRobot Rollout")
     parser.add_argument(
-        "--video_path",
-        type=str,
-        default="datasets/box_pick/videos/observation.images.global_view/chunk-000/file-002.mp4",
-        help="Path to MP4 video file to stream",
-    )
-    parser.add_argument("--port", type=int, default=5556, help="ZMQ PUB port (default: 5556)")
-    parser.add_argument(
-        "--camera_names",
-        nargs="+",
-        default=["head_camera", "global_view"],
-        help="List of camera names/topics to publish",
-    )
-    parser.add_argument("--fps", type=float, default=30.0, help="Publish framerate in Hz (default: 30.0)")
-    parser.add_argument("--loop", action="store_true", default=True, help="Loop video playback indefinitely")
-    parser.add_argument("--no-loop", dest="loop", action="store_false", help="Do not loop video")
-    parser.add_argument("--quality", type=int, default=80, help="JPEG encoding quality (default: 80)")
-    parser.add_argument(
-        "--start_time",
-        type=str,
-        default="0:00",
-        help="Start time offset in seconds or MM:SS (default: '0:00' / 0s)",
-    )
-    parser.add_argument(
-        "--end_time",
+        "--dataset-root",
+        "--dataset_root",
+        dest="dataset_root",
         type=str,
         default=None,
-        help="End time offset in seconds or MM:SS (default: None, plays until end)",
+        help="Path to LeRobot dataset directory (e.g. datasets/g1_pick_put_dex1_0923)",
     )
-    parser.add_argument("--start_frame", type=int, default=None, help="Start frame index")
-    parser.add_argument("--end_frame", type=int, default=None, help="End frame index")
+    parser.add_argument("--episode", type=int, default=0, help="Episode index when streaming from dataset (default: 0)")
+    parser.add_argument(
+        "--video-path",
+        "--video_path",
+        dest="video_path",
+        type=str,
+        default=None,
+        help="Path to main/head camera video file",
+    )
+    parser.add_argument(
+        "--left-video-path",
+        "--left_video_path",
+        "--video-left",
+        dest="left_video_path",
+        type=str,
+        default=None,
+        help="Path to left wrist camera video file",
+    )
+    parser.add_argument(
+        "--right-video-path",
+        "--right_video_path",
+        "--video-right",
+        dest="right_video_path",
+        type=str,
+        default=None,
+        help="Path to right wrist camera video file",
+    )
+    parser.add_argument("--port", type=int, default=5556, help="ZMQ PUB port for head camera (default: 5556)")
+    parser.add_argument("--left-wrist-port", "--left_wrist_port", dest="left_wrist_port", type=int, default=5557, help="ZMQ PUB port for left wrist (default: 5557)")
+    parser.add_argument("--right-wrist-port", "--right_wrist_port", dest="right_wrist_port", type=int, default=5558, help="ZMQ PUB port for right wrist (default: 5558)")
+    parser.add_argument("--no-wrist-cameras", dest="multi_port", action="store_false", help="Only stream on main port 5556")
+    parser.add_argument("--fps", type=float, default=30.0, help="Publish framerate in Hz (default: 30.0)")
+    parser.add_argument("--loop", action="store_true", default=True, help="Loop playback indefinitely (default: True)")
+    parser.add_argument("--no-loop", dest="loop", action="store_false", help="Do not loop video")
+    parser.add_argument("--quality", type=int, default=80, help="JPEG encoding quality (default: 80)")
     return parser.parse_args()
 
 
@@ -283,15 +438,17 @@ def main():
     args = parse_args()
     streamer = ZMQVideoStreamer(
         video_path=args.video_path,
+        left_video_path=args.left_video_path,
+        right_video_path=args.right_video_path,
+        dataset_root=args.dataset_root,
+        episode_idx=args.episode,
         port=args.port,
-        camera_names=args.camera_names,
+        left_wrist_port=args.left_wrist_port,
+        right_wrist_port=args.right_wrist_port,
+        multi_port=args.multi_port,
         fps=args.fps,
         loop=args.loop,
         quality=args.quality,
-        start_time=args.start_time,
-        end_time=args.end_time,
-        start_frame=args.start_frame,
-        end_frame=args.end_frame,
     )
 
     def handle_signal(sig, frame):

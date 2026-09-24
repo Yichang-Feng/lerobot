@@ -34,6 +34,10 @@ from lerobot.processor import PolicyProcessorPipeline
 
 from ..robot_wrapper import ThreadSafeRobot
 from .base import InferenceEngine
+try:
+    from .diagnostics import AsyncDiagnosticsRecorder
+except ImportError:
+    AsyncDiagnosticsRecorder = Any
 from .rtc import RTCInferenceEngine
 from .sync import SyncInferenceEngine
 
@@ -95,6 +99,7 @@ def create_inference_engine(
     use_torch_compile: bool = False,
     compile_warmup_inferences: int = 2,
     shutdown_event: Event | None = None,
+    diagnostics_recorder: AsyncDiagnosticsRecorder | None = None,
 ) -> InferenceEngine:
     """Instantiate the appropriate inference engine from a config object."""
     logger.info("Creating inference engine: %s", config.type)
@@ -124,5 +129,6 @@ def create_inference_engine(
             compile_warmup_inferences=compile_warmup_inferences,
             rtc_queue_threshold=config.queue_threshold,
             shutdown_event=shutdown_event,
+            diagnostics_recorder=diagnostics_recorder,
         )
     raise ValueError(f"Unknown inference engine type: {type(config).__name__}")

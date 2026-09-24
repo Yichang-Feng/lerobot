@@ -25,10 +25,12 @@ from .factory import (
     SyncInferenceConfig,
     create_inference_engine,
 )
+from .diagnostics import AsyncDiagnosticsRecorder
 from .rtc import RTCInferenceEngine
 from .sync import SyncInferenceEngine
 
 __all__ = [
+    "AsyncDiagnosticsRecorder",
     "InferenceEngine",
     "InferenceEngineConfig",
     "PolicyQuery",

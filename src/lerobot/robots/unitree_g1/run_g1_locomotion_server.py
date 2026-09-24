@@ -61,8 +61,9 @@ def state_publisher_loop(
     state_sock: zmq.Socket,
     fps: float,
     shutdown_event: threading.Event,
+    gripper_sock: zmq.Socket | None = None,
 ) -> None:
-    """Publish 29-DoF joint state and IMU to ZMQ clients at constant rate."""
+    """Publish 29-DoF joint state, IMU, and optional gripper state to ZMQ clients at constant rate."""
     period = 1.0 / fps
     logger.info("State publisher thread started at %.1fHz", fps)
 
@@ -102,9 +103,84 @@ def state_publisher_loop(
             with contextlib.suppress(zmq.Again):
                 state_sock.send(payload, zmq.NOBLOCK)
 
+            if gripper_sock is not None:
+                obs = robot.get_observation()
+                g_left = float(obs.get("gripper.left", 1.0))
+                g_right = float(obs.get("gripper.right", 1.0))
+                g_msg = {
+                    "gripper": {"left": g_left, "right": g_right},
+                    "timestamp": time.time(),
+                }
+                g_payload = json.dumps(g_msg).encode("utf-8")
+                with contextlib.suppress(zmq.Again):
+                    gripper_sock.send(g_payload, zmq.NOBLOCK)
+
         elapsed = time.time() - t_start
         sleep_time = max(0.0, period - elapsed)
         time.sleep(sleep_time)
+
+
+def extract_gripper_command(data: dict) -> tuple[float, float] | None:
+    """
+    从 6002 的 JSON 包中提取左右夹爪值。
+
+    客户端可能把夹爪放在：
+    1. data["gripper"]
+    2. data["action"]["gripper"]
+    3. data["action"]["gripper.left"] / data["action"]["gripper.right"]
+    4. data["action"]["gripper_left"] / data["action"]["gripper_right"]
+    5. data["action"]["kLeftGripper.q"] / data["action"]["kRightGripper.q"]
+    """
+    action = data.get("action", {}) or {}
+
+    # 优先顶层 gripper
+    g = data.get("gripper", None)
+
+    # 其次 action 内嵌 gripper
+    if not isinstance(g, dict):
+        g = action.get("gripper", None)
+
+    if isinstance(g, dict):
+        left = g.get("left", g.get("gripper_left", 1.0))
+        right = g.get("right", g.get("gripper_right", 1.0))
+        return float(left), float(right)
+
+    left = None
+    right = None
+
+    left_candidates = [
+        "gripper.left",
+        "gripper_left",
+        "kLeftGripper.q",
+    ]
+
+    right_candidates = [
+        "gripper.right",
+        "gripper_right",
+        "kRightGripper.q",
+    ]
+
+    for key in left_candidates:
+        if key in action:
+            left = float(action[key])
+            break
+
+    for key in right_candidates:
+        if key in action:
+            right = float(action[key])
+            break
+
+    if left is None and right is None:
+        return None
+
+    if left is None:
+        left = 1.0
+
+    if right is None:
+        right = 1.0
+
+    return float(left), float(right)
+
 
 
 def main() -> None:
@@ -120,6 +196,25 @@ def main() -> None:
     parser.add_argument("--locomotion-mode", type=str, default="stand", help="Initial locomotion mode: stand or walk")
     parser.add_argument("--zero-locomotion-cmd", action="store_true", default=False, help="Force zero velocity to WBC")
     parser.add_argument("--fps", type=float, default=50.0, help="State publisher rate in Hz (default: 50)")
+    parser.add_argument(
+        "--enable-gripper",
+        action="store_true",
+        default=True,
+        help="Enable gripper parsing, execution and optional state publishing (default: True)",
+    )
+
+    parser.add_argument(
+        "--gripper-port",
+        type=int,
+        default=6004,
+        help="ZMQ PUB port for gripper state (used by client if enable_gripper=True)",
+    )
+
+    parser.add_argument(
+        "--gripper-direct",
+        action="store_true",
+        help="Directly write gripper commands in this server instead of relying on UnitreeG1.send_action",
+    )
 
     args = parser.parse_args()
 
@@ -158,6 +253,7 @@ def main() -> None:
         zero_locomotion_cmd=args.zero_locomotion_cmd,
         robot_scene=args.robot_scene,
         cameras=cameras_cfg,
+        enable_gripper=args.enable_gripper,
     )
 
     logger.info("Initializing UnitreeG1 instance...")
@@ -176,6 +272,13 @@ def main() -> None:
     action_sock.setsockopt(zmq.CONFLATE, 1)
     action_sock.bind(f"tcp://0.0.0.0:{args.action_port}")
 
+    gripper_sock = None
+    if args.enable_gripper:
+        gripper_sock = ctx.socket(zmq.PUB)
+        gripper_sock.setsockopt(zmq.CONFLATE, 1)
+        gripper_sock.bind(f"tcp://0.0.0.0:{args.gripper_port}")
+        logger.info("Gripper state publisher listening on ZMQ PUB port %d", args.gripper_port)
+
     shutdown_event = threading.Event()
 
     def handle_signal(sig, frame):
@@ -188,10 +291,11 @@ def main() -> None:
     # 3. Start state broadcast thread
     state_thread = threading.Thread(
         target=state_publisher_loop,
-        args=(robot, state_sock, args.fps, shutdown_event),
+        args=(robot, state_sock, args.fps, shutdown_event, gripper_sock),
         daemon=True,
     )
     state_thread.start()
+
 
     logger.info(
         "Locomotion Server is LIVE! Robot balance controller running. Waiting for VLA client on port %d...",
@@ -212,7 +316,9 @@ def main() -> None:
                     cmd = data.get("cmd", "action")
 
                     if cmd == "action":
-                        action = data.get("action", {})
+                        action = data.get("action", {}) or {}
+                        if "gripper" in data and "gripper" not in action:
+                            action["gripper"] = data["gripper"]
                         robot.send_action(action)
                         last_action_time = time.time()
                         if not vla_connected:

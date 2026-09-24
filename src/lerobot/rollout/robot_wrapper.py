@@ -79,6 +79,39 @@ class ThreadSafeRobot:
         return self._robot.is_connected
 
     @property
+    def current_mode(self):
+        return getattr(self._robot, "current_mode", None)
+
+    @property
+    def is_vla_mode(self) -> bool:
+        return getattr(self._robot, "is_vla_mode", False)
+
+    @property
+    def mode_port(self) -> int:
+        return getattr(self._robot, "mode_port", getattr(getattr(self._robot, "config", None), "mode_port", 6000))
+
+    @property
+    def mode_packet_count(self) -> int:
+        return getattr(self._robot, "mode_packet_count", 0)
+
+    @property
+    def last_mode_time(self) -> float:
+        return getattr(self._robot, "last_mode_time", 0.0)
+
+    @property
+    def last_mode_raw(self) -> str:
+        return getattr(self._robot, "last_mode_raw", "")
+
+    def mode_status_summary(self) -> str:
+        if hasattr(self._robot, "mode_status_summary"):
+            return self._robot.mode_status_summary()
+        return f"  • 当前模式: {self.current_mode}"
+
+    def trigger_engagement_smoothing(self) -> None:
+        if hasattr(self._robot, "trigger_engagement_smoothing"):
+            self._robot.trigger_engagement_smoothing()
+
+    @property
     def inner(self) -> Robot:
         """Access the underlying robot (e.g. for connect/disconnect)."""
         return self._robot

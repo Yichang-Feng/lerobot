@@ -30,7 +30,7 @@
 4. [数据转化：面向 Pi0.5 (model/box_pick)](#四数据转化面向-pi05-modelbox_pick)
    - 维度映射关系 (43D $\to$ 29D State, 18D Action)
    - 原地抱箱转身任务的关键动力学处理 (`remote.rx`)
-   - 转换脚本执行 (`convert_rubberhand_to_g1_v30.py` / `Psi0`)
+   - 转换脚本执行 (`dataset_tools/convert_rubberhand_to_g1_v30.py` / `Psi0`)
 5. [启动 Pi0.5 快速微调训练](#五启动-pi05-快速微调训练)
 
 ---
@@ -228,19 +228,21 @@ python gear_sonic/scripts/run_data_exporter.py \
 
 遥操人员在控制机器人抱起箱子、转身放置的过程中，通过以下按键控制数据录制：
 
-| 控制设备 | 按键动作 | 功能行为 | 提示音效 (零延迟) | 语音反馈 |
-| :--- | :--- | :--- | :--- | :--- |
-| **PICO VR 手柄** | **Left Grip + A** | **开始录制** (IDLE 状态) | 🎵 清脆上扬音 (`BEEP_START`, 880Hz $\to$ 1320Hz) | *"Recording started"* |
-| **PICO VR 手柄** | **Left Grip + A** | **结束并保存** (录制满 2.0s 后) | 🔔 清脆双音 (`BEEP_SAVE`, 1046Hz + 1318Hz) | *"Finished saving episode"* |
-| **PICO VR 手柄** | **Left Grip + A** | **误触多按 / 抖动拦截** (< 2.0s 内) | ⚠️ 急促双重警告音 (`BEEP_GUARD`, 440Hz 嘟嘟) | *(保持录制，不翻转)* |
-| **PICO VR 手柄** | **Left Grip + B** | **放弃当前 Episode** (丢弃失误动作) | 📉 低沉下落音 (`BEEP_DISCARD`, 587Hz $\to$ 293Hz) | *"Episode discarded"* |
-| **上位机键盘** | `c` 键 | 切换录制 / 保存 (带防抖门禁) | 同上手柄音效 | 同上 |
-| **上位机键盘** | `x` 键 | 放弃当前 Episode | 同上手柄音效 | 同上 |
+| 控制设备 | 按键动作 | 功能行为 | 提示音效 (零延迟) | 语音反馈 | 终端醒目标记 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **PICO VR 手柄** | **Left Grip + A** | **开始录制** (IDLE 状态) | 🎵 清脆上扬音 (`BEEP_START`, 880Hz $\to$ 1320Hz) | *"Recording started"* | 🟢 大号绿色横幅 `[START RECORDING]` |
+| **PICO VR 手柄** | **Left Grip + A** | **结束并保存** (无连按限制，立即停止) | 🔔 清脆双音 (`BEEP_SAVE`, 1046Hz + 1318Hz) | *"Finished saving episode"* | 🔴 大号黄色横幅 `[STOP RECORDING]` $\to$ 💾 青色横幅 `[SAVED]` |
+| **PICO VR 手柄** | **Left Grip + B** | **放弃当前 Episode** (丢弃失误动作) | 📉 低沉下落音 (`BEEP_DISCARD`, 587Hz $\to$ 293Hz) | *"Episode discarded"* | ⚠️ 大号红色横幅 `[DISCARDED]` |
+| **上位机键盘** | `c` 键 | 切换录制 / 结束保存 (立即生效) | 同上手柄音效 | 同上 | 同上对应横幅 |
+| **上位机键盘** | `x` 键 | 放弃当前 Episode | 同上手柄音效 | 同上 | 同上对应横幅 |
 
 > [!TIP]
-> **防抖与最短录制保护机制说明**：
-> 默认已开启 `--min-episode-duration 2.0`（最短录制有效时长 2 秒）与 `--debounce-cooldown 1.5`（按键冷却 1.5 秒）。
-> 若手柄误触连按，系统会自动拦截并播放 `BEEP_GUARD` 提示音，**状态绝不翻转，持续保持录制**；只有操作满 2 秒后的正常按键才会触发保存。无需分心看终端！
+> **连按与状态提醒说明**：
+> 已取消连按冷却与最短时长限制（默认 `--min-episode-duration 0.0` 与 `--debounce-cooldown 0.0`），结束录制与开启下一段录制均无冷却等待，支持快速连续切段录制。
+> 终端通过大号 ANSI 彩色横幅与每秒周期状态标签实时明确标识系统状态：
+> - 🟢 `● [录制中 EP#X | 时长 | 帧数]`（大号绿色横幅）：表示正在录制。
+> - 🔴 `⏳ [保存中 SAVING...]`（大号黄色横幅）：表示正在落盘编码。
+> - 💾 `○ [就绪 IDLE | 下一段 EP#X]`（大号青色横幅）：表示已保存就绪，可随时按下 `Left Grip + A` 启动下一段。
 
 
 每次录制完毕后，数据会自动累积保存在：
@@ -248,17 +250,17 @@ python gear_sonic/scripts/run_data_exporter.py \
 
 ### 4. 数据整理与异常样本剔除 (通用清洗工具)
 
-在批量录制过程中，若发现某些 Episode 操作失误（掉箱、绊倒）或前置等待时间过长，请使用专用的全自动清洗工具 [`sanitize_sonic_dataset.py`](file:///home/yichangfeng/lerobot/sanitize_sonic_dataset.py)：
+在批量录制过程中，若发现某些 Episode 操作失误（掉箱、绊倒）或前置等待时间过长，请使用专用的全自动清洗工具 [`sanitize_sonic_dataset.py`](file:///home/yichangfeng/lerobot/dataset_tools/sanitize_sonic_dataset.py)：
 
 ```bash
 # 示例 1: 删除失败的第 5 和第 14 条数据
-python ~/lerobot/sanitize_sonic_dataset.py --delete-episodes 5 14
+python ~/lerobot/dataset_tools/sanitize_sonic_dataset.py --delete-episodes 5 14
 
 # 示例 2: 将第 2 条数据从第 13.0 秒起步（裁剪掉前 13 秒等待期）
-python ~/lerobot/sanitize_sonic_dataset.py --trim-start 2:13.0
+python ~/lerobot/dataset_tools/sanitize_sonic_dataset.py --trim-start 2:13.0
 
 # 示例 3: 仅重新排版与编号对齐（自动检查音画同步）
-python ~/lerobot/sanitize_sonic_dataset.py
+python ~/lerobot/dataset_tools/sanitize_sonic_dataset.py
 ```
 > 详细数据要素规范与跨 Agent 复用说明请参阅：[`Dataset_Cleaning_Guide.md`](file:///home/yichangfeng/lerobot/Dataset_Cleaning_Guide.md)。
 
@@ -287,12 +289,12 @@ python ~/lerobot/sanitize_sonic_dataset.py
 
 ### 3. 执行数据转换
 
-在 `~/lerobot` 项目中直接运行转换脚本 [`convert_rubberhand_to_g1_v30.py`](file:///home/yichangfeng/lerobot/convert_rubberhand_to_g1_v30.py)：
+在 `~/lerobot` 项目中直接运行转换脚本 [`convert_rubberhand_to_g1_v30.py`](file:///home/yichangfeng/lerobot/dataset_tools/convert_rubberhand_to_g1_v30.py)：
 
 ```bash
 cd ~/lerobot
 conda activate lerobot
-python convert_rubberhand_to_g1_v30.py \
+python dataset_tools/convert_rubberhand_to_g1_v30.py \
     --src-dir ~/SonicStar/wbc/outputs/g1_rubberhand_pick_turn \
     --dst-dir ~/lerobot/datasets/g1_box_pick_turn_v30 \
     --fps 30 \
@@ -303,12 +305,12 @@ python convert_rubberhand_to_g1_v30.py \
 
 由于“原地转身”任务中横移与前进速度恒为 0（`remote.lx=0, remote.ly=0, remote.ry=0`），直接计算会导致 $q_{99}-q_{01}=0$ 塌陷。而底模 `model/box_pick` 依赖 `QUANTILES` 归一化，训练时分母除以极小值 $\text{eps}=10^{-8}$ 会破坏静止动作表征。
 
-运行速度对齐工具 [`align_velocity_dataset.py`](file:///home/yichangfeng/lerobot/align_velocity_dataset.py)，在完整保留原 `g1_box_pick_turn_v30` 的同时，生成对齐后的新数据集 `g1_box_pick_turn_v30_aligned`：
+运行速度对齐工具 [`align_velocity_dataset.py`](file:///home/yichangfeng/lerobot/dataset_tools/align_velocity_dataset.py)，在完整保留原 `g1_box_pick_turn_v30` 的同时，生成对齐后的新数据集 `g1_box_pick_turn_v30_aligned`：
 
 ```bash
 cd ~/lerobot
 conda activate lerobot
-python align_velocity_dataset.py \
+python dataset_tools/align_velocity_dataset.py \
     --src-dir ~/lerobot/datasets/g1_box_pick_turn_v30 \
     --dst-dir ~/lerobot/datasets/g1_box_pick_turn_v30_aligned
 ```

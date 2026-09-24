@@ -55,6 +55,8 @@ class BaseStrategy(RolloutStrategy):
 
         start_time = time.perf_counter()
         engine.resume()
+        if hasattr(robot, "trigger_engagement_smoothing"):
+            robot.trigger_engagement_smoothing()
         logger.info("Base strategy control loop started")
 
         try:

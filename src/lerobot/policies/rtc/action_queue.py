@@ -22,6 +22,7 @@ handling action merging and leftover tracking.
 """
 
 import logging
+import time
 from threading import Lock
 
 import torch
@@ -67,6 +68,8 @@ class ActionQueue:
         self.lock = Lock()
         self.last_index = 0
         self.cfg = cfg
+        self._chunk_records: list[dict] = []
+        self._current_chunk_id: int = -1
 
     def get(self) -> Tensor | None:
         """Get the next action from the queue.
@@ -99,10 +102,25 @@ class ActionQueue:
     def clear(self) -> None:
         """Clear queued actions and reset consumption index."""
         with self.lock:
+            if self._chunk_records and self._chunk_records[-1].get("end_time") is None:
+                latest = self._chunk_records[-1]
+                latest["executed_steps"] = self.last_index
+                latest["executed_slice"] = [latest["delay"], latest["delay"] + self.last_index]
+                latest["end_time"] = time.time()
             self.queue = None
             self.original_queue = None
             self._task_queue = None
             self.last_index = 0
+
+    def get_chunk_records(self) -> list[dict]:
+        """Get snapshot of all chunk execution records so far."""
+        with self.lock:
+            if self._chunk_records:
+                latest = self._chunk_records[-1]
+                if latest.get("end_time") is None:
+                    latest["executed_steps"] = self.last_index
+                    latest["executed_slice"] = [latest["delay"], latest["delay"] + self.last_index]
+            return [dict(rec) for rec in self._chunk_records]
 
     def qsize(self) -> int:
         """Get the number of remaining actions in the queue.
@@ -188,6 +206,27 @@ class ActionQueue:
             delay = self._check_and_resolve_delays(real_delay, action_index_before_inference)
 
             if self.cfg.enabled:
+                # Finalize previous chunk execution count
+                if self._chunk_records:
+                    prev_rec = self._chunk_records[-1]
+                    prev_rec["executed_steps"] = self.last_index
+                    prev_rec["executed_slice"] = [prev_rec["delay"], prev_rec["delay"] + self.last_index]
+                    prev_rec["end_time"] = time.time()
+
+                clamped_delay = max(0, min(delay, len(original_actions), len(processed_actions)))
+                self._current_chunk_id += 1
+                new_rec = {
+                    "chunk_id": self._current_chunk_id,
+                    "task": task,
+                    "delay": clamped_delay,
+                    "total_steps": len(processed_actions),
+                    "executed_steps": 0,
+                    "executed_slice": [clamped_delay, clamped_delay],
+                    "start_time": time.time(),
+                    "end_time": None,
+                }
+                self._chunk_records.append(new_rec)
+
                 self._replace_actions_queue(original_actions, processed_actions, delay, task)
                 return
 

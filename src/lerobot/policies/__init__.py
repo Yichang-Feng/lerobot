@@ -32,6 +32,7 @@ from .pretrained import PreTrainedPolicy as PreTrainedPolicy
 from .smolvla.configuration_smolvla import SmolVLAConfig as SmolVLAConfig
 from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
 from .utils import make_robot_action, prepare_observation_for_inference
+from .unifolm_vla.configuration_unifolm_vla import UnifolmVLAConfig as UnifolmVLAConfig
 from .vla_jepa.configuration_vla_jepa import VLAJEPAConfig as VLAJEPAConfig
 from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
 from .wall_x.configuration_wall_x import WallXConfig as WallXConfig
@@ -58,6 +59,7 @@ __all__ = [
     "PI05Config",
     "SmolVLAConfig",
     "TDMPCConfig",
+    "UnifolmVLAConfig",
     "VLAJEPAConfig",
     "VQBeTConfig",
     "WallXConfig",

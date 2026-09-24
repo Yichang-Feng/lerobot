@@ -2,21 +2,21 @@
 # Unitree G1 (Rubber Hand) Pi0.5 策略模型微调训练配置文件 (train_pi05_config.yaml)
 # ==============================================================================
 # 启动方式:
-#   python -m lerobot.scripts.lerobot_train --config_path=train_pi05_config.yaml
+#   ./run_train.sh
 #
-# 后台持久化运行:
-#   nohup python -m lerobot.scripts.lerobot_train --config_path=train_pi05_config.yaml > train.log 2>&1 &
-#
-# 命令行临时覆盖某个参数 (例如临时改步数或学习率):
-#   python -m lerobot.scripts.lerobot_train --config_path=train_pi05_config.yaml --steps=2000 --policy.optimizer_lr=1.0e-5
+# 命令行临时覆盖某个参数 (例如更换数据集或输出目录):
+#   ./run_train.sh --dataset.repo_id=g1_box_pick_turn_v30_subtasks_state_as_action_shift0 \
+#                  --dataset.root=datasets/g1_box_pick_turn_v30_subtasks_state_as_action_shift0 \
+#                  --output_dir=outputs/train/pi05_subtasks_state_as_action_shift0 \
+#                  --job_name=pi05_subtasks_state_as_action_shift0
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# 1. 数据集配置 (对齐后的转向角速度解耦数据集)
+# 1. 数据集配置 (默认使用新生成的 shift=1 State-as-Action 3-Subtask 数据集)
 # ------------------------------------------------------------------------------
 dataset:
-  repo_id: "g1_box_pick_turn_v30"
-  root: "datasets/g1_box_pick_turn_v30"
+  repo_id: "g1_box_pick_turn_v30_subtasks_state_as_action"
+  root: "datasets/g1_box_pick_turn_v30_subtasks_state_as_action"
 
 # ------------------------------------------------------------------------------
 # 2. 策略模型微调配置
@@ -26,25 +26,27 @@ policy:
   train_expert_only: true         # 冻结 2B 视觉语言模型，仅微调 300M 动作专家（省显存并防严重过拟合）
   compile_model: false            # 关闭 Triton 耗时编译，5 秒秒开启动
   device: "cuda"
+  push_to_hub: false              # ★ 关闭自动推送到 Hugging Face Hub (避免 /tmp 临时打包)
 
-  # ★ 学习率与调度器控制（保持与下方显式配置同步）
+  # ★ 学习率与调度器控制（与下方显式配置严格对齐）
   optimizer_lr: 5.0e-6            # 峰值学习率
   scheduler_decay_lr: 1.5e-6      # 最终衰减目标学习率
   scheduler_warmup_steps: 200     # 线性预热步数
-  scheduler_decay_steps: 4000     # 与 steps: 4000 严格对齐
+  scheduler_decay_steps: 5000     # ★ 衰减步数与 steps: 5000 严格对齐
 
 # ------------------------------------------------------------------------------
 # 3. 训练全局控制参数
 # ------------------------------------------------------------------------------
-output_dir: "outputs/train/g1_box_pick_turn_v30"
-job_name: "g1_box_pick_turn_v30"
+output_dir: "outputs/train/pi05_subtasks_state_as_action_shift1"
+job_name: "pi05_subtasks_state_as_action_shift1"
 
 batch_size: 8                     # RTX 4090 D 显存占用约 15~17 GB
-steps: 4000                       # 总步数设为 4000 步（覆盖到 4000 步 Checkpoint）
+steps: 5000                       # ★ 总步数统一为 5000 步
 num_workers: 4
 
 log_freq: 50                      # 每 50 步打印一次训练指标
-save_freq: 500                    # 每 500 步存盘一次（完美覆盖 500/1000/1500/2000/2500/4000）
+save_freq: 1000                   # ★ 每 1000 步存盘一次 (保存 1000/2000/3000/4000/5000 checkpoints)
+save_checkpoint_to_hub: false     # ★ 关闭 Checkpoint 上传到 Hub
 env_eval_freq: 0                  # 必须设为 0 关闭仿真内嵌评估
 
 # ------------------------------------------------------------------------------
@@ -55,7 +57,7 @@ use_policy_training_preset: false
 
 optimizer:
   type: "adamw"
-  lr: 5.0e-6                     # ★ 峰值学习率同步修改为 5.0e-6
+  lr: 5.0e-6                     # ★ 峰值学习率
   betas: [0.9, 0.95]
   eps: 1.0e-8
   weight_decay: 1.0e-4           # 权重衰减防过拟合
@@ -64,7 +66,7 @@ optimizer:
 scheduler:
   type: "cosine_decay_with_warmup"
   num_warmup_steps: 200          # 200 步平稳预热
-  num_decay_steps: 4000          # ★ 衰减步数必须与 steps: 4000 保持一致
+  num_decay_steps: 5000          # ★ 衰减步数必须与 steps: 5000 保持一致
   peak_lr: 5.0e-6                # ★ 峰值学习率对齐为 5.0e-6
   decay_lr: 1.5e-6               # ★ 衰减终点设为 1.5e-6（保留 30% 输出活力，彻底杜绝动作犹豫僵死）
 
@@ -72,4 +74,4 @@ scheduler:
 # 5. 监控看板
 # ------------------------------------------------------------------------------
 wandb:
-  enable: true                   # 是否开启在线 WandB 看板
+  enable: false                  # ★ 默认关闭 WandB 在线看板，防止离线或无秘钥时网络阻塞

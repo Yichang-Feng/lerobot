@@ -16,6 +16,7 @@
 
 import builtins
 import logging
+import os
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
@@ -558,6 +559,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
+        self.capture_diagnostics = False
+        self.last_diagnostics = None
 
         # Compile model if requested
         if config.compile_model:
@@ -803,13 +806,21 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         prefix_att_2d_masks_4d = prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        _, past_key_values = self.paligemma_with_expert.forward(
+        prefix_out, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
+
+        if getattr(self, "capture_diagnostics", False):
+            prefix_tokens_t = prefix_out[0] if prefix_out is not None and prefix_out[0] is not None else None
+            self.last_diagnostics = {
+                "prefix_tokens": prefix_tokens_t.detach().cpu().to(torch.float16) if prefix_tokens_t is not None else None,
+                "prefix_embs": prefix_embs.detach().cpu().to(torch.float16) if prefix_embs is not None else None,
+                "prompt_tokens": tokens.detach().cpu() if tokens is not None else None,
+            }
 
         rtc_mode = "guided"
         trained_prefix = trained_prefix_mask = None
@@ -919,6 +930,9 @@ class PI05Policy(PreTrainedPolicy):
             self.model.gradient_checkpointing_enable()
 
         self.model.to(config.device)
+
+        self.triton_infer = None
+        self._use_triton = False
 
         self.reset()
 
@@ -1040,7 +1054,58 @@ class PI05Policy(PreTrainedPolicy):
         except Exception as e:
             print(f"Warning: Could not load state dict: {e}")
 
+        # Auto-detect Triton accelerated checkpoint
+        model.pretrained_path = str(pretrained_name_or_path)
+        triton_cands = [
+            os.path.join(str(pretrained_name_or_path), "converted_model.pkl"),
+            os.path.join(str(pretrained_name_or_path), "converted_merged_model.pkl"),
+            os.path.join(str(pretrained_name_or_path), "converted_checkpoint.pkl"),
+        ]
+        for cand in triton_cands:
+            if os.path.isfile(cand):
+                model.init_triton_engine(cand)
+                break
+
         return model
+
+    def init_triton_engine(self, ckpt_path: str):
+        """Initialize Pi05Inference Triton engine for fast forward pass."""
+        try:
+            from .pi05_infer import Pi05Inference
+        except ImportError:
+            try:
+                from lerobot.policies.pi05.pi05_infer import Pi05Inference
+            except ImportError:
+                print("❌ [PI05Policy] 无法导入 Pi05Inference，跳过 Triton 加速")
+                return
+
+        print(f"🚀 [PI05Policy] 检测到 Triton 加速权重: {ckpt_path}")
+        print("   正在加载并初始化 CUDA Graph (约需 1~2 秒)...")
+        import pickle
+        with open(ckpt_path, "rb") as f:
+            weights = pickle.load(f)
+
+        pretrained_dir = os.path.dirname(ckpt_path)
+        tok_path = os.path.join(pretrained_dir, "tokenizer")
+        if not os.path.isdir(tok_path):
+            tok_path = getattr(self.config, "tokenizer_path", None)
+
+        num_views = len(self.config.image_features) if hasattr(self.config, "image_features") else 1
+        try:
+            self.triton_infer = Pi05Inference(
+                checkpoint=weights,
+                num_views=num_views,
+                chunk_size=self.config.chunk_size,
+                tokenizer_path=tok_path,
+                discrete_state_input=True,
+                state_dim_for_max_prompt=29,
+            )
+            self._use_triton = True
+            print("✅ [PI05Policy] Triton 极速推理引擎加载完成！(~25ms/step)")
+        except Exception as err:
+            print(f"❌ [PI05Policy] 初始化 Triton 引擎失败: {err}，将回退至原生 PyTorch 推理")
+            self.triton_infer = None
+            self._use_triton = False
 
     def _prepare_pretrained_state_dict(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
         # MEM's continuous proprioceptive projection is new relative to
@@ -1335,6 +1400,39 @@ class PI05Policy(PreTrainedPolicy):
         states, state_masks = self._prepare_memory_states(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
+        # Fast path: Triton accelerated forward pass (~25ms)
+        if getattr(self, "triton_infer", None) is not None:
+            imgs_triton = torch.stack([img[0].permute(1, 2, 0) for img in images], dim=0).to(
+                dtype=torch.bfloat16, device="cuda"
+            )
+            n_real = int(masks[0].sum().item())
+            token_ids = tokens[0][:n_real].to(device="cuda", dtype=torch.int64)
+
+            embeds = self.triton_infer.prompt_embedding(token_ids) * self.triton_infer._prompt_embed_scale
+            start = self.triton_infer.num_views * 256
+            self.triton_infer.buffers["encoder_x"][start : start + n_real].copy_(embeds)
+            self.triton_infer.buffers["valid_encoder_len"].fill_(start + n_real)
+            self.triton_infer.buffers["decoder_rope_weights"].copy_(self.triton_infer.get_decoder_rope_weights(n_real))
+            self.triton_infer.buffers["observation_images_normalized"].copy_(imgs_triton)
+
+            noise = kwargs.get("noise")
+            if noise is None:
+                noise = torch.randn(self.config.chunk_size, 32, dtype=torch.bfloat16, device="cuda")
+            else:
+                noise = noise[0].to(dtype=torch.bfloat16, device="cuda")
+            self.triton_infer.buffers["diffusion_noise"].copy_(noise)
+
+            self.triton_infer.infer_graph.replay()
+            out_noise = self.triton_infer.buffers["diffusion_noise"]
+
+            original_action_dim = self.config.output_features[ACTION].shape[0]
+            actions = out_noise.unsqueeze(0)[:, :, :original_action_dim].to(torch.float32)
+
+            if getattr(self.model, "capture_diagnostics", False):
+                self.last_diagnostics = {"actions": actions.detach().cpu()}
+
+            return actions
+
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
         actions = self.model.sample_actions(
             images, img_masks, tokens, masks, states=states, state_masks=state_masks, **kwargs
@@ -1344,7 +1442,18 @@ class PI05Policy(PreTrainedPolicy):
         original_action_dim = self.config.output_features[ACTION].shape[0]
         actions = actions[:, :, :original_action_dim]
 
+        if getattr(self.model, "capture_diagnostics", False) and hasattr(self.model, "last_diagnostics"):
+            self.last_diagnostics = self.model.last_diagnostics
+            if self.last_diagnostics is not None:
+                self.last_diagnostics["actions"] = actions.detach().cpu()
+
         return actions
+
+    def set_capture_diagnostics(self, enabled: bool = True):
+        self.model.capture_diagnostics = enabled
+
+    def get_last_diagnostics(self) -> dict | None:
+        return getattr(self, "last_diagnostics", None)
 
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training.
