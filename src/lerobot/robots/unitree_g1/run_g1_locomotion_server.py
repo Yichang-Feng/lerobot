@@ -105,8 +105,8 @@ def state_publisher_loop(
 
             if gripper_sock is not None:
                 obs = robot.get_observation()
-                g_left = float(obs.get("gripper.left", 1.0))
-                g_right = float(obs.get("gripper.right", 1.0))
+                g_left = float(obs.get("gripper.left", 5.0))
+                g_right = float(obs.get("gripper.right", 5.0))
                 g_msg = {
                     "gripper": {"left": g_left, "right": g_right},
                     "timestamp": time.time(),
@@ -141,8 +141,8 @@ def extract_gripper_command(data: dict) -> tuple[float, float] | None:
         g = action.get("gripper", None)
 
     if isinstance(g, dict):
-        left = g.get("left", g.get("gripper_left", 1.0))
-        right = g.get("right", g.get("gripper_right", 1.0))
+        left = g.get("left", g.get("gripper_left", 5.0))
+        right = g.get("right", g.get("gripper_right", 5.0))
         return float(left), float(right)
 
     left = None
@@ -329,7 +329,10 @@ def main() -> None:
                         logger.info(">>> [RESET REQUESTED] Returning arms smoothly to default position. <<<")
                         # Zero locomotion input
                         robot.send_action({k: 0.0 for k in REMOTE_AXES})
-                        robot.reset()
+                        if is_simulation:
+                            robot.reset(reset_simulation=False)
+                        else:
+                            robot.reset()
                         vla_connected = False
 
                     elif cmd == "stop":

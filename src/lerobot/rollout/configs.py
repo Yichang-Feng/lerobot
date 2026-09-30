@@ -279,8 +279,26 @@ class RolloutConfig:
     # Use vocal synthesis to read events
     play_sounds: bool = True
     resume: bool = False
-    # 3-Subtask automatic sequencing mode (clamp & lift -> turn right -> place on table)
-    subtasks: bool = False
+    # Subtask sequencing mode (bool or comma-separated subtask prompts)
+    subtasks: bool | str = False
+    # In subtask mode, automatically return to initial position upon stage completion before handing over to next task
+    subtask_auto_home: bool = True
+    # Duration (seconds) of smooth cosine S-curve interpolation when homing between subtasks
+    subtask_homing_duration: float = 2.5
+    # Whether to automatically switch to the next subtask prompt upon homing completion.
+    # Default is False: smoothly returns home and keeps the current prompt, allowing manual advance via 'n' or phase number.
+    subtask_auto_advance: bool = False
+    # Whether to first retract the arm horizontally/backward away from the box before returning home
+    subtask_retract_first: bool = True
+    # Duration (seconds) of the horizontal retraction phase before returning home
+    subtask_retract_duration: float = 1.2
+    # Valen (Jev) decision evaluator configuration for multimodal automated subtask transitions
+    valen_evaluator: bool = False
+    valen_ip: str = "10.8.8.98"
+    valen_port: int = 5559
+    valen_endpoint: str | None = None
+    valen_eval_interval_s: float = 0.4
+    valen_auto_advance: bool = True
     # Auto mode: automatically start policy inference when robot gamepad enters VLA mode,
     # and automatically reset (after 0.2s debounce) when switching back to gamepad/nav mode.
     auto_mode: bool = False
@@ -288,6 +306,18 @@ class RolloutConfig:
     mode_port: int = 6000
     # Rename map for mapping robot/dataset observation keys to policy keys
     rename_map: dict[str, str] = field(default_factory=dict)
+
+    # Cross-table water bottle transfer mode configuration
+    transfer_mode: bool = False
+    transfer_grasp_thresh: float = 3.5
+    transfer_lift_pitch: float = -0.20
+    transfer_grasp_frames: int = 8
+    transfer_restore_duration: float = 2.5
+    transfer_gripper_closed: float = 3.4
+    transfer_place_box_task: str = "pick up the water bottle and place it into the blue box"
+    transfer_place_table_task: str = "pick up the water bottle and place it on the table"
+    # When True, print live transfer status HUD every 1.5s. When False (default), keep terminal calm and quiet.
+    transfer_hud: bool = False
 
     # Hardware teardown
     # When True (default), smoothly interpolate the robot back to the joint

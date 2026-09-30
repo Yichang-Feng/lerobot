@@ -177,36 +177,158 @@ class RolloutStrategy(abc.ABC):
             teleop.disconnect()
 
     @staticmethod
-    def return_to_initial_position(hw: HardwareContext, duration_s: float = 3.0, fps: int = 50) -> bool:
+    def _compute_retract_waypoint(current_pos: dict[str, float]) -> dict[str, float] | None:
+        """Compute an intermediate horizontal retraction pose to pull the arm backward away from a container.
+
+        Kinematics for Unitree G1:
+        When releasing an object in a container (e.g. blue box):
+        - The arm is extended forward (ShoulderPitch ~ -0.90 rad, Elbow ~ +1.25 rad).
+        - Direct interpolation to default pose (ShoulderPitch ~ +0.05, Elbow ~ 0.45) drops the shoulder
+          downwards and shifts lateral before retreating, hitting the container wall.
+        - Conversely, bending the elbow more causes a downward dip because dZ/dElbow is negative.
+
+        Correct 2-stage motion:
+        - Stage 1 (Horizontal Retraction Waypoint):
+          1. Shoulder pitch retracts from ~ -0.90 to -0.38 rad (raising arm up & backward).
+          2. Elbow adjusts to 0.42 rad (retaining forearm horizontally without dipping down).
+          3. Shoulder yaw aligns to +0.18 rad (holding the arm centered along the retreat corridor).
+          4. Shoulder roll ensures slight clearance (>= 0.14 rad).
+          5. Wrist pitch sets to -0.65 rad (slightly up-tilted to prevent finger hook).
+          6. Gripper fully open (5.0).
+          This achieves a clean horizontal backward translation (X retreats ~7-9 cm, Z rises ~3 cm, dip = 0.0 cm).
+        - Stage 2 (To Initial Position):
+          From this safely retracted waypoint, the subsequent interpolation moves the arm right (Y -> -0.14)
+          and down (Z -> 0.83) to initial_position, completely avoiding the container boundaries.
+        """
+        waypoint = dict(current_pos)
+        retracted_any = False
+
+        # Right arm
+        r_pitch_key = next((k for k in ("kRightShoulderPitch", "right_shoulder_pitch", "kRightShoulderPitch.q") if k in current_pos), None)
+        r_roll_key = next((k for k in ("kRightShoulderRoll", "right_shoulder_roll", "kRightShoulderRoll.q") if k in current_pos), None)
+        r_yaw_key = next((k for k in ("kRightShoulderYaw", "right_shoulder_yaw", "kRightShoulderYaw.q") if k in current_pos), None)
+        r_elbow_key = next((k for k in ("kRightElbow", "right_elbow", "kRightElbow.q") if k in current_pos), None)
+        r_wroll_key = next((k for k in ("kRightWristRoll", "right_wrist_roll", "kRightWristRoll.q") if k in current_pos), None)
+        r_wpitch_key = next((k for k in ("kRightWristPitch", "right_wrist_pitch", "kRightWristPitch.q") if k in current_pos), None)
+        r_wyaw_key = next((k for k in ("kRightWristYaw", "right_wrist_yaw", "kRightWristYaw.q") if k in current_pos), None)
+        r_grip_key = next((k for k in ("kRightGripper", "gripper.right", "right_gripper") if k in current_pos), None)
+
+        if r_pitch_key is not None and r_elbow_key is not None:
+            curr_pitch = current_pos[r_pitch_key]
+            curr_elbow = current_pos[r_elbow_key]
+            # Arm is extended forward into container if shoulder pitch is forward (< -0.20) or elbow is bent (> 0.65)
+            if curr_pitch < -0.20 or curr_elbow > 0.65:
+                waypoint[r_pitch_key] = -0.38
+                if r_roll_key is not None:
+                    waypoint[r_roll_key] = max(current_pos.get(r_roll_key, 0.14), 0.14)
+                if r_yaw_key is not None:
+                    waypoint[r_yaw_key] = 0.18
+                waypoint[r_elbow_key] = 0.42
+                if r_wroll_key is not None:
+                    waypoint[r_wroll_key] = 0.00
+                if r_wpitch_key is not None:
+                    waypoint[r_wpitch_key] = -0.65
+                if r_wyaw_key is not None:
+                    waypoint[r_wyaw_key] = 0.00
+                if r_grip_key is not None:
+                    waypoint[r_grip_key] = 5.0
+                retracted_any = True
+
+        # Left arm (symmetric)
+        l_pitch_key = next((k for k in ("kLeftShoulderPitch", "left_shoulder_pitch", "kLeftShoulderPitch.q") if k in current_pos), None)
+        l_roll_key = next((k for k in ("kLeftShoulderRoll", "left_shoulder_roll", "kLeftShoulderRoll.q") if k in current_pos), None)
+        l_yaw_key = next((k for k in ("kLeftShoulderYaw", "left_shoulder_yaw", "kLeftShoulderYaw.q") if k in current_pos), None)
+        l_elbow_key = next((k for k in ("kLeftElbow", "left_elbow", "kLeftElbow.q") if k in current_pos), None)
+        l_wroll_key = next((k for k in ("kLeftWristRoll", "left_wrist_roll", "kLeftWristRoll.q") if k in current_pos), None)
+        l_wpitch_key = next((k for k in ("kLeftWristPitch", "left_wrist_pitch", "kLeftWristPitch.q") if k in current_pos), None)
+        l_wyaw_key = next((k for k in ("kLeftWristYaw", "left_wrist_yaw", "kLeftWristYaw.q") if k in current_pos), None)
+        l_grip_key = next((k for k in ("kLeftGripper", "gripper.left", "left_gripper") if k in current_pos), None)
+
+        if l_pitch_key is not None and l_elbow_key is not None:
+            curr_pitch = current_pos[l_pitch_key]
+            curr_elbow = current_pos[l_elbow_key]
+            if curr_pitch < -0.20 or curr_elbow > 0.65:
+                waypoint[l_pitch_key] = -0.38
+                if l_roll_key is not None:
+                    waypoint[l_roll_key] = min(current_pos.get(l_roll_key, -0.14), -0.14)
+                if l_yaw_key is not None:
+                    waypoint[l_yaw_key] = -0.18
+                waypoint[l_elbow_key] = 0.42
+                if l_wroll_key is not None:
+                    waypoint[l_wroll_key] = 0.00
+                if l_wpitch_key is not None:
+                    waypoint[l_wpitch_key] = -0.65
+                if l_wyaw_key is not None:
+                    waypoint[l_wyaw_key] = 0.00
+                if l_grip_key is not None:
+                    waypoint[l_grip_key] = 5.0
+                retracted_any = True
+
+        return waypoint if retracted_any else None
+
+    @staticmethod
+    def _interpolate_motion(
+        robot: Any,
+        start_pos: dict[str, float],
+        target_pos: dict[str, float],
+        duration_s: float,
+        fps: int = 50,
+    ) -> None:
+        steps = max(int(duration_s * fps), 1)
+        for step in range(1, steps + 1):
+            t = step / steps
+            alpha = 0.5 * (1.0 - math.cos(math.pi * t))
+            interp = {}
+            for k in target_pos:
+                s_val = start_pos.get(k, target_pos[k])
+                interp[k] = s_val * (1.0 - alpha) + target_pos[k] * alpha
+            # Lock remote chassis axes to 0.0 during arm movement
+            for remote_key in ("remote.lx", "remote.ly", "remote.rx", "remote.ry"):
+                if remote_key in robot.action_features:
+                    interp[remote_key] = 0.0
+            robot.send_action(interp)
+            precise_sleep(1 / fps)
+
+    @classmethod
+    def return_to_initial_position(
+        cls,
+        hw: HardwareContext,
+        duration_s: float = 3.0,
+        fps: int = 50,
+        retract_first: bool = False,
+        retract_duration_s: float = 1.2,
+        target_override: dict[str, float] | None = None,
+    ) -> bool:
         """Smoothly interpolate the robot back to its initial position using a cosine S-curve.
+
+        If retract_first is True, the robot first retracts any forward-extended arm horizontally
+        back toward the torso (avoiding collisions with boxes or containers), and then smoothly
+        settles into the default initial position.
+        If target_override is provided, those key-value pairs override corresponding joint targets
+        (e.g., maintaining the clamped gripper position during homing).
 
         Returns ``True`` when the interpolation completed, ``False`` when it failed
         partway — the robot is then at an arbitrary pose, so callers must not report
         a completed reset on ``False``.
         """
         robot = hw.robot_wrapper
-        target = hw.initial_position
+        target = dict(hw.initial_position) if hw.initial_position else {}
+        if target_override:
+            target.update(target_override)
         try:
             current_obs = robot.get_observation()
             current_pos = {k: v for k, v in current_obs.items() if k in target}
-            steps = max(int(duration_s * fps), 1)
-            for step in range(1, steps + 1):
-                t = step / steps
-                # Smooth cosine S-curve weighting
-                alpha = 0.5 * (1.0 - math.cos(math.pi * t))
-                interp = {}
-                for k in current_pos:
-                    interp[k] = current_pos[k] * (1.0 - alpha) + target[k] * alpha
-                # Lock remote chassis axes to 0.0 during arm homing
-                for remote_key in ("remote.lx", "remote.ly", "remote.rx", "remote.ry"):
-                    if remote_key in robot.action_features:
-                        interp[remote_key] = 0.0
-                robot.send_action(interp)
-                precise_sleep(1 / fps)
 
-            # Signal protocol-level reset on robot if supported (e.g. UnitreeG1Client sends {"cmd": "reset"})
-            if hasattr(robot, "reset"):
-                robot.reset()
+            if retract_first:
+                retract_waypoint = cls._compute_retract_waypoint(current_pos)
+                if retract_waypoint is not None:
+                    logger.info("Executing horizontal arm retraction (%.1fs) before homing...", retract_duration_s)
+                    cls._interpolate_motion(
+                        robot, current_pos, retract_waypoint, duration_s=retract_duration_s, fps=fps
+                    )
+                    current_pos = retract_waypoint
+
+            cls._interpolate_motion(robot, current_pos, target, duration_s=duration_s, fps=fps)
         except Exception as e:
             logger.warning("Could not return to initial position: %s", e)
             return False

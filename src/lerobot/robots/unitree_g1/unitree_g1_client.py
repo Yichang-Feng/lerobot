@@ -438,7 +438,7 @@ class UnitreeG1Client(Robot):
 
         # Gripper state tracking (extra port, e.g. 6004: data{left, right})
         self._gripper_sub: zmq.Socket | None = None
-        self._latest_gripper: dict[str, float] = {"left": 1.0, "right": 1.0}
+        self._latest_gripper: dict[str, float] = {"left": 5.0, "right": 5.0}
         self._gripper_lock = threading.Lock()
 
         self._gripper_thread: threading.Thread | None = None
@@ -455,6 +455,32 @@ class UnitreeG1Client(Robot):
 
         # Camera frame cache to ensure observations remain complete even during transient packet drops
         self._last_camera_frames: dict[str, Any] = {}
+        self._last_sent_action: dict[str, float] = {}
+
+    @property
+    def right_gripper_position(self) -> float:
+        """Get the latest right gripper position (from sensor feedback, commanded action, or lowstate)."""
+        if self.config.enable_gripper:
+            with self._gripper_lock:
+                g = dict(self._latest_gripper)
+            if "right" in g and self._first_gripper_packet_received:
+                return float(g["right"])
+
+        if hasattr(self, "_last_sent_action") and self._last_sent_action:
+            if "kRightGripper" in self._last_sent_action:
+                return float(self._last_sent_action["kRightGripper"])
+            if "gripper.right" in self._last_sent_action:
+                return float(self._last_sent_action["gripper.right"])
+
+        with self._state_lock:
+            state = self._latest_state
+        if state and isinstance(state, dict):
+            motors = state.get("motors", {})
+            for k in ("right_gripper", "kRightGripper", "right_ee"):
+                if k in motors:
+                    m = motors[k]
+                    return float(m.get("q", 5.0)) if isinstance(m, dict) else float(m)
+        return 5.0
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
@@ -614,8 +640,8 @@ class UnitreeG1Client(Robot):
         if self.config.enable_gripper:
             with self._gripper_lock:
                 g = dict(self._latest_gripper)
-            r_val = float(g.get("right", 1.0))
-            l_val = float(g.get("left", 1.0))
+            r_val = float(g.get("right", 5.0))
+            l_val = float(g.get("left", 5.0))
             start_pos["gripper.right"] = r_val
             start_pos["gripper.left"] = l_val
             start_pos["kRightGripper"] = r_val
@@ -1288,8 +1314,8 @@ class UnitreeG1Client(Robot):
         if self.config.enable_gripper:
             with self._gripper_lock:
                 g = dict(self._latest_gripper)
-            l_val = float(g.get("left", 1.0))
-            r_val = float(g.get("right", 1.0))
+            l_val = float(g.get("left", 5.0))
+            r_val = float(g.get("right", 5.0))
             obs["gripper.left"] = l_val
             obs["gripper.right"] = r_val
             obs["kLeftGripper"] = l_val
@@ -1302,6 +1328,7 @@ class UnitreeG1Client(Robot):
     def send_action(self, action: RobotAction) -> RobotAction:
         """Forward action dict to locomotion server via ZMQ PUSH, applying engagement smoothing if active."""
         blended_action = dict(action)
+        self._last_sent_action = dict(blended_action)
         with self._engagement_lock:
             if self._engagement_smoothing_active:
                 total = self._engagement_total_steps
@@ -1361,8 +1388,8 @@ class UnitreeG1Client(Robot):
             or "kLeftGripper" in blended_action
         )
         if self.config.enable_gripper or has_gripper_keys:
-            r_val = float(blended_action.get("kRightGripper", blended_action.get("gripper.right", 1.0)))
-            l_val = float(blended_action.get("kLeftGripper", blended_action.get("gripper.left", 1.0)))
+            r_val = float(blended_action.get("kRightGripper", blended_action.get("gripper.right", 5.0)))
+            l_val = float(blended_action.get("kLeftGripper", blended_action.get("gripper.left", 5.0)))
             r_val_clipped = float(np.clip(r_val, 0.0, 5.0))
             l_val_clipped = float(np.clip(l_val, 0.0, 5.0))
 

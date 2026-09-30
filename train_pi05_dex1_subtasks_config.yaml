@@ -1,12 +1,18 @@
 # ==============================================================================
-# G1 Dex1 (双臂14维+双夹爪2维+三相机) Pi0.5 LoRA 微调配置
+# Unitree G1 Dex-1 (3Cam + 16-DoF) Pi0.5 LoRA 双子任务训练配置 (RTX 4090 32GB)
+# ==============================================================================
+# 对应子任务:
+#   Task 0: "pick up the water bottle from the table and place it into the blue box"
+#   Task 1: "take the water bottle out of the blue box and place it back on the table"
 # ==============================================================================
 
+# 1. 数据集配置 (子任务版本，自动由 apply_dex1_subtask_cut.py 生成)
 dataset:
-  repo_id: "g1_pick_put_dex1_0923"
-  root: "datasets/g1_pick_put_dex1_0923"
+  repo_id: "g1_pick_put_dex1_0923_subtasks"
+  root: "datasets/g1_pick_put_dex1_0923_subtasks"
   video_backend: "torchcodec"
 
+# 2. 策略模型配置
 policy:
   path: "model/pi05_base"
   device: "cuda"
@@ -15,21 +21,22 @@ policy:
   compile_model: false
   push_to_hub: false
 
-# 3 相机输入重命名映射: 将数据集的键名映射到底模预期的三路相机名
+# 3. 3 相机输入重命名映射 (对齐 pi0.5 原生 3 视角)
 rename_map:
   "observation.images.cam_high": "observation.images.base_0_rgb"
   "observation.images.cam_left_wrist": "observation.images.left_wrist_0_rgb"
   "observation.images.cam_right_wrist": "observation.images.right_wrist_0_rgb"
 
-# LoRA (PEFT) 适配器配置
+# 4. 全链路 LoRA (PEFT) 适配器设计
 peft:
   method_type: "LORA"
   r: 64
   lora_alpha: 128
   target_modules: "(.*(vision_tower|language_model|gemma_expert).*(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|fc1|fc2)|.*multi_modal_projector\\.linear|model\\.(action_in_proj|action_out_proj))"
 
-output_dir: "outputs/train/pi05_lora_g1_pick_put_dex1_0924"
-job_name: "pi05_lora_g1_pick_put_dex1_0924"
+# 5. 训练全局控制
+output_dir: "outputs/train/pi05_lora_4090_g1_pick_put_dex1_subtasks"
+job_name: "pi05_lora_4090_g1_pick_put_dex1_subtasks"
 
 batch_size: 8
 steps: 10000

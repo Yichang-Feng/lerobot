@@ -112,6 +112,10 @@ class ThreadSafeRobot:
             self._robot.trigger_engagement_smoothing()
 
     @property
+    def right_gripper_position(self) -> float:
+        return getattr(self._robot, "right_gripper_position", 5.0)
+
+    @property
     def inner(self) -> Robot:
         """Access the underlying robot (e.g. for connect/disconnect)."""
         return self._robot

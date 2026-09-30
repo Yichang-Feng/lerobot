@@ -113,6 +113,9 @@ COMMAND_ALIASES: dict[str, str] = {
     "phase1": "phase1",
     "phase2": "phase2",
     "phase3": "phase3",
+    "d": "navdone",
+    "nav": "navdone",
+    "navdone": "navdone",
 }
 
 
@@ -194,10 +197,21 @@ class InteractiveSession:
             self._subtasks_enabled = bool(raw_subtasks)
         elif raw_subtasks is True:
             self._subtasks_enabled = True
-            self._subtask_list = list(DEFAULT_SUBTASKS)
+            if "dex1" in policy_path.lower():
+                self._subtask_list = [
+                    "pick up the water bottle from the table and place it into the blue box",
+                    "take the water bottle out of the blue box and place it back on the table",
+                ]
+            else:
+                self._subtask_list = list(DEFAULT_SUBTASKS)
         else:
-            # Auto-detect only if this is specifically the legacy 3-stage turn-right model
-            if "turn" in policy_path.lower() and "subtask" in policy_path.lower():
+            if "dex1" in policy_path.lower() and "subtask" in policy_path.lower():
+                self._subtasks_enabled = True
+                self._subtask_list = [
+                    "pick up the water bottle from the table and place it into the blue box",
+                    "take the water bottle out of the blue box and place it back on the table",
+                ]
+            elif "turn" in policy_path.lower() and "subtask" in policy_path.lower():
                 self._subtasks_enabled = True
                 self._subtask_list = list(DEFAULT_SUBTASKS)
             else:
@@ -211,6 +225,48 @@ class InteractiveSession:
         self._subtask_tracker_thread: threading.Thread | None = None
         self._subtask_tracker_running = False
         self._subtask_stop_event = threading.Event()
+
+        # Transfer mode: cross-table water bottle transport
+        # Enabled via --transfer_mode=true CLI flag
+        raw_transfer = getattr(ctx.runtime.cfg, "transfer_mode", False)
+        if isinstance(raw_transfer, str):
+            self._transfer_mode = raw_transfer.lower() in ("true", "1", "yes")
+        else:
+            self._transfer_mode = bool(raw_transfer)
+        # Event set by /navdone command to signal navigation has completed
+        self._nav_done_event = threading.Event()
+        # Snapshot of robot joint state at the moment the bottle was confirmed grasped+lifted.
+        # Used to restore arm pose at table B before VLA takeover (to prevent motion jump).
+        self._frozen_joint_state: dict | None = None
+        # Real-time gripper angle measured at the moment grasp success was confirmed.
+        # Clamped throughout homing, navigation, and pose restore without VLA intervention.
+        self._captured_gripper_val: float | None = None
+        self._transfer_banner_printed: bool = False
+
+        # Valen (Jev) Multi-Modal Decision Evaluator support
+        raw_ve = getattr(ctx.runtime.cfg, "valen_evaluator", False)
+        if isinstance(raw_ve, str):
+            self._valen_enabled = raw_ve.lower() in ("true", "1", "yes")
+        else:
+            self._valen_enabled = bool(raw_ve)
+        self._valen_client = None
+        if self._valen_enabled:
+            try:
+                from lerobot.rollout.valen_evaluator import ValenClient
+                valen_ip = getattr(ctx.runtime.cfg, "valen_ip", "10.8.8.98")
+                valen_port = getattr(ctx.runtime.cfg, "valen_port", 5559)
+                valen_endpoint = getattr(ctx.runtime.cfg, "valen_endpoint", None)
+                self._valen_client = ValenClient(
+                    host=valen_ip,
+                    port=valen_port,
+                    endpoint=valen_endpoint,
+                    timeout_ms=500,
+                )
+                logger.info("Valen (Jev) Evaluator client initialized (%s)", self._valen_client.endpoint)
+                self._print(f"🧠 [Valen JEV] 决策模型已连接: {self._valen_client.endpoint}")
+            except Exception as e:
+                logger.error("Failed to initialize ValenClient: %s", e)
+                self._print(f"⚠️  [Valen JEV] 初始化连接失败: {e}")
 
         if self._subtasks_enabled and self._subtask_list:
             self.controller._initial_task = self._subtask_list[0]
@@ -233,15 +289,51 @@ class InteractiveSession:
         }
         if self._subtasks_enabled:
             self._commands["next"] = (self._cmd_next_subtask, "", "advance to next subtask phase (shortcut: /n, n)")
-            self._commands["phase1"] = (lambda cmd: self._cmd_jump_phase(0), "", "jump to phase 1: clamp and lift the box (shortcut: /1, 1)")
-            self._commands["phase2"] = (lambda cmd: self._cmd_jump_phase(1), "", "jump to phase 2: hold and turn right (shortcut: /2, 2)")
-            self._commands["phase3"] = (lambda cmd: self._cmd_jump_phase(2), "", "jump to phase 3: place on table and release (shortcut: /3, 3)")
+            for i, task_str in enumerate(self._subtask_list):
+                idx = i
+                self._commands[f"phase{i+1}"] = (
+                    lambda cmd, p=idx: self._cmd_jump_phase(p),
+                    "",
+                    f"jump to phase {i+1}: {task_str} (shortcut: /{i+1}, {i+1})",
+                )
+        if self._transfer_mode:
+            self._commands["navdone"] = (
+                self._cmd_navdone,
+                "",
+                "signal navigation to table B done → restore arm & VLA place (shortcut: /d, d, /navdone)",
+            )
 
     @property
     def robot_wrapper(self):
         """Retrieve the robot wrapper instance reliably across sub-context structures."""
         hw = getattr(self.ctx, "hardware", None)
         return getattr(hw, "robot_wrapper", None) if hw is not None else getattr(self.ctx, "robot_wrapper", None)
+
+    @property
+    def is_simulation(self) -> bool:
+        """Check whether the current session is running against a simulation environment."""
+        if getattr(self._runtime.cfg, "sim", None) is True or getattr(self._runtime.cfg, "is_simulation", None) is True:
+            return True
+        robot = getattr(self.robot_wrapper, "inner", self.robot_wrapper)
+        if robot is not None:
+            if getattr(robot, "is_simulation", None) is True:
+                return True
+            cfg = getattr(robot, "config", None)
+            if cfg is not None:
+                if getattr(cfg, "is_simulation", None) is True:
+                    return True
+                robot_ip = getattr(cfg, "robot_ip", None)
+                if isinstance(robot_ip, str):
+                    if robot_ip.lower() and robot_ip.lower() not in ("localhost", "127.0.0.1"):
+                        return False
+                    if robot_ip.lower() in ("localhost", "127.0.0.1", ""):
+                        return True
+        import sys
+        if "--real" in sys.argv:
+            return False
+        if "--sim" in sys.argv:
+            return True
+        return False
 
     @contextlib.contextmanager
     def _route_cadence_reports(self) -> Iterator[None]:
@@ -284,12 +376,30 @@ class InteractiveSession:
         elif event is RolloutEvent.SEGMENT_STARTED:
             self._is_starting = False
             log_say("Starting rollout", self._play_sounds)
-            if self._subtasks_enabled:
+            if self._transfer_mode:
+                if self._current_phase == 4:
+                    self._print(
+                        f"Rollout running — [Transfer Phase 4] VLA 已接管放置任务: \"{self.controller.task}\""
+                    )
+                elif not getattr(self, "_transfer_banner_printed", False):
+                    self._transfer_banner_printed = True
+                    self._current_phase = 0
+                    self.controller.set_task(self.controller.task or "pick up the water bottle from the table")
+                    self._print(
+                        f"Rollout running — [跨桌水瓶转运] Phase 0: 夹取水瓶 (Task: \"{self.controller.task}\").\n"
+                        f"提示: 检测到夹紧并抬起后自动夹持回默认位；导航到达桌B后输入 'd' 回车继续。"
+                    )
+                    self._start_subtask_tracker()
+                else:
+                    self._start_subtask_tracker()
+            elif self._subtasks_enabled:
                 self.controller.set_task(self._subtask_list[self._current_phase])
+                total_phases = len(self._subtask_list)
+                shortcuts_str = ", ".join(f"'{i+1}'" for i in range(total_phases))
                 self._print(
-                    f"Rollout running — [3-Subtask 模式] 当前阶段 [{self._current_phase + 1}/3]: "
+                    f"Rollout running — [{total_phases}-Subtask 模式] 当前阶段 [{self._current_phase + 1}/{total_phases}]: "
                     f"\"{self._subtask_list[self._current_phase]}\".\n"
-                    "快捷指令: 'n' 跳下一阶段, '1'/'2'/'3' 选段, 'r' 复位, 'q' 退出。"
+                    f"快捷指令: 'n' 跳下一阶段, {shortcuts_str} 选段, 'r' 复位, 'q' 退出。"
                 )
                 self._start_subtask_tracker()
             else:
@@ -443,29 +553,73 @@ class InteractiveSession:
     # ------------------------------------------------------------------
 
     def _get_robot_metrics(self) -> dict:
-        """Extract arm shoulder pitch and IMU yaw from robot state."""
+        """Extract arm shoulder pitch, IMU yaw, and right gripper angle from robot state."""
+        r_gripper = getattr(self.robot_wrapper, "right_gripper_position", 5.0)
+
+        def _extract_q(d: dict, *candidate_keys: str) -> float | None:
+            for k in candidate_keys:
+                if k in d:
+                    entry = d[k]
+                    if isinstance(entry, dict):
+                        return float(entry.get("q", 0.0))
+                    try:
+                        return float(entry)
+                    except (ValueError, TypeError):
+                        pass
+            return None
+
         try:
             robot = getattr(self.robot_wrapper, "inner", self.robot_wrapper)
+            state = None
             if robot is not None and hasattr(robot, "_latest_state") and hasattr(robot, "_state_lock"):
                 with robot._state_lock:
                     state = robot._latest_state
-                if state is not None:
-                    motors = state.get("motors", {})
-                    l_pitch = float(motors.get("left_shoulder_pitch_joint", {}).get("q", 0.0))
-                    r_pitch = float(motors.get("right_shoulder_pitch_joint", {}).get("q", 0.0))
-                    l_roll = float(motors.get("left_shoulder_roll_joint", {}).get("q", 0.0))
-                    r_roll = float(motors.get("right_shoulder_roll_joint", {}).get("q", 0.0))
-                    imu = state.get("imu", {})
-                    rpy = imu.get("rpy", [0.0, 0.0, 0.0])
-                    yaw = float(rpy[2]) if len(rpy) >= 3 else 0.0
-                    return {
-                        "connected": True,
-                        "l_pitch": l_pitch,
-                        "r_pitch": r_pitch,
-                        "l_roll": l_roll,
-                        "r_roll": r_roll,
-                        "yaw": yaw,
-                    }
+
+            motors = state.get("motors", {}) if isinstance(state, dict) else {}
+
+            # Read observation from robot wrapper as high-confidence fallback
+            obs = {}
+            if hasattr(self.robot_wrapper, "get_observation"):
+                try:
+                    obs = self.robot_wrapper.get_observation()
+                except Exception:
+                    pass
+
+            r_pitch = _extract_q(motors, "kRightShoulderPitch", "right_shoulder_pitch", "right_shoulder_pitch_joint", "kRightShoulderPitch.q")
+            if r_pitch is None:
+                r_pitch = _extract_q(obs, "kRightShoulderPitch", "kRightShoulderPitch.q", "right_shoulder_pitch") or 0.0
+
+            l_pitch = _extract_q(motors, "kLeftShoulderPitch", "left_shoulder_pitch", "left_shoulder_pitch_joint", "kLeftShoulderPitch.q")
+            if l_pitch is None:
+                l_pitch = _extract_q(obs, "kLeftShoulderPitch", "kLeftShoulderPitch.q", "left_shoulder_pitch") or 0.0
+
+            r_roll = _extract_q(motors, "kRightShoulderRoll", "right_shoulder_roll", "right_shoulder_roll_joint", "kRightShoulderRoll.q")
+            if r_roll is None:
+                r_roll = _extract_q(obs, "kRightShoulderRoll", "kRightShoulderRoll.q", "right_shoulder_roll") or 0.0
+
+            l_roll = _extract_q(motors, "kLeftShoulderRoll", "left_shoulder_roll", "left_shoulder_roll_joint", "kLeftShoulderRoll.q")
+            if l_roll is None:
+                l_roll = _extract_q(obs, "kLeftShoulderRoll", "kLeftShoulderRoll.q", "left_shoulder_roll") or 0.0
+
+            # If gripper was not found from robot_wrapper property, check obs
+            if r_gripper >= 4.95 and obs:
+                obs_grip = _extract_q(obs, "kRightGripper", "right_gripper", "gripper.right")
+                if obs_grip is not None and obs_grip < 4.95:
+                    r_gripper = obs_grip
+
+            imu = state.get("imu", {}) if isinstance(state, dict) else {}
+            rpy = imu.get("rpy", [0.0, 0.0, 0.0])
+            yaw = float(rpy[2]) if len(rpy) >= 3 else 0.0
+
+            return {
+                "connected": bool(state is not None or obs),
+                "l_pitch": float(l_pitch),
+                "r_pitch": float(r_pitch),
+                "l_roll": float(l_roll),
+                "r_roll": float(r_roll),
+                "yaw": float(yaw),
+                "r_gripper": float(r_gripper),
+            }
         except Exception as e:
             logger.debug("Error reading robot metrics: %s", e)
         return {
@@ -475,10 +629,13 @@ class InteractiveSession:
             "l_roll": 0.0,
             "r_roll": 0.0,
             "yaw": 0.0,
+            "r_gripper": float(r_gripper),
         }
 
     def _start_subtask_tracker(self) -> None:
-        if not self._subtasks_enabled:
+        if self._transfer_mode:
+            pass
+        elif not self._subtasks_enabled or len(self._subtask_list) not in (2, 3):
             return
         self._stop_subtask_tracker()
         self._subtask_stop_event.clear()
@@ -499,7 +656,14 @@ class InteractiveSession:
             self._subtask_tracker_thread.join(timeout=0.5)
         self._subtask_tracker_thread = None
 
-    def _advance_phase(self, new_phase: int, reason: str = "") -> None:
+    def _advance_phase(
+        self,
+        new_phase: int,
+        reason: str = "",
+        with_homing: bool = False,
+        duration_s: float | None = None,
+        post_homing_fn: Callable[[], str | None] | None = None,
+    ) -> None:
         if not self._subtasks_enabled or new_phase < 0 or new_phase >= len(self._subtask_list):
             return
         self._current_phase = new_phase
@@ -507,23 +671,371 @@ class InteractiveSession:
         self._lift_sustained_seconds = 0.0
         new_task = self._subtask_list[new_phase]
 
-        if new_phase == 1:
+        if new_phase == 1 and len(self._subtask_list) == 3:
             metrics = self._get_robot_metrics()
             self._phase1_start_yaw = metrics["yaw"]
 
-        self.controller.set_task(new_task)
         msg = (
-            f"\n" + "=" * 60 + "\n"
-            f" [Subtasks 流转] 切换至 Subtask [{new_phase + 1}/3]: \"{new_task}\"\n"
+            f"\n" + "=" * 65 + "\n"
+            f" [Subtasks 流转] 切换至 Subtask [{new_phase + 1}/{len(self._subtask_list)}]: \"{new_task}\"\n"
         )
         if reason:
             msg += f"   原因: {reason}\n"
-        msg += "=" * 60
+        if with_homing:
+            h_dur = duration_s if duration_s is not None else getattr(self._runtime.cfg, "subtask_homing_duration", 2.5)
+            msg += (
+                f"   优先平滑回位: 启动余弦 S 曲线归位插值 ({h_dur:.1f}s) 回到初始位置...\n"
+                f"   自动接管模式: 归位到达后自动由 VLA 接管开始执行 Phase {new_phase + 1} 推理！\n"
+            )
+        else:
+            msg += f"   模式: 直接动态切换 Prompt (保持机械臂当前姿态与环境状态，无缝流转)\n"
+        msg += "=" * 65
         self._print(msg)
 
+        if with_homing and hasattr(self.controller, "transition_with_homing"):
+            h_dur = duration_s if duration_s is not None else getattr(self._runtime.cfg, "subtask_homing_duration", 2.0)
+            if not isinstance(h_dur, (int, float)):
+                h_dur = 2.0
+            retract_first = getattr(self._runtime.cfg, "subtask_retract_first", True)
+            if not isinstance(retract_first, bool):
+                retract_first = True
+            retract_dur = getattr(self._runtime.cfg, "subtask_retract_duration", 1.2)
+            if not isinstance(retract_dur, (int, float)):
+                retract_dur = 1.2
+            self.controller.transition_with_homing(
+                new_task,
+                duration_s=h_dur,
+                retract_first=retract_first,
+                retract_duration_s=retract_dur,
+                post_homing_fn=post_homing_fn,
+            )
+        else:
+            self.controller.set_task(new_task)
+
     def _subtask_tracker_loop(self) -> None:
+        """Background thread monitoring kinematics for subtask transitions."""
+        if self._transfer_mode:
+            self._subtask_tracker_loop_transfer()
+        elif len(self._subtask_list) == 2:
+            self._subtask_tracker_loop_2stage()
+        else:
+            self._subtask_tracker_loop_3stage()
+
+    def _subtask_tracker_loop_2stage(self) -> None:
+        """Dex-1 2-Subtask tracker: table to box, prioritized homing on release, then VLA takeover to table."""
+        logger.info("Dex-1 2-Subtask tracker loop started.")
+        self._phase_start_time = time.time()
+        last_hud_time = 0.0
+        has_grasped = False
+        grasp_count = 0
+        release_count = 0
+        is_sim = self.is_simulation
+        raw_auto_home = getattr(self._runtime.cfg, "subtask_auto_home", True)
+        if isinstance(raw_auto_home, str):
+            cfg_auto_home = raw_auto_home.lower() in ("true", "1", "yes")
+        elif isinstance(raw_auto_home, bool):
+            cfg_auto_home = raw_auto_home
+        else:
+            cfg_auto_home = True
+        auto_home = cfg_auto_home
+        homing_dur = getattr(self._runtime.cfg, "subtask_homing_duration", 2.5)
+        if not isinstance(homing_dur, (int, float)):
+            homing_dur = 2.5
+        retract_first = getattr(self._runtime.cfg, "subtask_retract_first", True)
+        if not isinstance(retract_first, bool):
+            retract_first = True
+        retract_dur = getattr(self._runtime.cfg, "subtask_retract_duration", 1.2)
+        if not isinstance(retract_dur, (int, float)):
+            retract_dur = 1.2
+        raw_auto_advance = getattr(self._runtime.cfg, "subtask_auto_advance", False)
+        if isinstance(raw_auto_advance, str):
+            auto_advance = raw_auto_advance.lower() in ("true", "1", "yes")
+        elif isinstance(raw_auto_advance, bool):
+            auto_advance = raw_auto_advance
+        else:
+            auto_advance = False
+
+        # Valen (Jev) decision evaluator tracking
+        valen_client = getattr(self, "_valen_client", None)
+        valen_last_time = 0.0
+        valen_eval_interval = getattr(self._runtime.cfg, "valen_eval_interval_s", 0.4)
+        if not isinstance(valen_eval_interval, (int, float)):
+            valen_eval_interval = 0.4
+        raw_vaa = getattr(self._runtime.cfg, "valen_auto_advance", True)
+        if isinstance(raw_vaa, str):
+            valen_auto_advance = raw_vaa.lower() in ("true", "1", "yes")
+        elif isinstance(raw_vaa, bool):
+            valen_auto_advance = raw_vaa
+        else:
+            valen_auto_advance = True
+        valen_confirm_count = 0
+        latest_valen_hud = ""
+
+        def _evaluate_next_phase_at_home() -> str:
+            """Executed at default position: inspect scene and decide whether next is Phase 1 or Phase 2."""
+            time.sleep(0.4)
+            robot = getattr(self.robot_wrapper, "inner", self.robot_wrapper)
+            last_cams = getattr(robot, "_last_camera_frames", {})
+            g_frame = last_cams.get("global_view") or last_cams.get("base_0_rgb")
+            rw_frame = last_cams.get("right_wrist") or last_cams.get("right_wrist_0_rgb")
+
+            # 1. If Valen evaluator is active, evaluate scene from default position
+            if valen_client is not None and g_frame is not None and rw_frame is not None:
+                v_res = valen_client.evaluate(g_frame, rw_frame, phase=0)
+                if v_res.is_success:
+                    choice = v_res.choice
+                    prob = v_res.probabilities.get(choice, 0.0)
+                    box_prob = v_res.probabilities.get("bottle_in_box_completed", 0.0)
+                    if valen_auto_advance and (choice == "bottle_in_box_completed" or box_prob >= 0.50):
+                        self._current_phase = 1
+                        next_task = self._subtask_list[1]
+                        self._print(
+                            f"\n" + "=" * 65 + "\n"
+                            f" [默认位置状态判别] Valen Jev 判定水瓶已在蓝盒中！\n"
+                            f"   判定结果: {choice} (置信度 P={box_prob:.2f}, {v_res.cost_ms:.0f}ms)\n"
+                            f"   决策下发: 进入 Subtask [2/2]: \"{next_task}\"\n"
+                            f"   接管模式: VLA 自动接管开始执行从盒中取出水瓶 (无缝流转，全程无 Reset)\n"
+                            f"=" * 65 + "\n"
+                        )
+                        self._phase_start_time = time.time()
+                        return next_task
+                    else:
+                        self._current_phase = 0
+                        next_task = self._subtask_list[0]
+                        self._print(
+                            f"\n" + "=" * 65 + "\n"
+                            f" [默认位置状态判别] Valen Jev 判定水瓶未入盒 / 仍在桌上 / 抓取失败！\n"
+                            f"   判定结果: {choice} (P={prob:.2f}, {v_res.cost_ms:.0f}ms)\n"
+                            f"   决策下发: 重新执行 Subtask [1/2]: \"{next_task}\"\n"
+                            f"   接管模式: VLA 自动接管重新夹取水瓶放入蓝盒 (无缝重试，全程无 Reset)\n"
+                            f"=" * 65 + "\n"
+                        )
+                        self._phase_start_time = time.time()
+                        return next_task
+
+            # 2. If Valen is not active or evaluation failed:
+            if auto_advance:
+                self._current_phase = 1
+                next_task = self._subtask_list[1]
+                self._print(
+                    f"\n" + "=" * 65 + "\n"
+                    f" [默认位置状态确认] 机器人已到达默认位置，流转至 Subtask [2/2]: \"{next_task}\"\n"
+                    f"   接管模式: VLA 自动接管开始执行 Phase 2 推理 (全程无 Reset)\n"
+                    f"=" * 65 + "\n"
+                )
+            else:
+                self._current_phase = 0
+                next_task = self._subtask_list[0]
+                self._print(
+                    f"\n" + "=" * 65 + "\n"
+                    f" [默认位置状态保持] 机器人已到达默认位置，保持 Subtask [1/2]: \"{next_task}\"\n"
+                    f"   手动切换提示: 准备好执行下一阶段时，随时按 'n' 或 '2' 手动切换至 Subtask 2\n"
+                    f"=" * 65 + "\n"
+                )
+            self._phase_start_time = time.time()
+            return next_task
+
+        while self._subtask_tracker_running and not self._subtask_stop_event.is_set():
+            time.sleep(0.05)
+            # Skip evaluation while inference is paused or transitioning
+            if not getattr(self.controller, "running", False):
+                continue
+
+            now = time.time()
+            elapsed = now - self._phase_start_time
+            metrics = self._get_robot_metrics()
+
+            if not metrics.get("connected", False):
+                continue
+
+            r_gripper = float(metrics.get("r_gripper", 5.0))
+
+            # Query Valen evaluator if enabled
+            if valen_client is not None and now - valen_last_time >= valen_eval_interval:
+                valen_last_time = now
+                robot = getattr(self.robot_wrapper, "inner", self.robot_wrapper)
+                last_cams = getattr(robot, "_last_camera_frames", {})
+                g_frame = last_cams.get("global_view")
+                if g_frame is None:
+                    g_frame = last_cams.get("base_0_rgb")
+                rw_frame = last_cams.get("right_wrist")
+                if rw_frame is None:
+                    rw_frame = last_cams.get("right_wrist_0_rgb")
+
+                if g_frame is not None and rw_frame is not None:
+                    v_res = valen_client.evaluate(g_frame, rw_frame, phase=self._current_phase)
+                    if v_res.is_success:
+                        prob_val = v_res.probabilities.get(v_res.choice, 0.0)
+                        latest_valen_hud = f" | Jev: {v_res.choice} (P={prob_val:.2f}, {v_res.cost_ms:.0f}ms)"
+
+                        # Double verification with Valen + Gripper
+                        if self._current_phase == 0:
+                            is_target = (
+                                (v_res.choice == "bottle_in_box_completed" and prob_val >= 0.55)
+                                or v_res.probabilities.get("bottle_in_box_completed", 0.0) >= 0.65
+                            )
+                            # Only confirm completion if the bottle was previously grasped and is now released in box
+                            if is_target and has_grasped and r_gripper >= 4.7:
+                                valen_confirm_count += 1
+                                if valen_confirm_count >= 2:
+                                    reason = (
+                                        f"Valen Jev+夹爪双校验确认瓶已入盒 "
+                                        f"({v_res.choice}, P={v_res.probabilities.get('bottle_in_box_completed', 0.0):.2f}) 且已松爪"
+                                    )
+                                    valen_confirm_count = 0
+                                    has_grasped = False
+                                    grasp_count = 0
+                                    release_count = 0
+                                    self._phase_start_time = time.time()
+                                    if auto_home:
+                                        msg = (
+                                            f"\n" + "=" * 65 + "\n"
+                                            f" [Subtask 1/2 动作完成] {reason}\n"
+                                            f"   平滑回位中: 先平收右臂 ({retract_dur:.1f}s) 避开盒子，再余弦 S 曲线归位 ({homing_dur:.1f}s) 回到默认位置...\n"
+                                            f"   归位后规划: 到达默认位置后重新观察视野，判断接下来进入 Phase 1 还是 Phase 2 (全程无 Reset)\n"
+                                            f"=" * 65
+                                        )
+                                        self._print(msg)
+                                        if hasattr(self.controller, "transition_with_homing"):
+                                            self.controller.transition_with_homing(
+                                                None,
+                                                duration_s=homing_dur,
+                                                retract_first=retract_first,
+                                                retract_duration_s=retract_dur,
+                                                resume=True,
+                                                post_homing_fn=_evaluate_next_phase_at_home,
+                                            )
+                                    else:
+                                        if valen_auto_advance or auto_advance:
+                                            self._advance_phase(1, reason=reason, with_homing=False)
+                            else:
+                                valen_confirm_count = max(0, valen_confirm_count - 1)
+
+                        elif self._current_phase == 1:
+                            is_target = (
+                                (v_res.choice == "bottle_on_table_completed" and prob_val >= 0.55)
+                                or v_res.probabilities.get("bottle_on_table_completed", 0.0) >= 0.65
+                            )
+                            if is_target and has_grasped and r_gripper >= 4.7:
+                                valen_confirm_count += 1
+                                if valen_confirm_count >= 2:
+                                    self._print("\n" + "=" * 65)
+                                    self._print("🎉 [Subtasks] 2 阶段抓放水瓶子任务已全部执行完毕！")
+                                    self._print(
+                                        f"   Valen Jev+夹爪双校验确认瓶已放回桌面 ({v_res.choice})，平滑返回默认位置待命...\n"
+                                        f"   (保持当前大模型上下文与仿真场景，未自动Reset；如需重置模型上下文可手动按 'r' 或 /reset)"
+                                    )
+                                    self._print("=" * 65 + "\n")
+                                    self._current_phase = 2
+                                    valen_confirm_count = 0
+                                    has_grasped = False
+                                    grasp_count = 0
+                                    release_count = 0
+                                    if auto_home and hasattr(self.controller, "transition_with_homing"):
+                                        self.controller.transition_with_homing(
+                                            None,
+                                            duration_s=homing_dur,
+                                            retract_first=retract_first,
+                                            retract_duration_s=retract_dur,
+                                            resume=False,
+                                        )
+                            else:
+                                valen_confirm_count = max(0, valen_confirm_count - 1)
+
+            # Status HUD every 1.5s
+            if now - last_hud_time >= 1.5:
+                last_hud_time = now
+                status_str = "已夹持水瓶" if has_grasped else "未抓取/张开"
+                status_str += latest_valen_hud
+                if self._current_phase == 0:
+                    self._print(
+                        f"📊 [Subtask 1/2: 抓水瓶放盒] 耗时: {elapsed:4.1f}s | "
+                        f"右夹爪: {r_gripper:4.2f} rad ({status_str}) | 右肩俯仰: {metrics['r_pitch']:+.2f}"
+                    )
+                elif self._current_phase == 1:
+                    self._print(
+                        f"📊 [Subtask 2/2: 盒中取水瓶放桌] 耗时: {elapsed:4.1f}s | "
+                        f"右夹爪: {r_gripper:4.2f} rad ({status_str}) | 右肩俯仰: {metrics['r_pitch']:+.2f}"
+                    )
+
+            # Phase 0: "pick up the water bottle from the table and place it into the blue box"
+            if self._current_phase == 0:
+                if r_gripper <= 3.9:
+                    grasp_count += 1
+                    if grasp_count >= 3:
+                        if not has_grasped:
+                            has_grasped = True
+                            self._print(f"\n✊ [Subtask 1/2] 检测到水瓶已被稳固夹起 (右夹爪: {r_gripper:.2f} rad <= 3.9)")
+                else:
+                    grasp_count = max(0, grasp_count - 1)
+
+                if has_grasped and r_gripper >= 4.7:
+                    release_count += 1
+                    if release_count >= 3:
+                        reason = f"检测到水瓶在盒中松开释放 (右夹爪: {r_gripper:.2f} rad >= 4.7)"
+                        has_grasped = False
+                        grasp_count = 0
+                        release_count = 0
+                        self._phase_start_time = time.time()
+                        if auto_home:
+                            msg = (
+                                f"\n" + "=" * 65 + "\n"
+                                f" [Subtask 1/2 动作完成] {reason}\n"
+                                f"   平滑回位中: 先平收右臂 ({retract_dur:.1f}s) 避开盒子，再余弦 S 曲线归位 ({homing_dur:.1f}s) 回到默认位置...\n"
+                                f"   归位后规划: 到达默认位置后重新观察视野，判断接下来进入 Phase 1 还是 Phase 2 (全程无 Reset)\n"
+                                f"=" * 65
+                            )
+                            self._print(msg)
+                            if hasattr(self.controller, "transition_with_homing"):
+                                self.controller.transition_with_homing(
+                                    None,
+                                    duration_s=homing_dur,
+                                    retract_first=retract_first,
+                                    retract_duration_s=retract_dur,
+                                    resume=True,
+                                    post_homing_fn=_evaluate_next_phase_at_home,
+                                )
+                        else:
+                            if auto_advance:
+                                self._advance_phase(1, reason=reason, with_homing=False)
+
+            # Phase 1: "take the water bottle out of the blue box and place it back on the table"
+            elif self._current_phase == 1:
+                if r_gripper <= 3.9:
+                    grasp_count += 1
+                    if grasp_count >= 3:
+                        if not has_grasped:
+                            has_grasped = True
+                            self._print(f"\n✊ [Subtask 2/2] 检测到水瓶已从盒中夹起 (右夹爪: {r_gripper:.2f} rad <= 3.9)")
+                else:
+                    grasp_count = max(0, grasp_count - 1)
+
+                if has_grasped and r_gripper >= 4.7:
+                    release_count += 1
+                    if release_count >= 3:
+                        self._print("\n" + "=" * 65)
+                        self._print("🎉 [Subtasks] 2 阶段抓放水瓶子任务已全部执行完毕！")
+                        self._print(
+                            "   检测到水瓶已放回桌面并松开，平滑返回默认位置待命...\n"
+                            "   (保持当前大模型上下文与环境状态，未自动Reset；如需重置模型上下文可手动按 'r' 或 /reset)"
+                        )
+                        self._print("=" * 65 + "\n")
+                        self._current_phase = 2
+                        has_grasped = False
+                        grasp_count = 0
+                        release_count = 0
+                        if auto_home and hasattr(self.controller, "transition_with_homing"):
+                            self.controller.transition_with_homing(
+                                None,
+                                duration_s=homing_dur,
+                                retract_first=retract_first,
+                                retract_duration_s=retract_dur,
+                                resume=False,
+                            )
+
+    def _subtask_tracker_loop_3stage(self) -> None:
         """Background thread monitoring kinematics for 3-stage subtask transitions."""
-        logger.info("Subtask tracker thread started.")
+        logger.info("Subtask tracker thread started (3-stage).")
         self._phase_start_time = time.time()
         self._phase1_start_yaw = 0.0
         self._lift_sustained_seconds = 0.0
@@ -599,24 +1111,351 @@ class InteractiveSession:
                     self._current_phase = 3
 
     # ------------------------------------------------------------------
+    # Transfer mode: cross-table water bottle transport
+    # Phase flow:
+    #   0 → VLA picking from table A  (JEV detects grasped+lifted → freeze snapshot)
+    #   1 → Arm homing while gripping  (transition_with_homing resume=False)
+    #   2 → Waiting for /navdone       (navigation walk, upper body fixed at home)
+    #   3 → Arm restore to frozen pose (interpolate home→frozen, gripper stays clamped)
+    #   4 → VLA placing at table B     (JEV decides box vs table, VLA takes over)
+    # ------------------------------------------------------------------
+
+    def _subtask_tracker_loop_transfer(self) -> None:
+        """Transfer-mode tracker: detect grasped+lifted → freeze → home → wait nav → restore → VLA place.
+
+        The gripper stays clamped (closed) during homing, navigation, and pose-restore phases.
+        The arm joint snapshot is captured the moment JEV confirms the bottle is grasped and
+        slightly lifted.  After navigation (signalled via /navdone), the arm is interpolated
+        back from the home position to that frozen pose before VLA resumes, preventing a jump.
+        """
+        import copy
+        import math
+
+        logger.info("Transfer-mode subtask tracker started.")
+        self._phase_start_time = time.time()
+        self._current_phase = 0
+        self._nav_done_event.clear()
+
+        # ── Tunable thresholds ────────────────────────────────────────
+        grasp_thresh = float(getattr(self._runtime.cfg, "transfer_grasp_thresh", 3.5))
+        lift_pitch_thresh = float(getattr(self._runtime.cfg, "transfer_lift_pitch", -0.20))
+        grasp_confirm_frames = int(getattr(self._runtime.cfg, "transfer_grasp_frames", 8))
+        homing_dur = float(getattr(self._runtime.cfg, "subtask_homing_duration", 2.5))
+        restore_dur = float(getattr(self._runtime.cfg, "transfer_restore_duration", 2.5))
+        gripper_closed_val = float(getattr(self._runtime.cfg, "transfer_gripper_closed", 2.0))
+        valen_eval_interval = float(getattr(self._runtime.cfg, "valen_eval_interval_s", 0.5))
+
+        # Default placement prompt when JEV is unavailable
+        default_place_box_task = getattr(
+            self._runtime.cfg, "transfer_place_box_task",
+            "pick up the water bottle and place it into the blue box"
+        )
+        default_place_table_task = getattr(
+            self._runtime.cfg, "transfer_place_table_task",
+            "pick up the water bottle and place it on the table"
+        )
+
+        valen_client = getattr(self, "_valen_client", None)
+        valen_auto_advance = True
+        raw_vaa = getattr(self._runtime.cfg, "valen_auto_advance", True)
+        if isinstance(raw_vaa, str):
+            valen_auto_advance = raw_vaa.lower() in ("true", "1", "yes")
+        elif isinstance(raw_vaa, bool):
+            valen_auto_advance = raw_vaa
+
+        # ── Phase 0 state ─────────────────────────────────────────────
+        grasp_count = 0
+        transfer_triggered = False
+        last_hud_time = 0.0
+        valen_last_time = 0.0
+        latest_valen_hud = ""
+
+        # ── Helper: capture full joint state snapshot ─────────────────
+        def _capture_joint_snapshot() -> dict | None:
+            """Return a {joint_key: float} snapshot of the robot's current action-space joints."""
+            try:
+                robot_wrapper = self.robot_wrapper
+                robot = getattr(robot_wrapper, "inner", robot_wrapper)
+                if robot is None:
+                    return None
+                obs = robot_wrapper.get_observation()
+                # Keep only keys that appear in the action feature space
+                action_keys = set(getattr(robot_wrapper, "action_features", {}).keys())
+                snapshot = {k: float(v) for k, v in obs.items() if k in action_keys}
+                return snapshot if snapshot else None
+            except Exception as exc:
+                logger.debug("Failed to capture joint snapshot: %s", exc)
+                return None
+
+        # ── Helper: restore arm to frozen pose, gripper stays clamped at real-time value ──
+        def _restore_arm_to_frozen_pose(frozen: dict, duration_s: float, gripper_val: float) -> None:
+            """Interpolate from current (home) pose to the frozen grasped pose.
+
+            The gripper target is strictly locked to gripper_val (the real-time
+            angle captured when the bottle was grasped), ensuring the gripper maintains
+            the exact same gripping force and position throughout arm restoration.
+            """
+            from lerobot.rollout.strategies.core import RolloutStrategy
+            try:
+                robot_wrapper = self.robot_wrapper
+                robot = getattr(robot_wrapper, "inner", robot_wrapper)
+                if robot is None or not frozen:
+                    return
+                current_obs = robot_wrapper.get_observation()
+                current_pos = {k: float(v) for k, v in current_obs.items() if k in frozen}
+
+                # Build target: frozen pose, with gripper held at the real-time grasped angle
+                target = dict(frozen)
+                for grip_key in ("kRightGripper", "right_gripper", "gripper.right",
+                                 "kLeftGripper", "left_gripper", "gripper.left"):
+                    if grip_key in target:
+                        target[grip_key] = gripper_val
+
+                self._print(
+                    f"\n── [Phase 3 / Transfer] 开始上肢姿态恢复 ({duration_s:.1f}s)...\n"
+                    f"   夹爪保持夹取时的实时测量角度 ({gripper_val:.2f} rad)，恢复完成后 VLA 无缝接管"
+                )
+                RolloutStrategy._interpolate_motion(
+                    robot_wrapper, current_pos, target, duration_s=duration_s
+                )
+                self._print("✅ [Phase 3 / Transfer] 上肢姿态恢复完成！")
+            except Exception as exc:
+                logger.warning("Arm pose restore failed: %s", exc)
+
+        # ── Helper: JEV decision at table B ───────────────────────────
+        def _decide_placement_task_at_tableB() -> str:
+            """Called from post_homing_fn after navigation done + arm restore.
+
+            Waits for /navdone signal, restores arm pose, then queries JEV to
+            determine whether to place into box or onto table.
+            Returns the subtask prompt string (used as next_task by _homing_transition).
+            """
+            # ── Phase 2: wait for /navdone signal ──────────────────
+            self._current_phase = 2
+            self._print(
+                "\n" + "=" * 65 + "\n"
+                " 📍 [Transfer] 机器人已回到默认位置，夹爪保持夹紧水瓶。\n"
+                "    请移动/导航至桌B，到达后输入 'd' 回车 (或 /navdone) 继续。\n"
+                "   [TRANSFER_STATE] PHASE2_NAVIGATING\n"
+                "=" * 65
+            )
+            self._nav_done_event.wait()   # blocks until /navdone or timeout
+            self._nav_done_event.clear()
+
+            # ── Phase 3: restore arm to frozen grasped pose ─────────
+            self._current_phase = 3
+            self._print("\n[TRANSFER_STATE] PHASE3_RESTORING")
+            frozen = self._frozen_joint_state
+            grip_val = self._captured_gripper_val if self._captured_gripper_val is not None else float(getattr(self._runtime.cfg, "transfer_gripper_closed", 3.4))
+            if frozen:
+                _restore_arm_to_frozen_pose(frozen, duration_s=restore_dur, gripper_val=grip_val)
+            else:
+                self._print("⚠️  [Transfer] 未找到冻结关节快照，跳过姿态恢复。")
+                time.sleep(0.5)
+
+            # ── Phase 4 prep: JEV decides placement target ──────────
+            self._current_phase = 4
+            self._print("\n[TRANSFER_STATE] PHASE4_PLACING_PREP")
+            time.sleep(0.5)  # let camera stabilise
+
+            placement_task = default_place_table_task  # fallback
+            target_decision_str = "放桌上 (place_on_table)"
+            if valen_client is not None:
+                robot = getattr(self.robot_wrapper, "inner", self.robot_wrapper)
+                last_cams = getattr(robot, "_last_camera_frames", {})
+                g_frame = last_cams.get("base_0_rgb") or last_cams.get("global_view")
+                rw_frame = last_cams.get("right_wrist_0_rgb") or last_cams.get("right_wrist")
+
+                if g_frame is not None and rw_frame is not None:
+                    # phase=2 → JEV server decides: "place_into_box" or "place_on_table"
+                    v_res = valen_client.evaluate(g_frame, rw_frame, phase=2)
+                    if v_res.is_success:
+                        prob = v_res.probabilities.get(v_res.choice, 0.0)
+                        if v_res.choice == "place_into_box":
+                            placement_task = default_place_box_task
+                            target_decision_str = f"放蓝盒 (place_into_box, P={prob:.2f}, {v_res.cost_ms:.0f}ms)"
+                        elif v_res.choice == "place_on_table":
+                            placement_task = default_place_table_task
+                            target_decision_str = f"放桌上 (place_on_table, P={prob:.2f}, {v_res.cost_ms:.0f}ms)"
+                        else:
+                            placement_task = default_place_table_task
+                            target_decision_str = f"未知标签 '{v_res.choice}' -> 默认放桌上"
+                    else:
+                        target_decision_str = f"查询失败 ({v_res.error}) -> 默认放桌上"
+                else:
+                    target_decision_str = "相机不可用 -> 默认放桌上"
+
+            self._print(
+                "\n" + "=" * 65 + "\n"
+                f" 🤖 [Transfer] Jev 视觉判断放置目标: {target_decision_str}\n"
+                f" 🎯 [Transfer Phase 4] VLA 接管放置任务: \"{placement_task}\"\n"
+                "=" * 65
+            )
+            return placement_task
+
+        # ── Main Phase 0 detection loop ───────────────────────────────
+        show_hud = False
+        raw_hud = getattr(self._runtime.cfg, "transfer_hud", False)
+        if isinstance(raw_hud, str):
+            show_hud = raw_hud.lower() in ("true", "1", "yes")
+        elif isinstance(raw_hud, bool):
+            show_hud = raw_hud
+
+        while self._subtask_tracker_running and not self._subtask_stop_event.is_set():
+            time.sleep(0.05)
+
+            if not getattr(self.controller, "running", False):
+                continue
+            if transfer_triggered:
+                # transition_with_homing is blocking on the serve thread; nothing more to do here
+                break
+
+            now = time.time()
+            elapsed = now - self._phase_start_time
+            metrics = self._get_robot_metrics()
+
+            if not metrics.get("connected", False):
+                continue
+
+            r_gripper = float(metrics.get("r_gripper", 5.0))
+            r_pitch = float(metrics.get("r_pitch", 0.0))
+
+            # ── Valen HUD (only when transfer_hud is explicitly enabled) ─────
+            if show_hud and valen_client is not None and now - valen_last_time >= valen_eval_interval:
+                valen_last_time = now
+                robot = getattr(self.robot_wrapper, "inner", self.robot_wrapper)
+                last_cams = getattr(robot, "_last_camera_frames", {})
+                g_frame = last_cams.get("base_0_rgb") or last_cams.get("global_view")
+                rw_frame = last_cams.get("right_wrist_0_rgb") or last_cams.get("right_wrist")
+                if g_frame is not None and rw_frame is not None:
+                    v_res = valen_client.evaluate(g_frame, rw_frame, phase=0)
+                    if v_res.is_success:
+                        prob = v_res.probabilities.get(v_res.choice, 0.0)
+                        latest_valen_hud = f" | Jev: {v_res.choice} (P={prob:.2f})"
+                    else:
+                        latest_valen_hud = f" | Jev: [{v_res.error or 'err'}]"
+
+            # ── Detect grasped + slightly lifted ──────────────────────
+            # Clamped: gripper closed around bottle (e.g. <= 3.5 rad)
+            # Lifted: right shoulder pitch rotated upwards (r_pitch <= lift_pitch_thresh, e.g. <= -0.15 rad)
+            is_clamped = (r_gripper <= grasp_thresh)
+            is_lifted = (r_pitch <= lift_pitch_thresh)
+            is_grasped_and_lifted = is_clamped and is_lifted
+
+            if is_grasped_and_lifted:
+                grasp_count += 1
+            else:
+                grasp_count = max(0, grasp_count - 1)
+
+            # ── HUD (only when transfer_hud is explicitly enabled) ──────
+            if show_hud and now - last_hud_time >= 1.5:
+                last_hud_time = now
+                grip_str = "夹紧✊" if is_clamped else "张开🤚"
+                lift_str = f"已抬起({r_pitch:+.2f})" if is_lifted else f"未抬起({r_pitch:+.2f})"
+                confirm_str = f" [确认: {grasp_count}/{grasp_confirm_frames}]" if grasp_count > 0 else ""
+                self._print(
+                    f"📊 [Transfer Phase 0: 夹水瓶] 耗时: {elapsed:4.1f}s | "
+                    f"右夹爪: {r_gripper:.2f} rad ({grip_str}) | "
+                    f"右肩: {lift_str}{confirm_str}{latest_valen_hud}"
+                )
+
+            if grasp_count >= grasp_confirm_frames and not transfer_triggered:
+                transfer_triggered = True
+                self._current_phase = 1
+
+                # Capture real-time gripper measurement at the moment of confirmed grasp
+                captured_gripper_val = float(r_gripper)
+                self._captured_gripper_val = captured_gripper_val
+
+                # Capture frozen snapshot BEFORE homing starts
+                snapshot = _capture_joint_snapshot()
+                if snapshot:
+                    # Explicitly stamp the real-time grasped gripper angle onto all gripper keys in the snapshot
+                    for grip_key in ("kRightGripper", "right_gripper", "gripper.right",
+                                     "kLeftGripper", "left_gripper", "gripper.left"):
+                        if grip_key in snapshot:
+                            snapshot[grip_key] = captured_gripper_val
+                    self._frozen_joint_state = snapshot
+                    self._print(
+                        f"\n✊ [Transfer] 检测到水瓶已夹起并抬起 (夹爪: {captured_gripper_val:.2f} rad, 右肩: {r_pitch:.2f} rad)。\n"
+                        f"   已冻结抓取姿态快照，夹爪全程锁定夹紧 ({captured_gripper_val:.2f} rad)。\n"
+                        f"   正在平滑回默认位置 ({homing_dur:.1f}s)...\n"
+                        f"   [TRANSFER_STATE] PHASE1_RETURNING"
+                    )
+                else:
+                    self._print(
+                        f"\n✊ [Transfer] 检测到夹紧+抬起 (夹爪: {captured_gripper_val:.2f} rad)，"
+                        f"正在回默认位置 ({homing_dur:.1f}s)...\n"
+                        f"   [TRANSFER_STATE] PHASE1_RETURNING"
+                    )
+
+                # ── Trigger homing, gripper locked to captured_gripper_val ─────
+                # Build target_override so return_to_initial_position maintains the exact
+                # grasped gripper angle instead of opening back to the default position's 5.0 rad.
+                target_override = {}
+                hw_initial = getattr(self.ctx.hardware, "initial_position", {}) or {}
+                for grip_key in ("kRightGripper", "right_gripper", "gripper.right",
+                                 "kLeftGripper", "left_gripper", "gripper.left"):
+                    if grip_key in hw_initial:
+                        target_override[grip_key] = captured_gripper_val
+
+                # retract_first=False: arm is not forward-extended into a box;
+                # the retract waypoint would try to open the gripper (undesired).
+                # post_homing_fn blocks the serve thread while waiting for nav + restore + decide.
+                ok = self.controller.transition_with_homing(
+                    next_task=None,        # task set inside post_homing_fn
+                    duration_s=homing_dur,
+                    retract_first=False,   # already upright, no obstacle to retract from
+                    retract_duration_s=0.0,
+                    resume=True,           # _homing_transition will call _run_segment after fn returns
+                    post_homing_fn=_decide_placement_task_at_tableB,
+                    target_override=target_override if target_override else None,
+                )
+                if not ok:
+                    self._print("⚠️  [Transfer] transition_with_homing 被拒绝（控制器已停止？），中止转运。")
+                    transfer_triggered = False
+                    self._current_phase = 0
+                break
+
+        logger.info("Transfer-mode subtask tracker exited (phase=%d).", self._current_phase)
+
+    # ------------------------------------------------------------------
     # Command handlers (called from the listener thread)
     # ------------------------------------------------------------------
 
     def _handle_line(self, line: str) -> None:
         stripped = line.strip()
         if not stripped:
+            ctrl_state = "RUNNING (运行中)" if self.controller.running else ("RESETTING (复位中)" if self._is_resetting else "IDLE (待命)")
+            if self._transfer_mode:
+                phase_labels = {
+                    0: "Phase 0 (桌A夹水瓶)",
+                    1: "Phase 1 (回默认位置)",
+                    2: "Phase 2 (等待导航, 输入 d 回车)",
+                    3: "Phase 3 (姿态恢复中)",
+                    4: "Phase 4 (桌B放置)",
+                }
+                phase_str = phase_labels.get(self._current_phase, f"Phase {self._current_phase}")
+                metrics = self._get_robot_metrics()
+                grip_val = metrics.get("r_gripper", 0.0)
+                pitch_val = metrics.get("r_pitch", 0.0)
+                self._print(
+                    f"[Transfer 状态] {phase_str} | 控制器: {ctrl_state} | "
+                    f"右夹爪: {grip_val:.2f} rad | 右肩俯仰: {pitch_val:+.2f} rad | "
+                    f"指令: 's' 启动, 'd' 导航到达, 'r' 复位, 'q' 退出"
+                )
+                return
             # User pressed empty Enter: print a one-line quick status
             robot = self.robot_wrapper
             mode = getattr(robot, "current_mode", "N/A")
             mode_val = mode.value if hasattr(mode, "value") else str(mode)
             pkts = getattr(robot, "mode_packet_count", 0)
             mode_port = getattr(robot, "mode_port", 6000)
-            ctrl_state = "RUNNING (运行中)" if self.controller.running else ("RESETTING (复位中)" if self._is_resetting else "IDLE (待命)")
             self._print(f"[当前状态] 模式端口({mode_port}): {mode_val} (收包: {pkts}) | 控制器: {ctrl_state} | 输入 'm' 查看详情, 's' 启动, 'r' 复位")
             return
         cmd = parse_command(stripped)
         if cmd is None:
-            self._print("Input not recognized — commands: s (start), r (reset), m (mode), n (next), 1/2/3, q (stop), /help.")
+            self._print("Input not recognized — commands: s (start), d (navdone), r (reset), m (mode), n (next), q (stop), /help.")
             return
         entry = self._commands.get(cmd.name)
         if entry is None:
@@ -750,10 +1589,40 @@ class InteractiveSession:
             logger.error("Unhandled AskResult %r for /autosteer", result)
             self._print(f"Could not start autosteer ({result.value}).")
 
+    def _cmd_navdone(self, cmd: InteractiveCommand) -> None:
+        """Signal that navigation to table B is complete.
+
+        Sets the nav_done event, which unblocks the post_homing_fn waiting in
+        the serve thread.  The serve thread then runs Phase 3 (arm restore) and
+        Phase 4 (VLA takeover with JEV-decided prompt) automatically.
+        """
+        if not self._transfer_mode:
+            self._print("Transfer mode is not active — /navdone has no effect.")
+            return
+        if self._current_phase != 2:
+            self._print(
+                f"⚠️  /navdone received but current transfer phase is {self._current_phase} (expected 2: NAVIGATING). "
+                "Signal stored; it will unblock the next Phase 2 wait if one occurs."
+            )
+        else:
+            self._print(
+                "✅ [Transfer] 导航完成信号已接收！\n"
+                "   → 开始 Phase 3: 上肢从默认位置恢复到抓取时的冻结姿态（夹爪保持夹紧）…"
+            )
+        self._nav_done_event.set()
+
     def _cmd_reset(self, cmd: InteractiveCommand) -> None:
         self._is_starting = False
         self._is_resetting = True
         self._stop_subtask_tracker()
+        if self._transfer_mode:
+            # Also clear transfer-specific state so a re-run starts fresh
+            self._nav_done_event.set()   # unblock any waiting post_homing_fn
+            self._frozen_joint_state = None
+            self._captured_gripper_val = None
+            self._current_phase = 0
+            self._transfer_banner_printed = False
+            self._nav_done_event.clear()
         if self._subtasks_enabled:
             self._current_phase = 0
             self._lift_sustained_seconds = 0.0
@@ -795,10 +1664,28 @@ class InteractiveSession:
     def _render_banner(self) -> str:
         subtask_info = ""
         if self._subtasks_enabled:
+            total_phases = len(self._subtask_list)
+            seq_desc = " -> ".join(f"[{i+1}] {t}" for i, t in enumerate(self._subtask_list))
+            shortcuts = "/".join(str(i+1) for i in range(total_phases))
+            auto_home = getattr(self._runtime.cfg, "subtask_auto_home", True)
+            auto_adv = getattr(self._runtime.cfg, "subtask_auto_advance", False)
+            if auto_home and not auto_adv:
+                home_note = " (★ 动作完成自动平滑回位并保持Prompt，按'n'手动切段)"
+            elif auto_home and auto_adv:
+                home_note = " (★ 阶段完成自动平滑回位并自动切换Prompt)"
+            else:
+                home_note = ""
             subtask_info = (
-                "Subtasks Sequence: ON (3 阶段自动流转模式已激活)\n"
-                "  [1] clamp and lift the box -> [2] hold the box and turn right -> [3] place the box on the table and release\n"
-                "  (快捷键: 'n' 跳下一阶段, '1'/'2'/'3' 选阶段, 'r' 复位, 's' 启动, 'q' 退出)\n"
+                f"Subtasks Sequence: ON ({total_phases} 阶段流转模式已激活{home_note})\n"
+                f"  {seq_desc}\n"
+                f"  (快捷键: 'n' 跳下一阶段, '{shortcuts}' 选阶段, 'r' 复位, 's' 启动, 'q' 退出)\n"
+            )
+        transfer_info = ""
+        if self._transfer_mode:
+            transfer_info = (
+                "Task Mode: WATER BOTTLE TRANSFER (跨桌水瓶转运)\n"
+                "  • 阶段流程: 桌A夹水瓶 → 自动夹紧回默认位 → 导航至桌B(输入 'd' 回车) → 恢复姿态 → 桌B放置\n"
+                "  • 快捷指令: 's' 启动推理 | 'd' 导航到达桌B | 'r' 复位 | 'q' 退出\n"
             )
         mode_info = ""
         robot = self.robot_wrapper
@@ -825,6 +1712,7 @@ class InteractiveSession:
             f"{session_lead}"
             f"{mode_info}"
             f"{subtask_info}"
+            f"{transfer_info}"
             f"Task: {_format_task(self.controller.initial_task)}\n"
             f"{self._render_help()}\n"
             "Routine system logs and warnings are muted during the session (errors and the "

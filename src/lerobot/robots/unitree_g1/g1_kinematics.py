@@ -297,7 +297,7 @@ class G1_29_ArmIK:  # noqa: N801
     def compute_proprio_23d(
         self,
         raw_state: np.ndarray,
-        default_grippers: tuple[float, float] = (4.0, 4.0),
+        default_grippers: tuple[float, float] = (5.0, 5.0),
     ) -> np.ndarray:
         """
         Compute 23-DoF proprioception [L_xyz (3), L_6d (6), R_xyz (3), R_6d (6), grippers (2), waist (3)]

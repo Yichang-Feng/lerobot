@@ -177,6 +177,14 @@ class RolloutController:
         self._start_requested = Event()
         self._reset_requested = Event()
         self._stop_requested = Event()
+        self._transition_requested = Event()
+        self._transition_next_task: str | None = None
+        self._transition_duration_s: float = 2.0
+        self._transition_retract_first: bool = True
+        self._transition_retract_duration_s: float = 1.2
+        self._transition_resume: bool = True
+        self._transition_post_homing_fn: Callable[[], str | None] | None = None
+        self._transition_target_override: dict[str, float] | None = None
         self._wake = Event()
         self._running = Event()
         # Latched (never cleared) when serve() exits; the control methods then refuse.
@@ -261,6 +269,41 @@ class RolloutController:
             self._segment_stop.set()
             self._wake.set()
             return restored
+
+    def transition_with_homing(
+        self,
+        next_task: str | None = None,
+        duration_s: float = 2.0,
+        retract_first: bool = True,
+        retract_duration_s: float = 1.2,
+        resume: bool = True,
+        post_homing_fn: Callable[[], str | None] | None = None,
+        target_override: dict[str, float] | None = None,
+    ) -> bool:
+        """Interrupt running segment, return robot smoothly to initial position, and optionally resume inference.
+
+        If retract_first is True, first retracts the arm horizontally to avoid obstacles before homing.
+        If next_task is provided and non-empty, sets the new task; otherwise keeps the current task.
+        If post_homing_fn is provided, it is executed after reaching the initial position to decide next_task.
+        If resume is True, automatically resumes inference after homing; if False, holds at initial position.
+        If target_override is provided, those values override corresponding joint targets in initial_position.
+        Returns True when accepted, False if stopped/failed.
+        """
+        with self._control_lock:
+            if self._stopped.is_set() or self._stop_requested.is_set():
+                return False
+            self._transition_next_task = next_task
+            self._transition_duration_s = duration_s
+            self._transition_retract_first = retract_first
+            self._transition_retract_duration_s = retract_duration_s
+            self._transition_resume = resume
+            self._transition_post_homing_fn = post_homing_fn
+            self._transition_target_override = target_override
+            self._start_requested.clear()
+            self._transition_requested.set()
+            self._segment_stop.set()
+            self._wake.set()
+            return True
 
     def stop(self) -> None:
         """End :meth:`serve` so the caller can run ``strategy.teardown(ctx)``.  Idempotent."""
@@ -361,6 +404,28 @@ class RolloutController:
                     self._reset_requested.clear()
                     self._reset_robot()
                     continue
+                if self._transition_requested.is_set():
+                    self._transition_requested.clear()
+                    next_task = self._transition_next_task
+                    duration_s = self._transition_duration_s
+                    retract_first = self._transition_retract_first
+                    retract_dur = self._transition_retract_duration_s
+                    resume = getattr(self, "_transition_resume", True)
+                    post_homing_fn = getattr(self, "_transition_post_homing_fn", None)
+                    target_override = getattr(self, "_transition_target_override", None)
+                    self._transition_next_task = None
+                    self._transition_post_homing_fn = None
+                    self._transition_target_override = None
+                    self._homing_transition(
+                        next_task,
+                        duration_s,
+                        retract_first,
+                        retract_dur,
+                        resume=resume,
+                        post_homing_fn=post_homing_fn,
+                        target_override=target_override,
+                    )
+                    continue
                 if self._start_requested.is_set():
                     # Consume the request and mark the segment running in one atomic step, so a
                     # concurrent start() cannot re-arm the flag behind the running segment.
@@ -431,9 +496,65 @@ class RolloutController:
         if engine.failed or self._strategy_failure_traceback is not None:
             return  # the serve loop emits the failure event and shuts down
         if not (
-            self._stop_requested.is_set() or self._reset_requested.is_set() or self._global_shutdown.is_set()
+            self._stop_requested.is_set()
+            or self._reset_requested.is_set()
+            or self._transition_requested.is_set()
+            or self._global_shutdown.is_set()
         ):
             self._emit(RolloutEvent.SEGMENT_ENDED)
+
+    def _homing_transition(
+        self,
+        next_task: str | None = None,
+        duration_s: float = 2.0,
+        retract_first: bool = True,
+        retract_duration_s: float = 1.2,
+        resume: bool = True,
+        post_homing_fn: Callable[[], str | None] | None = None,
+        target_override: dict[str, float] | None = None,
+    ) -> None:
+        """Pause inference, smoothly return robot to initial position (retracting horizontally first if enabled), and resume."""
+        self._ctx.policy.inference.pause()
+        self._strategy.reset_control_state()
+
+        if self._ctx.hardware.initial_position:
+            if retract_first:
+                logger.info(
+                    "Retracting arm horizontally (%.1fs) then returning to initial position (%.1fs)...",
+                    retract_duration_s,
+                    duration_s,
+                )
+            else:
+                logger.info("Smoothly returning robot to initial position (%.1fs)...", duration_s)
+            self._strategy.return_to_initial_position(
+                self._ctx.hardware,
+                duration_s=duration_s,
+                retract_first=retract_first,
+                retract_duration_s=retract_duration_s,
+                target_override=target_override,
+            )
+        else:
+            logger.warning("No initial position captured — skipping the return move")
+
+        # Execute decision function at default position if provided
+        if post_homing_fn is not None:
+            try:
+                decided_task = post_homing_fn()
+                if decided_task:
+                    next_task = decided_task
+            except Exception as e:
+                logger.exception("Error executing post_homing_fn: %s", e)
+
+        # Set the next task instruction if provided
+        if next_task:
+            self.set_task(next_task)
+
+        # Automatically start next segment with next_task if resume is True
+        if resume and not self._stopped.is_set() and not self._stop_requested.is_set() and not self._reset_requested.is_set():
+            with self._control_lock:
+                self._start_requested.clear()
+                self._running.set()
+            self._run_segment()
 
     def _reset_robot(self) -> None:
         """Pause inference and return the robot home (the task was restored by :meth:`reset`)."""
@@ -441,10 +562,16 @@ class RolloutController:
         self._ctx.policy.inference.pause()
         # Immediately purge RTC queues, leftover prefixes, and stale observations
         self._strategy.reset_control_state()
+        retract_first = getattr(self._ctx.runtime.cfg, "subtask_retract_first", False)
+        retract_dur = getattr(self._ctx.runtime.cfg, "subtask_retract_duration", 1.2)
         if not self._ctx.hardware.initial_position:
             logger.warning("No initial position captured — skipping the return move")
             self._emit(RolloutEvent.RESET_SKIPPED)
-        elif self._strategy.return_to_initial_position(self._ctx.hardware):
+        elif self._strategy.return_to_initial_position(
+            self._ctx.hardware,
+            retract_first=retract_first,
+            retract_duration_s=retract_dur,
+        ):
             self._emit(RolloutEvent.RESET_DONE)
         else:
             # RESET_DONE guarantees "back at the initial position"; a failed move must not claim it.

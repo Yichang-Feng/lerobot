@@ -202,3 +202,20 @@ run_vla_subtask.py
 train_pi05_*.yaml
 !train_pi05_dex1_*.yaml
 VLA_Vision_Evaluation_Guide.md
+
+# Local deployment test scripts & diagnostics
+compare_rtc_20_steps.py
+frame0_parity_result.json
+scripts/test_valen_*.py
+test_frame0_parity.py
+test_merged_dex1_model.py
+tests/test_dex1_subtask_homing.py
+tests/test_unitree_g1_auto_mode.py
+verify_triton_acceleration.py
+stream_snap/
+scratch/
+robot_server/lerobot/
+
+# Local deployment guides & diagnostic reports
+DEX1_VALEN_JEV_DEPLOYMENT_GUIDE.md
+G1_Pi05_Pick_Put_Diagnostic_Report.md

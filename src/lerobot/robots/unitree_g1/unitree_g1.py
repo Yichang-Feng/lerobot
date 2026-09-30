@@ -204,7 +204,7 @@ class UnitreeG1(Robot):
 
         # Gripper state variables
         self._gripper_lock = threading.Lock()
-        self._gripper_cmd = {"left": 1.0, "right": 1.0}
+        self._gripper_cmd = {"left": 5.0, "right": 5.0}
         self._gripper_actuator_ids: dict[str, list[int]] = {"left": [], "right": []}
 
 
@@ -247,8 +247,8 @@ class UnitreeG1(Robot):
                         raw_sim = getattr(self.sim_env, "sim_env", self.sim_env)
                         if hasattr(raw_sim, "mj_model") and hasattr(raw_sim, "mj_data"):
                             with self._gripper_lock:
-                                l_cmd = self._gripper_cmd.get("left", 1.0)
-                                r_cmd = self._gripper_cmd.get("right", 1.0)
+                                l_cmd = self._gripper_cmd.get("left", 5.0)
+                                r_cmd = self._gripper_cmd.get("right", 5.0)
 
                             l_pos = map_gripper_cmd_to_pos(l_cmd)
                             r_pos = map_gripper_cmd_to_pos(r_cmd)
@@ -453,6 +453,30 @@ class UnitreeG1(Robot):
             )
             # Extract the actual gym env from the dict structure
             self.sim_env = self._env_wrapper["hub_env"][0].envs[0]
+            if getattr(self.config, "enable_gripper", True):
+                with self._gripper_lock:
+                    self._gripper_cmd = {"left": 5.0, "right": 5.0}
+                raw_sim = getattr(self.sim_env, "sim_env", self.sim_env)
+                if hasattr(raw_sim, "mj_model") and hasattr(raw_sim, "mj_data"):
+                    open_pos = map_gripper_cmd_to_pos(5.0)
+                    for act_name in (
+                        getattr(self.config, "gripper_actuators_left", DEX1_LEFT_FINGER_ACTUATORS)
+                        + getattr(self.config, "gripper_actuators_right", DEX1_RIGHT_FINGER_ACTUATORS)
+                    ):
+                        try:
+                            act_id = raw_sim.mj_model.actuator(act_name).id
+                            jnt_id = raw_sim.mj_model.actuator_trnid[act_id, 0]
+                            qpos_adr = raw_sim.mj_model.jnt_qposadr[jnt_id]
+                            raw_sim.mj_data.qpos[qpos_adr] = open_pos
+                            raw_sim.mj_data.ctrl[act_id] = open_pos
+                        except Exception:
+                            pass
+                    try:
+                        import mujoco
+
+                        mujoco.mj_forward(raw_sim.mj_model, raw_sim.mj_data)
+                    except Exception:
+                        pass
 
         else:
             self._ChannelFactoryInitialize(0, config=self.config)
@@ -693,8 +717,8 @@ class UnitreeG1(Robot):
 
         if getattr(self.config, "enable_gripper", True):
             with self._gripper_lock:
-                l_val = float(self._gripper_cmd.get("left", 1.0))
-                r_val = float(self._gripper_cmd.get("right", 1.0))
+                l_val = float(self._gripper_cmd.get("left", 5.0))
+                r_val = float(self._gripper_cmd.get("right", 5.0))
 
 
             if self.config.is_simulation and self.sim_env is not None:
@@ -715,6 +739,10 @@ class UnitreeG1(Robot):
 
             obs["gripper.left"] = l_val
             obs["gripper.right"] = r_val
+            obs["kLeftGripper"] = l_val
+            obs["kRightGripper"] = r_val
+            obs["observation.left_gripper"] = l_val
+            obs["observation.right_gripper"] = r_val
 
         return obs
 
@@ -753,8 +781,8 @@ class UnitreeG1(Robot):
                 raw_sim = getattr(self.sim_env, "sim_env", self.sim_env)
                 if hasattr(raw_sim, "mj_model") and hasattr(raw_sim, "mj_data"):
                     with self._gripper_lock:
-                        l_cmd = self._gripper_cmd.get("left", 1.0)
-                        r_cmd = self._gripper_cmd.get("right", 1.0)
+                        l_cmd = self._gripper_cmd.get("left", 5.0)
+                        r_cmd = self._gripper_cmd.get("right", 5.0)
 
                     l_pos = map_gripper_cmd_to_pos(l_cmd)
                     r_pos = map_gripper_cmd_to_pos(r_cmd)
@@ -852,6 +880,7 @@ class UnitreeG1(Robot):
         self,
         control_dt: float | None = None,
         default_positions: list[float] | None = None,
+        reset_simulation: bool = False,
     ) -> None:  # move robot to default position
         if control_dt is None:
             control_dt = self.config.control_dt
@@ -867,12 +896,29 @@ class UnitreeG1(Robot):
         # publishing its own targets throughout, and the robot is driven by two writers at once.
         with self._control_lock:
             if self.config.is_simulation and self.sim_env is not None:
-                self.sim_env.reset()
+                if reset_simulation:
+                    self.sim_env.reset()
                 raw_sim = getattr(self.sim_env, "sim_env", self.sim_env)
                 if hasattr(raw_sim, "mj_data") and hasattr(raw_sim, "body_joint_index"):
                     for i, motor in enumerate(G1_29_JointIndex):
                         qpos_idx = raw_sim.body_joint_index[i] + 7 - 1
                         raw_sim.mj_data.qpos[qpos_idx] = float(default_positions[motor.value])
+                    if getattr(self.config, "enable_gripper", True):
+                        with self._gripper_lock:
+                            self._gripper_cmd = {"left": 5.0, "right": 5.0}
+                        open_pos = map_gripper_cmd_to_pos(5.0)
+                        for act_name in (
+                            getattr(self.config, "gripper_actuators_left", DEX1_LEFT_FINGER_ACTUATORS)
+                            + getattr(self.config, "gripper_actuators_right", DEX1_RIGHT_FINGER_ACTUATORS)
+                        ):
+                            try:
+                                act_id = raw_sim.mj_model.actuator(act_name).id
+                                jnt_id = raw_sim.mj_model.actuator_trnid[act_id, 0]
+                                qpos_adr = raw_sim.mj_model.jnt_qposadr[jnt_id]
+                                raw_sim.mj_data.qpos[qpos_adr] = open_pos
+                                raw_sim.mj_data.ctrl[act_id] = open_pos
+                            except Exception:
+                                pass
                     import mujoco
 
                     mujoco.mj_forward(raw_sim.mj_model, raw_sim.mj_data)

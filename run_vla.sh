@@ -68,6 +68,11 @@ LEFT_WRIST_IP=""
 RIGHT_WRIST_IP=""
 ARM_ONLY=""
 USER_RENAME_MAP=""
+VALEN_EVALUATOR=false
+VALEN_IP="10.8.8.98"
+VALEN_PORT=5559
+VALEN_AUTO_ADVANCE=true
+TRANSFER_MODE=false
 
 CLI_ARGS=()
 for arg in "$@"; do
@@ -231,6 +236,29 @@ for arg in "$@"; do
         --rename_map=*|--rename-map=*)
             USER_RENAME_MAP="${arg#*=}"
             ;;
+        --valen|--valen-evaluator|--valen_evaluator|--evaluator=valen)
+            VALEN_EVALUATOR=true
+            ;;
+        --valen_ip=*|--valen-ip=*)
+            VALEN_IP="${arg#*=}"
+            VALEN_EVALUATOR=true
+            ;;
+        --valen_port=*|--valen-port=*)
+            VALEN_PORT="${arg#*=}"
+            VALEN_EVALUATOR=true
+            ;;
+        --valen_auto_advance=*|--valen-auto-advance=*)
+            VALEN_AUTO_ADVANCE="${arg#*=}"
+            ;;
+        --auto-home|--auto_home|--subtask_auto_home=true|--auto_home=true)
+            SUBTASK_AUTO_HOME=true
+            ;;
+        --no-auto-home|--no_auto_home|--subtask_auto_home=false|--auto_home=false)
+            SUBTASK_AUTO_HOME=false
+            ;;
+        --transfer|--transfer_mode|--transfer-mode)
+            TRANSFER_MODE=true
+            ;;
         *)
             CLI_ARGS+=("$arg")
             ;;
@@ -278,14 +306,20 @@ fi
 
 # 自动判断是否开启子任务流转模式
 if [ -z "$SUBTASKS" ]; then
-    if [[ "$POLICY_PATH" == *"subtask"* ]]; then
+    if [[ "$POLICY_PATH" == *"dex1"* && "$POLICY_PATH" == *"subtask"* ]]; then
+        SUBTASKS="pick up the water bottle from the table and place it into the blue box,take the water bottle out of the blue box and place it back on the table"
+    elif [[ "$POLICY_PATH" == *"subtask"* ]]; then
         SUBTASKS=true
     else
         SUBTASKS=false
     fi
 fi
 
-if [ "$SUBTASKS" = true ] && [ "$TASK" = "pick up the box, turn right, and place it on the table" ]; then
+if [[ "$SUBTASKS" == *"water bottle"* ]]; then
+    if [ "$TASK" = "pick up the box then put it in the blue area" ] || [ "$TASK" = "pick up the box, turn right, and place it on the table" ] || [[ "$TASK" == *"then take it out"* ]]; then
+        TASK="pick up the water bottle from the table and place it into the blue box"
+    fi
+elif [ "$SUBTASKS" = true ] && [ "$TASK" = "pick up the box, turn right, and place it on the table" ]; then
     TASK="clamp and lift the box"
 fi
 
@@ -391,7 +425,15 @@ fi
 if [ ${#RENAME_MAP_ARGS[@]} -gt 0 ]; then
     echo " 视角重映射   : ★ 机载视角 1:1 对齐大模型 (${RENAME_MAP_ARGS[*]})"
 fi
-if [ "$SUBTASKS" = true ]; then
+if [ "$TRANSFER_MODE" = true ]; then
+    echo " 任务模式     : ★ 跨桌水瓶转运模式已启用 (桌A夹水瓶 -> 回默认位 -> 导航至桌B(输入'd'回车) -> 恢复姿态 -> 桌B放置)"
+    echo " 快捷指令     : s (开始) | d (导航到达桌B) | r (复位) | q (退出)"
+elif [[ "$SUBTASKS" == *"water bottle"* ]]; then
+    echo " 子任务模式   : ★ G1 Dex-1 抓水瓶双子任务已启用 (盒中松开后先平着收回右臂再归位，保持原Prompt，支持按 'n' 手动切段)"
+    echo "                 Phase 1: pick up the water bottle from the table and place it into the blue box"
+    echo "                 Phase 2: take the water bottle out of the blue box and place it back on the table"
+    echo " 快捷指令     : n (跳下一阶段) | 1 (桌到盒) | 2 (盒到桌) | s (开始) | r (复位) | q (退出)"
+elif [ "$SUBTASKS" = true ]; then
     echo " 子任务模式   : ★ 3 阶段流转已启用 (1:抱箱抬起 -> 2:右转 -> 3:放箱)"
     echo " 快捷指令     : n (跳下一阶段) | 1/2/3 (直达阶段) | s (开始) | r (复位) | q (退出)"
 fi
@@ -418,6 +460,10 @@ if [ "$ENABLE_WRIST_CAMERAS" = true ]; then
     echo " 视觉输入模式 : ★ 三相机多视角模式 (全局主摄: ${CAMERA_IP:-$ROBOT_IP}:${CAMERA_PORT} | 左手腕: ${LEFT_WRIST_IP:-${CAMERA_IP:-$ROBOT_IP}}:${LEFT_WRIST_PORT} | 右手腕: ${RIGHT_WRIST_IP:-${CAMERA_IP:-$ROBOT_IP}}:${RIGHT_WRIST_PORT})"
 else
     echo " 相机源主机   : ${CAMERA_IP:-$ROBOT_IP}:${CAMERA_PORT} (单路全局主视角)"
+fi
+if [ "$VALEN_EVALUATOR" = true ]; then
+    echo " 决策大脑     : ★ Valen (Jev) 多模态决策服务已连接 (${VALEN_IP}:${VALEN_PORT})"
+    echo "                 (全局主摄+右手腕拼接视角，实时状态判定与双校验自动转段)"
 fi
 echo " 平滑介入时长 : ${ENGAGEMENT_DURATION} 秒 (余弦 S 曲线过渡)"
 echo " 连接机制     : 显存常驻 + 后台弹性接入 (连接未就绪不中断退出)"
@@ -491,6 +537,28 @@ if [ "$ENABLE_WRIST_CAMERAS" = true ]; then
     fi
 fi
 
+EXTRA_VALEN_ARGS=()
+if [ "$VALEN_EVALUATOR" = true ]; then
+    EXTRA_VALEN_ARGS+=(
+        "--valen_evaluator=true"
+        "--valen_ip=${VALEN_IP}"
+        "--valen_port=${VALEN_PORT}"
+        "--valen_auto_advance=${VALEN_AUTO_ADVANCE}"
+    )
+fi
+
+EXTRA_SUBTASK_ARGS=()
+if [ -n "$SUBTASK_AUTO_HOME" ]; then
+    EXTRA_SUBTASK_ARGS+=("--subtask_auto_home=${SUBTASK_AUTO_HOME}")
+fi
+
+EXTRA_TRANSFER_ARGS=()
+if [ "$TRANSFER_MODE" = true ]; then
+    EXTRA_TRANSFER_ARGS+=("--transfer_mode=true")
+    SUBTASKS=false
+    TASK="pick up the water bottle from the table"
+fi
+
 "$PYTHON_BIN" -m lerobot.scripts.lerobot_rollout \
     --strategy.type=base \
     --inference.type=rtc \
@@ -503,6 +571,9 @@ fi
     "${RENAME_MAP_ARGS[@]}" \
     --robot.type=unitree_g1_client \
     "${EXTRA_ROBOT_ARGS[@]}" \
+    "${EXTRA_VALEN_ARGS[@]}" \
+    "${EXTRA_SUBTASK_ARGS[@]}" \
+    "${EXTRA_TRANSFER_ARGS[@]}" \
     --robot.robot_ip="${ROBOT_IP}" \
     --robot.action_ip="${ACTION_IP:-$ROBOT_IP}" \
     --robot.camera_ip="${CAMERA_IP:-$ROBOT_IP}" \
