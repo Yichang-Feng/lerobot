@@ -4,7 +4,7 @@
 # ==============================================================================
 set -e
 
-ROBOT_IP="${1:-192.168.123.164}"
+ROBOT_IP="${1:-10.3.42.221}"
 POLICY_PATH="${2:-model/box_move_blue}"
 TASK_DESC="${3:-move blue box back and forth between tables}"
 CAMERA_PORT="${4:-5555}"

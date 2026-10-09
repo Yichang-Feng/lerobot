@@ -279,12 +279,14 @@ class RolloutController:
         resume: bool = True,
         post_homing_fn: Callable[[], str | None] | None = None,
         target_override: dict[str, float] | None = None,
+        skip_homing: bool = False,
     ) -> bool:
-        """Interrupt running segment, return robot smoothly to initial position, and optionally resume inference.
+        """Interrupt running segment, return robot smoothly to initial position (unless skip_homing is True), and optionally resume inference.
 
+        If skip_homing is True, pauses inference and resets control state, but holds the robot arm in place instead of moving to initial position.
         If retract_first is True, first retracts the arm horizontally to avoid obstacles before homing.
         If next_task is provided and non-empty, sets the new task; otherwise keeps the current task.
-        If post_homing_fn is provided, it is executed after reaching the initial position to decide next_task.
+        If post_homing_fn is provided, it is executed after reaching the initial position (or after pausing) to decide next_task.
         If resume is True, automatically resumes inference after homing; if False, holds at initial position.
         If target_override is provided, those values override corresponding joint targets in initial_position.
         Returns True when accepted, False if stopped/failed.
@@ -299,6 +301,7 @@ class RolloutController:
             self._transition_resume = resume
             self._transition_post_homing_fn = post_homing_fn
             self._transition_target_override = target_override
+            self._transition_skip_homing = skip_homing
             self._start_requested.clear()
             self._transition_requested.set()
             self._segment_stop.set()
@@ -413,9 +416,11 @@ class RolloutController:
                     resume = getattr(self, "_transition_resume", True)
                     post_homing_fn = getattr(self, "_transition_post_homing_fn", None)
                     target_override = getattr(self, "_transition_target_override", None)
+                    skip_homing = getattr(self, "_transition_skip_homing", False)
                     self._transition_next_task = None
                     self._transition_post_homing_fn = None
                     self._transition_target_override = None
+                    self._transition_skip_homing = False
                     self._homing_transition(
                         next_task,
                         duration_s,
@@ -424,6 +429,7 @@ class RolloutController:
                         resume=resume,
                         post_homing_fn=post_homing_fn,
                         target_override=target_override,
+                        skip_homing=skip_homing,
                     )
                     continue
                 if self._start_requested.is_set():
@@ -512,29 +518,33 @@ class RolloutController:
         resume: bool = True,
         post_homing_fn: Callable[[], str | None] | None = None,
         target_override: dict[str, float] | None = None,
+        skip_homing: bool = False,
     ) -> None:
-        """Pause inference, smoothly return robot to initial position (retracting horizontally first if enabled), and resume."""
+        """Pause inference, smoothly return robot to initial position (unless skip_homing is True), and resume."""
         self._ctx.policy.inference.pause()
         self._strategy.reset_control_state()
 
-        if self._ctx.hardware.initial_position:
-            if retract_first:
-                logger.info(
-                    "Retracting arm horizontally (%.1fs) then returning to initial position (%.1fs)...",
-                    retract_duration_s,
-                    duration_s,
+        if not skip_homing:
+            if self._ctx.hardware.initial_position:
+                if retract_first:
+                    logger.info(
+                        "Retracting arm horizontally (%.1fs) then returning to initial position (%.1fs)...",
+                        retract_duration_s,
+                        duration_s,
+                    )
+                else:
+                    logger.info("Smoothly returning robot to initial position (%.1fs)...", duration_s)
+                self._strategy.return_to_initial_position(
+                    self._ctx.hardware,
+                    duration_s=duration_s,
+                    retract_first=retract_first,
+                    retract_duration_s=retract_duration_s,
+                    target_override=target_override,
                 )
             else:
-                logger.info("Smoothly returning robot to initial position (%.1fs)...", duration_s)
-            self._strategy.return_to_initial_position(
-                self._ctx.hardware,
-                duration_s=duration_s,
-                retract_first=retract_first,
-                retract_duration_s=retract_duration_s,
-                target_override=target_override,
-            )
+                logger.warning("No initial position captured — skipping the return move")
         else:
-            logger.warning("No initial position captured — skipping the return move")
+            logger.info("skip_homing=True: Holding arm at current pose (skipping homing move).")
 
         # Execute decision function at default position if provided
         if post_homing_fn is not None:

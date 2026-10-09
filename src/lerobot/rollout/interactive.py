@@ -233,6 +233,18 @@ class InteractiveSession:
             self._transfer_mode = raw_transfer.lower() in ("true", "1", "yes")
         else:
             self._transfer_mode = bool(raw_transfer)
+
+        raw_hold = getattr(ctx.runtime.cfg, "transfer_hold_after_grasp", False)
+        if isinstance(raw_hold, str):
+            self._transfer_hold_after_grasp = raw_hold.lower() in ("true", "1", "yes")
+        else:
+            self._transfer_hold_after_grasp = bool(raw_hold)
+
+        raw_restore_b = getattr(ctx.runtime.cfg, "transfer_table_b_restore_pose", True)
+        if isinstance(raw_restore_b, str):
+            self._transfer_table_b_restore_pose = raw_restore_b.lower() in ("true", "1", "yes")
+        else:
+            self._transfer_table_b_restore_pose = bool(raw_restore_b)
         # Event set by /navdone command to signal navigation has completed
         self._nav_done_event = threading.Event()
         # Snapshot of robot joint state at the moment the bottle was confirmed grasped+lifted.
@@ -242,6 +254,11 @@ class InteractiveSession:
         # Clamped throughout homing, navigation, and pose restore without VLA intervention.
         self._captured_gripper_val: float | None = None
         self._transfer_banner_printed: bool = False
+        self._phase2_banner_printed: bool = False
+        self._phase4_banner_printed: bool = False
+        self._transfer_triggered: bool = False
+        self._transfer_lock = threading.Lock()
+        self._decided_placement_task: str | None = None
 
         # Valen (Jev) Multi-Modal Decision Evaluator support
         raw_ve = getattr(ctx.runtime.cfg, "valen_evaluator", False)
@@ -381,13 +398,19 @@ class InteractiveSession:
                     self._print(
                         f"Rollout running — [Transfer Phase 4] VLA 已接管放置任务: \"{self.controller.task}\""
                     )
+                    self._start_transfer_phase4_tracker()
                 elif not getattr(self, "_transfer_banner_printed", False):
                     self._transfer_banner_printed = True
                     self._current_phase = 0
                     self.controller.set_task(self.controller.task or "pick up the water bottle from the table")
+                    hint_str = (
+                        "检测到夹紧并抬起后自动保持当前抓取姿态；导航到达桌B后输入 'd' 回车继续。"
+                        if getattr(self, "_transfer_hold_after_grasp", False) else
+                        "检测到夹紧并抬起后自动夹持回默认位；导航到达桌B后输入 'd' 回车继续。"
+                    )
                     self._print(
                         f"Rollout running — [跨桌水瓶转运] Phase 0: 夹取水瓶 (Task: \"{self.controller.task}\").\n"
-                        f"提示: 检测到夹紧并抬起后自动夹持回默认位；导航到达桌B后输入 'd' 回车继续。"
+                        f"提示: {hint_str}"
                     )
                     self._start_subtask_tracker()
                 else:
@@ -637,6 +660,8 @@ class InteractiveSession:
             pass
         elif not self._subtasks_enabled or len(self._subtask_list) not in (2, 3):
             return
+        if self._subtask_tracker_thread is not None and self._subtask_tracker_thread.is_alive():
+            return
         self._stop_subtask_tracker()
         self._subtask_stop_event.clear()
         self._subtask_tracker_running = True
@@ -653,8 +678,48 @@ class InteractiveSession:
         self._subtask_tracker_running = False
         self._subtask_stop_event.set()
         if self._subtask_tracker_thread is not None and self._subtask_tracker_thread.is_alive():
-            self._subtask_tracker_thread.join(timeout=0.5)
+            self._subtask_tracker_thread.join(timeout=1.5)
         self._subtask_tracker_thread = None
+
+    def _start_transfer_phase4_tracker(self) -> None:
+        """Start the Phase 4 completion monitor thread to track bottle placement."""
+        self._stop_subtask_tracker()
+        self._subtask_stop_event.clear()
+        self._subtask_tracker_running = True
+        self._phase_start_time = time.time()
+        self._subtask_tracker_thread = threading.Thread(
+            target=self._subtask_tracker_loop_transfer_phase4,
+            name="TransferPhase4TrackerThread",
+            daemon=True,
+        )
+        self._subtask_tracker_thread.start()
+
+    def _reset_transfer_state(self) -> None:
+        """Reset transfer mode state flags so the session can cleanly start a new trial."""
+        with self._transfer_lock:
+            self._current_phase = 0
+            self._transfer_triggered = False
+            self._transfer_banner_printed = False
+            self._phase2_banner_printed = False
+            self._phase4_banner_printed = False
+            self._frozen_joint_state = None
+            self._captured_gripper_val = None
+            self._decided_placement_task = None
+            self._nav_done_event.clear()
+            initial_task = getattr(self.controller, "_initial_task", None) or "pick up the water bottle from the table"
+            self.controller.set_task(initial_task)
+
+    def _on_transfer_round_completed(self) -> str | None:
+        """Executed on serve thread once robot has smoothly returned to default stand pose."""
+        self._reset_transfer_state()
+        rule = "-" * 65
+        self._print(
+            f"\n{rule}\n"
+            "📍 [Transfer] 机器人已平稳停靠在身侧默认待命位置 (VLA 推理暂停中)。\n"
+            "   👉 摆好水瓶后，按 's' 回车 即可直接启动下一轮实验；按 'r' 复位，按 'q' 退出。\n"
+            f"{rule}\n"
+        )
+        return None
 
     def _advance_phase(
         self,
@@ -1139,20 +1204,24 @@ class InteractiveSession:
         # ── Tunable thresholds ────────────────────────────────────────
         grasp_thresh = float(getattr(self._runtime.cfg, "transfer_grasp_thresh", 3.5))
         lift_pitch_thresh = float(getattr(self._runtime.cfg, "transfer_lift_pitch", -0.20))
-        grasp_confirm_frames = int(getattr(self._runtime.cfg, "transfer_grasp_frames", 8))
+        grasp_duration = float(getattr(self._runtime.cfg, "transfer_grasp_duration", 0.40))
+        grasp_confirm_frames = int(getattr(self._runtime.cfg, "transfer_grasp_frames", max(1, int(round(grasp_duration / 0.05)))))
         homing_dur = float(getattr(self._runtime.cfg, "subtask_homing_duration", 2.5))
         restore_dur = float(getattr(self._runtime.cfg, "transfer_restore_duration", 2.5))
         gripper_closed_val = float(getattr(self._runtime.cfg, "transfer_gripper_closed", 2.0))
         valen_eval_interval = float(getattr(self._runtime.cfg, "valen_eval_interval_s", 0.5))
 
-        # Default placement prompt when JEV is unavailable
+        hold_after_grasp = getattr(self, "_transfer_hold_after_grasp", False)
+        restore_pose_at_table_b = getattr(self, "_transfer_table_b_restore_pose", True)
+
+        # Default placement prompt when JEV is unavailable (exact trained string)
         default_place_box_task = getattr(
             self._runtime.cfg, "transfer_place_box_task",
-            "pick up the water bottle and place it into the blue box"
+            "pick up the water bottle from the table and place it into the blue box"
         )
         default_place_table_task = getattr(
             self._runtime.cfg, "transfer_place_table_task",
-            "pick up the water bottle and place it on the table"
+            "pick up the water bottle from the table and place it into the blue box"
         )
 
         valen_client = getattr(self, "_valen_client", None)
@@ -1231,26 +1300,49 @@ class InteractiveSession:
             Returns the subtask prompt string (used as next_task by _homing_transition).
             """
             # ── Phase 2: wait for /navdone signal ──────────────────
+            with self._transfer_lock:
+                if self._phase2_banner_printed:
+                    return getattr(self, "_decided_placement_task", default_place_table_task)
+                self._phase2_banner_printed = True
+
             self._current_phase = 2
-            self._print(
-                "\n" + "=" * 65 + "\n"
-                " 📍 [Transfer] 机器人已回到默认位置，夹爪保持夹紧水瓶。\n"
-                "    请移动/导航至桌B，到达后输入 'd' 回车 (或 /navdone) 继续。\n"
-                "   [TRANSFER_STATE] PHASE2_NAVIGATING\n"
-                "=" * 65
-            )
+            rule_65 = "=" * 65
+            if hold_after_grasp:
+                self._print(
+                    f"\n{rule_65}\n"
+                    " 📍 [Transfer] 机械臂已在抓取位置安全保持，夹爪持续夹紧水瓶。\n"
+                    "    请移动/导航至桌B（导航过程中外部项目代码将手臂收回身侧默认位）；\n"
+                    "    到达桌B后输入 'd' 回车 (或 /navdone) 继续放置任务。\n"
+                    "   [TRANSFER_STATE] PHASE2_NAVIGATING\n"
+                    f"{rule_65}"
+                )
+            else:
+                self._print(
+                    f"\n{rule_65}\n"
+                    " 📍 [Transfer] 机器人已回到默认位置，夹爪保持夹紧水瓶。\n"
+                    "    请移动/导航至桌B，到达后输入 'd' 回车 (或 /navdone) 继续。\n"
+                    "   [TRANSFER_STATE] PHASE2_NAVIGATING\n"
+                    f"{rule_65}"
+                )
             self._nav_done_event.wait()   # blocks until /navdone or timeout
             self._nav_done_event.clear()
 
-            # ── Phase 3: restore arm to frozen grasped pose ─────────
+            # ── Phase 3: restore arm to frozen grasped pose or keep default ─
             self._current_phase = 3
             self._print("\n[TRANSFER_STATE] PHASE3_RESTORING")
-            frozen = self._frozen_joint_state
-            grip_val = self._captured_gripper_val if self._captured_gripper_val is not None else float(getattr(self._runtime.cfg, "transfer_gripper_closed", 3.4))
-            if frozen:
-                _restore_arm_to_frozen_pose(frozen, duration_s=restore_dur, gripper_val=grip_val)
+            if restore_pose_at_table_b:
+                frozen = self._frozen_joint_state
+                grip_val = self._captured_gripper_val if self._captured_gripper_val is not None else float(getattr(self._runtime.cfg, "transfer_gripper_closed", 3.4))
+                if frozen:
+                    _restore_arm_to_frozen_pose(frozen, duration_s=restore_dur, gripper_val=grip_val)
+                else:
+                    self._print("⚠️  [Transfer] 未找到冻结关节快照，跳过姿态恢复。")
+                    time.sleep(0.5)
             else:
-                self._print("⚠️  [Transfer] 未找到冻结关节快照，跳过姿态恢复。")
+                self._print(
+                    " ⏭️  [Phase 3 / Transfer] 跳过姿态恢复: 机械臂保持在身侧默认位置，"
+                    "直接以此动作启动 VLA 放置推理！"
+                )
                 time.sleep(0.5)
 
             # ── Phase 4 prep: JEV decides placement target ──────────
@@ -1258,8 +1350,8 @@ class InteractiveSession:
             self._print("\n[TRANSFER_STATE] PHASE4_PLACING_PREP")
             time.sleep(0.5)  # let camera stabilise
 
-            placement_task = default_place_table_task  # fallback
-            target_decision_str = "放桌上 (place_on_table)"
+            placement_task = default_place_box_task  # fallback to box
+            target_decision_str = "放蓝盒 (place_into_box)"
             if valen_client is not None:
                 robot = getattr(self.robot_wrapper, "inner", self.robot_wrapper)
                 last_cams = getattr(robot, "_last_camera_frames", {})
@@ -1274,23 +1366,30 @@ class InteractiveSession:
                         if v_res.choice == "place_into_box":
                             placement_task = default_place_box_task
                             target_decision_str = f"放蓝盒 (place_into_box, P={prob:.2f}, {v_res.cost_ms:.0f}ms)"
-                        elif v_res.choice == "place_on_table":
+                        elif v_res.choice == "place_on_table" and prob >= 0.85:
                             placement_task = default_place_table_task
                             target_decision_str = f"放桌上 (place_on_table, P={prob:.2f}, {v_res.cost_ms:.0f}ms)"
                         else:
-                            placement_task = default_place_table_task
-                            target_decision_str = f"未知标签 '{v_res.choice}' -> 默认放桌上"
+                            placement_task = default_place_box_task
+                            target_decision_str = f"优先放蓝盒 (JEV: {v_res.choice}, P={prob:.2f}, {v_res.cost_ms:.0f}ms)"
                     else:
-                        target_decision_str = f"查询失败 ({v_res.error}) -> 默认放桌上"
+                        target_decision_str = f"查询失败 ({v_res.error}) -> 默认放蓝盒"
                 else:
-                    target_decision_str = "相机不可用 -> 默认放桌上"
+                    target_decision_str = "相机不可用 -> 默认放蓝盒"
 
-            self._print(
-                "\n" + "=" * 65 + "\n"
-                f" 🤖 [Transfer] Jev 视觉判断放置目标: {target_decision_str}\n"
-                f" 🎯 [Transfer Phase 4] VLA 接管放置任务: \"{placement_task}\"\n"
-                "=" * 65
-            )
+            with self._transfer_lock:
+                if not self._phase4_banner_printed:
+                    self._phase4_banner_printed = True
+                    self._decided_placement_task = placement_task
+                    rule_65 = "=" * 65
+                    self._print(
+                        f"\n{rule_65}\n"
+                        f" 🤖 [Transfer] Jev 视觉判断放置目标: {target_decision_str}\n"
+                        f" 🎯 [Transfer Phase 4] VLA 接管放置任务: \"{placement_task}\"\n"
+                        f"{rule_65}"
+                    )
+                else:
+                    placement_task = getattr(self, "_decided_placement_task", default_place_table_task)
             return placement_task
 
         # ── Main Phase 0 detection loop ───────────────────────────────
@@ -1301,123 +1400,298 @@ class InteractiveSession:
         elif isinstance(raw_hud, bool):
             show_hud = raw_hud
 
+        clamp_count = 0
+        valen_grasp_count = 0
+        latest_valen_grasp_str = ""
+        clamp_start_pitch = None
+
+        import concurrent.futures
+        jev_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        jev_future = None
+
+        try:
+            while self._subtask_tracker_running and not self._subtask_stop_event.is_set():
+                time.sleep(0.05)
+
+                if not getattr(self.controller, "running", False):
+                    continue
+                if transfer_triggered:
+                    # transition_with_homing is blocking on the serve thread; nothing more to do here
+                    break
+
+                now = time.time()
+                elapsed = now - self._phase_start_time
+                metrics = self._get_robot_metrics()
+
+                if not metrics.get("connected", False):
+                    continue
+
+                r_gripper = float(metrics.get("r_gripper", 5.0))
+                r_pitch = float(metrics.get("r_pitch", 0.0))
+
+                # ── Detect physical clamping ──────────────────────────────
+                # Clamped: right gripper closed around bottle (e.g. <= 3.5 rad)
+                is_clamped = (r_gripper <= grasp_thresh)
+                if is_clamped:
+                    clamp_count += 1
+                    if clamp_start_pitch is None:
+                        clamp_start_pitch = r_pitch
+                else:
+                    clamp_count = 0
+                    valen_grasp_count = 0
+                    clamp_start_pitch = None
+
+                # ── Asynchronous Valen JEV visual evaluation (non-blocking) ──
+                if jev_future is not None and jev_future.done():
+                    try:
+                        v_res = jev_future.result()
+                        if v_res.is_success:
+                            prob = v_res.probabilities.get(v_res.choice, 0.0)
+                            conf = v_res.confidence
+                            latest_valen_grasp_str = f"{v_res.choice} (Conf={conf:.3f}, P={prob*100:.1f}%, {v_res.cost_ms:.0f}ms)"
+                            latest_valen_hud = f" | Jev: {latest_valen_grasp_str}"
+
+                            choice_tag = "已离地悬空 (held_in_air)" if v_res.choice == "held_in_air" else "未离地/在桌上 (on_table_or_unlifted)"
+                            curr_rise = (r_pitch - clamp_start_pitch) if clamp_start_pitch is not None else 0.0
+                            self._print(
+                                f"🤖 [Phase 0 JEV] 判定: {choice_tag} | "
+                                f"Conf: {conf:.3f} (P={prob*100:.1f}%) | "
+                                f"右夹爪: {r_gripper:.2f} rad | 肩Pitch: {r_pitch:.2f} rad (抬起量: {curr_rise:+.2f}) | "
+                                f"耗时: {v_res.cost_ms:.0f}ms"
+                            )
+
+                            # JEV 视觉判定离地：要求高置信度 (prob >= 0.70)，杜绝 52% 弱分类噪点误触发
+                            if v_res.choice == "held_in_air" and prob >= 0.70:
+                                valen_grasp_count += 1
+                            else:
+                                valen_grasp_count = 0
+                        else:
+                            latest_valen_hud = f" | Jev: [{v_res.error or 'err'}]"
+                    except Exception as exc:
+                        logger.debug("JEV async evaluate failed: %s", exc)
+                    jev_future = None
+
+                # Launch new background JEV evaluation if ready and clamped (continuous 2~3Hz pipeline)
+                if (
+                    valen_client is not None
+                    and is_clamped
+                    and jev_future is None
+                    and now - valen_last_time >= 0.1
+                ):
+                    valen_last_time = now
+                    robot = getattr(self.robot_wrapper, "inner", self.robot_wrapper)
+                    last_cams = getattr(robot, "_last_camera_frames", {})
+                    g_frame = last_cams.get("base_0_rgb") or last_cams.get("global_view")
+                    rw_frame = last_cams.get("right_wrist_0_rgb") or last_cams.get("right_wrist")
+                    if g_frame is not None and rw_frame is not None:
+                        jev_future = jev_executor.submit(valen_client.evaluate, g_frame, rw_frame, 3)
+
+                # ── HUD (only when transfer_hud is explicitly enabled) ──────
+                if show_hud and now - last_hud_time >= 1.5:
+                    last_hud_time = now
+                    grip_str = f"夹紧({clamp_count * 0.05:.2f}s)" if is_clamped else "张开"
+                    valen_str = f" [JEV离地: {valen_grasp_count}/2]" if valen_client is not None else ""
+                    confirm_str = f" [夹持: {clamp_count}/{grasp_confirm_frames}]"
+                    self._print(
+                        f"📊 [Transfer Phase 0: 夹水瓶] 耗时: {elapsed:4.1f}s | "
+                        f"右夹爪: {r_gripper:.2f} rad ({grip_str}) | "
+                        f"右肩: {r_pitch:+.2f} rad{confirm_str}{valen_str}{latest_valen_hud}"
+                    )
+
+                # ── Grasp & Lift Trigger Condition ──────────────────────────
+                # 双重门禁 (AND 关系，二者必须同时满足)：
+                # 1. 夹爪闭合保持达到设定时长 (clamp_count >= grasp_confirm_frames，例如 >= 8 帧 / 0.40s)
+                # 2. 并且 JEV 视觉权威确认水瓶离地悬空 (held_in_air, P >= 0.70) 达到 2 次 (valen_grasp_count >= 2)
+                # 持续夹持 60 帧 (3.0s) 仅作为网络中断或视觉服务未响应时的安全兜底。
+                if valen_client is not None:
+                    is_ready_to_home = is_clamped and (
+                        ((clamp_count >= grasp_confirm_frames) and (valen_grasp_count >= 2))
+                        or (clamp_count >= 60)
+                    )
+                else:
+                    is_ready_to_home = is_clamped and (clamp_count >= grasp_confirm_frames)
+
+                if is_ready_to_home and not transfer_triggered:
+                    with self._transfer_lock:
+                        if self._transfer_triggered:
+                            break
+                        self._transfer_triggered = True
+                    transfer_triggered = True
+                    self._current_phase = 1
+
+                    # Capture real-time gripper measurement at the moment of confirmed grasp
+                    captured_gripper_val = float(r_gripper)
+                    self._captured_gripper_val = captured_gripper_val
+
+                    reason_str = f"夹爪: {captured_gripper_val:.2f} rad, 右肩: {r_pitch:.2f} rad (夹持确认 {clamp_count * 0.05:.2f}s)"
+                    if latest_valen_grasp_str:
+                        reason_str += f" | 🤖 JEV视觉确认: {latest_valen_grasp_str}"
+
+                    # Capture frozen snapshot BEFORE homing starts
+                    snapshot = _capture_joint_snapshot()
+                    if snapshot:
+                        # Explicitly stamp the real-time grasped gripper angle onto all gripper keys in the snapshot
+                        for grip_key in ("kRightGripper", "right_gripper", "gripper.right",
+                                         "kLeftGripper", "left_gripper", "gripper.left"):
+                            if grip_key in snapshot:
+                                snapshot[grip_key] = captured_gripper_val
+                        self._frozen_joint_state = snapshot
+
+                    rule_65 = "=" * 65
+                    if hold_after_grasp:
+                        self._print(
+                            f"\n{rule_65}\n"
+                            f"✊ [Transfer] 检测到水瓶已夹起 ({reason_str})。\n"
+                            f"   已冻结抓取姿态快照，夹爪全程锁定夹紧 ({captured_gripper_val:.2f} rad)。\n"
+                            f"   [抓取位保持防碰桌模式]: 保持在当前抓取位置，跳过回身侧动作！\n"
+                            f"   [TRANSFER_STATE] PHASE1_HOLDING\n"
+                            f"{rule_65}"
+                        )
+                    else:
+                        self._print(
+                            f"\n{rule_65}\n"
+                            f"✊ [Transfer] 检测到水瓶已夹起 ({reason_str})。\n"
+                            f"   已冻结抓取姿态快照，夹爪全程锁定夹紧 ({captured_gripper_val:.2f} rad)。\n"
+                            f"   正在平滑回默认位置 ({homing_dur:.1f}s)...\n"
+                            f"   [TRANSFER_STATE] PHASE1_RETURNING\n"
+                            f"{rule_65}"
+                        )
+
+                    # ── Trigger transition (with skip_homing if hold_after_grasp is True) ─────
+                    target_override = {}
+                    hw_initial = getattr(self.ctx.hardware, "initial_position", {}) or {}
+                    for grip_key in ("kRightGripper", "right_gripper", "gripper.right",
+                                     "kLeftGripper", "left_gripper", "gripper.left"):
+                        if grip_key in hw_initial:
+                            target_override[grip_key] = captured_gripper_val
+
+                    ok = self.controller.transition_with_homing(
+                        next_task=None,        # task set inside post_homing_fn
+                        duration_s=homing_dur,
+                        retract_first=False,   # already upright, no obstacle to retract from
+                        retract_duration_s=0.0,
+                        resume=True,           # _homing_transition will call _run_segment after fn returns
+                        post_homing_fn=_decide_placement_task_at_tableB,
+                        target_override=target_override if target_override else None,
+                        skip_homing=hold_after_grasp,
+                    )
+                    if not ok:
+                        self._print("⚠️  [Transfer] transition_with_homing 被拒绝（控制器已停止？），中止转运。")
+                        with self._transfer_lock:
+                            self._transfer_triggered = False
+                        transfer_triggered = False
+                        self._current_phase = 0
+                    break
+        finally:
+            try:
+                jev_executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+
+        logger.info("Transfer-mode subtask tracker exited (phase=%d).", self._current_phase)
+
+    def _subtask_tracker_loop_transfer_phase4(self) -> None:
+        """Monitor Phase 4 (placing at table B): detect release, home to default pose, and wait for user."""
+        logger.info("Transfer Phase 4 completion tracker started.")
+        self._phase_start_time = time.time()
+        has_bottle = False
+        release_count = 0
+        valen_confirm_count = 0
+        valen_last_time = 0.0
+        valen_eval_interval = float(getattr(self._runtime.cfg, "valen_eval_interval_s", 0.4))
+        homing_dur = float(getattr(self._runtime.cfg, "subtask_homing_duration", 2.5))
+        retract_dur = 1.2
+        valen_client = getattr(self, "_valen_client", None)
+        task_str = str(self.controller.task or "")
+        is_box_task = "box" in task_str.lower()
+
         while self._subtask_tracker_running and not self._subtask_stop_event.is_set():
             time.sleep(0.05)
 
             if not getattr(self.controller, "running", False):
                 continue
-            if transfer_triggered:
-                # transition_with_homing is blocking on the serve thread; nothing more to do here
-                break
 
             now = time.time()
-            elapsed = now - self._phase_start_time
             metrics = self._get_robot_metrics()
-
             if not metrics.get("connected", False):
                 continue
 
             r_gripper = float(metrics.get("r_gripper", 5.0))
-            r_pitch = float(metrics.get("r_pitch", 0.0))
 
-            # ── Valen HUD (only when transfer_hud is explicitly enabled) ─────
-            if show_hud and valen_client is not None and now - valen_last_time >= valen_eval_interval:
+            # Track bottle holding state:
+            # Robot must be observed holding the bottle (r_gripper <= 3.8 rad) before release can be detected
+            if r_gripper <= 3.8:
+                has_bottle = True
+
+            # Query Valen evaluator if enabled
+            latest_valen_choice = ""
+            if valen_client is not None and now - valen_last_time >= valen_eval_interval:
                 valen_last_time = now
                 robot = getattr(self.robot_wrapper, "inner", self.robot_wrapper)
                 last_cams = getattr(robot, "_last_camera_frames", {})
                 g_frame = last_cams.get("base_0_rgb") or last_cams.get("global_view")
                 rw_frame = last_cams.get("right_wrist_0_rgb") or last_cams.get("right_wrist")
+
                 if g_frame is not None and rw_frame is not None:
-                    v_res = valen_client.evaluate(g_frame, rw_frame, phase=0)
+                    target_phase = 0 if is_box_task else 1
+                    v_res = valen_client.evaluate(g_frame, rw_frame, phase=target_phase)
                     if v_res.is_success:
                         prob = v_res.probabilities.get(v_res.choice, 0.0)
-                        latest_valen_hud = f" | Jev: {v_res.choice} (P={prob:.2f})"
-                    else:
-                        latest_valen_hud = f" | Jev: [{v_res.error or 'err'}]"
+                        latest_valen_choice = f"{v_res.choice} (P={prob:.2f})"
+                        expected_choice = "bottle_in_box_completed" if is_box_task else "bottle_on_table_completed"
+                        if v_res.choice == expected_choice and prob >= 0.50:
+                            valen_confirm_count += 1
+                        else:
+                            valen_confirm_count = max(0, valen_confirm_count - 1)
 
-            # ── Detect grasped + slightly lifted ──────────────────────
-            # Clamped: gripper closed around bottle (e.g. <= 3.5 rad)
-            # Lifted: right shoulder pitch rotated upwards (r_pitch <= lift_pitch_thresh, e.g. <= -0.15 rad)
-            is_clamped = (r_gripper <= grasp_thresh)
-            is_lifted = (r_pitch <= lift_pitch_thresh)
-            is_grasped_and_lifted = is_clamped and is_lifted
-
-            if is_grasped_and_lifted:
-                grasp_count += 1
+            # Check physical gripper release:
+            # ONLY valid if the robot was confirmed holding the bottle (has_bottle is True)
+            if has_bottle and r_gripper >= 4.7:
+                release_count += 1
             else:
-                grasp_count = max(0, grasp_count - 1)
+                release_count = max(0, release_count - 1)
 
-            # ── HUD (only when transfer_hud is explicitly enabled) ──────
-            if show_hud and now - last_hud_time >= 1.5:
-                last_hud_time = now
-                grip_str = "夹紧✊" if is_clamped else "张开🤚"
-                lift_str = f"已抬起({r_pitch:+.2f})" if is_lifted else f"未抬起({r_pitch:+.2f})"
-                confirm_str = f" [确认: {grasp_count}/{grasp_confirm_frames}]" if grasp_count > 0 else ""
+            # Confirmed if gripper open sustained for 6 frames (0.3s) after holding bottle,
+            # or if Valen confirms 2 frames and gripper is open (>= 4.5 rad)
+            is_released = (has_bottle and release_count >= 6) or (valen_confirm_count >= 2 and r_gripper >= 4.5)
+
+            if is_released:
+                reason = f"右夹爪已完全松开释放水瓶 (右夹爪: {r_gripper:.2f} rad >= 4.7)"
+                if latest_valen_choice:
+                    reason += f" | JEV: {latest_valen_choice}"
+
+                rule_65 = "=" * 65
+                rule_61 = "-" * 61
                 self._print(
-                    f"📊 [Transfer Phase 0: 夹水瓶] 耗时: {elapsed:4.1f}s | "
-                    f"右夹爪: {r_gripper:.2f} rad ({grip_str}) | "
-                    f"右肩: {lift_str}{confirm_str}{latest_valen_hud}"
+                    f"\n{rule_65}\n"
+                    "🎉 [Transfer] 跨桌水瓶转运全套任务已圆满完成！\n"
+                    f"   状态判定: {reason}\n"
+                    "   平滑回位待命:\n"
+                    f"     ├─ 水平收手 ({retract_dur:.1f}s) 避开盒子与桌面\n"
+                    f"     └─ 余弦 S 曲线归位 ({homing_dur:.1f}s) 平滑回到身侧默认待机位置\n"
+                    f"   {rule_61}\n"
+                    "   💡 下一轮实验说明:\n"
+                    "     1. 机器人当前已在默认待命姿势安全待机 (VLA 推理暂停中)；\n"
+                    "     2. 保持大模型显存与上下文不重置 (Zero-Reset)；\n"
+                    "     3. 在桌A重新摆好水瓶后，直接按 's' 回车 即可开启新一轮转运实验！\n"
+                    "     4. 亦可按 'r' 回车 重置状态，按 'q' 回车 退出。\n"
+                    f"{rule_65}\n"
                 )
 
-            if grasp_count >= grasp_confirm_frames and not transfer_triggered:
-                transfer_triggered = True
-                self._current_phase = 1
-
-                # Capture real-time gripper measurement at the moment of confirmed grasp
-                captured_gripper_val = float(r_gripper)
-                self._captured_gripper_val = captured_gripper_val
-
-                # Capture frozen snapshot BEFORE homing starts
-                snapshot = _capture_joint_snapshot()
-                if snapshot:
-                    # Explicitly stamp the real-time grasped gripper angle onto all gripper keys in the snapshot
-                    for grip_key in ("kRightGripper", "right_gripper", "gripper.right",
-                                     "kLeftGripper", "left_gripper", "gripper.left"):
-                        if grip_key in snapshot:
-                            snapshot[grip_key] = captured_gripper_val
-                    self._frozen_joint_state = snapshot
-                    self._print(
-                        f"\n✊ [Transfer] 检测到水瓶已夹起并抬起 (夹爪: {captured_gripper_val:.2f} rad, 右肩: {r_pitch:.2f} rad)。\n"
-                        f"   已冻结抓取姿态快照，夹爪全程锁定夹紧 ({captured_gripper_val:.2f} rad)。\n"
-                        f"   正在平滑回默认位置 ({homing_dur:.1f}s)...\n"
-                        f"   [TRANSFER_STATE] PHASE1_RETURNING"
+                if hasattr(self.controller, "transition_with_homing"):
+                    self.controller.transition_with_homing(
+                        next_task=None,
+                        duration_s=homing_dur,
+                        retract_first=True,
+                        retract_duration_s=retract_dur,
+                        resume=False,
+                        post_homing_fn=self._on_transfer_round_completed,
                     )
                 else:
-                    self._print(
-                        f"\n✊ [Transfer] 检测到夹紧+抬起 (夹爪: {captured_gripper_val:.2f} rad)，"
-                        f"正在回默认位置 ({homing_dur:.1f}s)...\n"
-                        f"   [TRANSFER_STATE] PHASE1_RETURNING"
-                    )
-
-                # ── Trigger homing, gripper locked to captured_gripper_val ─────
-                # Build target_override so return_to_initial_position maintains the exact
-                # grasped gripper angle instead of opening back to the default position's 5.0 rad.
-                target_override = {}
-                hw_initial = getattr(self.ctx.hardware, "initial_position", {}) or {}
-                for grip_key in ("kRightGripper", "right_gripper", "gripper.right",
-                                 "kLeftGripper", "left_gripper", "gripper.left"):
-                    if grip_key in hw_initial:
-                        target_override[grip_key] = captured_gripper_val
-
-                # retract_first=False: arm is not forward-extended into a box;
-                # the retract waypoint would try to open the gripper (undesired).
-                # post_homing_fn blocks the serve thread while waiting for nav + restore + decide.
-                ok = self.controller.transition_with_homing(
-                    next_task=None,        # task set inside post_homing_fn
-                    duration_s=homing_dur,
-                    retract_first=False,   # already upright, no obstacle to retract from
-                    retract_duration_s=0.0,
-                    resume=True,           # _homing_transition will call _run_segment after fn returns
-                    post_homing_fn=_decide_placement_task_at_tableB,
-                    target_override=target_override if target_override else None,
-                )
-                if not ok:
-                    self._print("⚠️  [Transfer] transition_with_homing 被拒绝（控制器已停止？），中止转运。")
-                    transfer_triggered = False
-                    self._current_phase = 0
+                    self._on_transfer_round_completed()
                 break
 
-        logger.info("Transfer-mode subtask tracker exited (phase=%d).", self._current_phase)
+        logger.info("Transfer Phase 4 completion tracker exited.")
 
     # ------------------------------------------------------------------
     # Command handlers (called from the listener thread)
@@ -1605,10 +1879,16 @@ class InteractiveSession:
                 "Signal stored; it will unblock the next Phase 2 wait if one occurs."
             )
         else:
-            self._print(
-                "✅ [Transfer] 导航完成信号已接收！\n"
-                "   → 开始 Phase 3: 上肢从默认位置恢复到抓取时的冻结姿态（夹爪保持夹紧）…"
-            )
+            if getattr(self, "_transfer_table_b_restore_pose", True):
+                self._print(
+                    "✅ [Transfer] 导航完成信号已接收！\n"
+                    "   → 开始 Phase 3: 上肢从身侧默认位置平滑恢复到抓取时的姿态（夹爪保持夹紧）…"
+                )
+            else:
+                self._print(
+                    "✅ [Transfer] 导航完成信号已接收！\n"
+                    "   → [默认位接管模式]: 机械臂保持在身侧默认位置，直接以此动作启动 VLA 放置推理…"
+                )
         self._nav_done_event.set()
 
     def _cmd_reset(self, cmd: InteractiveCommand) -> None:
@@ -1618,11 +1898,7 @@ class InteractiveSession:
         if self._transfer_mode:
             # Also clear transfer-specific state so a re-run starts fresh
             self._nav_done_event.set()   # unblock any waiting post_homing_fn
-            self._frozen_joint_state = None
-            self._captured_gripper_val = None
-            self._current_phase = 0
-            self._transfer_banner_printed = False
-            self._nav_done_event.clear()
+            self._reset_transfer_state()
         if self._subtasks_enabled:
             self._current_phase = 0
             self._lift_sustained_seconds = 0.0

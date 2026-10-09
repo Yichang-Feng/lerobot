@@ -63,7 +63,7 @@ class ZMQCamera(Camera):
         ```python
         from lerobot.cameras.zmq import ZMQCamera, ZMQCameraConfig
 
-        config = ZMQCameraConfig(server_address="192.168.123.164", port=5555, camera_name="head_camera")
+        config = ZMQCameraConfig(server_address="10.3.42.221", port=5555, camera_name="head_camera")
         camera = ZMQCamera(config)
         camera.connect()
 

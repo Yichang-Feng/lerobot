@@ -26,7 +26,7 @@ export PYTHONUNBUFFERED=1
 
 # 2. 默认部署配置
 POLICY_PATH="outputs/train/pi05_lora_g1_pick_put_subtasks/merged_model_10000"
-ROBOT_IP="192.168.123.164"
+ROBOT_IP="10.3.42.221"
 MODE="auto"
 QUEUE_THRESHOLD=35
 INTERPOLATION_MULTIPLIER=3

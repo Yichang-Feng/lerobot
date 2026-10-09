@@ -14,7 +14,7 @@ VIDEO_PATH="${1:-datasets/box_pick/videos/observation.images.global_view/chunk-0
 START_TIME="${2:-0:00}"
 CONTROLLER="${3:-GrootLocomotionController}"
 LOCOMOTION_MODE="${4:-stand}"
-ROBOT_IP="${5:-192.168.123.164}"
+ROBOT_IP="${5:-10.3.42.221}"
 PORT=5556
 FPS=30
 

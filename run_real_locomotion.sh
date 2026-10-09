@@ -17,7 +17,7 @@ cd "$SCRIPT_DIR"
 export LD_LIBRARY_PATH="/home/yichangfeng/miniforge3/envs/lerobot/lib:${LD_LIBRARY_PATH}"
 PYTHON_BIN="/home/yichangfeng/miniforge3/envs/lerobot/bin/python"
 
-ROBOT_IP="${ROBOT_IP:-192.168.123.164}"
+ROBOT_IP="${ROBOT_IP:-10.3.42.221}"
 CONTROLLER="${CONTROLLER:-GrootLocomotionController}"
 STATE_PORT="${STATE_PORT:-6001}"
 ACTION_PORT="${ACTION_PORT:-6002}"

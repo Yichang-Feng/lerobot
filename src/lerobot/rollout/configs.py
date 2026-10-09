@@ -309,13 +309,19 @@ class RolloutConfig:
 
     # Cross-table water bottle transfer mode configuration
     transfer_mode: bool = False
+    # When True, do not return to default position after grasping at table A; hold grasped pose.
+    transfer_hold_after_grasp: bool = False
+    # When True (default for legacy transfer), restore arm pose to frozen grasped pose at table B.
+    # When False, assume arm is already in default position (e.g. from external navigation code) and start VLA inference from default position.
+    transfer_table_b_restore_pose: bool = True
     transfer_grasp_thresh: float = 3.5
     transfer_lift_pitch: float = -0.20
+    transfer_grasp_duration: float = 0.40
     transfer_grasp_frames: int = 8
     transfer_restore_duration: float = 2.5
     transfer_gripper_closed: float = 3.4
-    transfer_place_box_task: str = "pick up the water bottle and place it into the blue box"
-    transfer_place_table_task: str = "pick up the water bottle and place it on the table"
+    transfer_place_box_task: str = "pick up the water bottle from the table and place it into the blue box"
+    transfer_place_table_task: str = "pick up the water bottle from the table and place it into the blue box"
     # When True, print live transfer status HUD every 1.5s. When False (default), keep terminal calm and quiet.
     transfer_hud: bool = False
 

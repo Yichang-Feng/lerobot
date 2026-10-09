@@ -385,7 +385,7 @@ def main():
     global args
     parser = argparse.ArgumentParser(description="Unitree G1 Dex-1 2-Subtask Deployment Supervisor.")
     parser.add_argument("--mode", choices=["manual", "auto"], default="manual", help="子任务流转模式 (manual: 单键手动, auto: 自动+按键)")
-    parser.add_argument("--robot_ip", default="192.168.123.164", help="G1 机器人或底层服务 IP")
+    parser.add_argument("--robot_ip", default="10.3.42.221", help="G1 机器人或底层服务 IP")
     parser.add_argument("--action_ip", default="", help="动作指令发送 IP")
     parser.add_argument("--camera_ip", default="", help="机载相机推流 IP")
     parser.add_argument("--camera_port", type=int, default=55555, help="头部主相机端口 (默认 55555)")

@@ -37,7 +37,7 @@ ROBOT_TYPE="unitree_g1"                        # 机器人类型
 CONTROLLER="GrootLocomotionController"         # 下肢平衡控制器 (GrootLocomotionController / SonicWholeBodyController)
 LOCOMOTION_MODE="stand"                        # 初始移动模式 (stand: 原地保持 / walk: 允许行走)
 ZERO_LOCOMOTION_CMD=false                      # 是否强制截断遥控移动速度 (实机安全建议设为 true)
-ROBOT_IP="192.168.123.164"                     # G1 机载工控机 IP
+ROBOT_IP="10.3.42.221"                     # G1 机载工控机 IP
 
 # 5. 自定义相机配置（留空则根据仿真/实机自动推导）
 CAMERA_SERVER=""                               # 相机推流地址

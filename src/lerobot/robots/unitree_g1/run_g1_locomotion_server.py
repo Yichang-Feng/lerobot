@@ -188,7 +188,7 @@ def main() -> None:
     parser.add_argument("--sim", action="store_true", default=True, help="Run in MuJoCo simulation mode (default)")
     parser.add_argument("--real", action="store_true", help="Run on real physical robot")
     parser.add_argument("--controller", type=str, default="GrootLocomotionController", help="Controller name")
-    parser.add_argument("--robot-ip", type=str, default="192.168.123.164", help="G1 Robot IP (for real robot)")
+    parser.add_argument("--robot-ip", type=str, default="10.3.42.221", help="G1 Robot IP (for real robot)")
     parser.add_argument("--state-port", type=int, default=6001, help="ZMQ PUB port for 29-DoF lowstate")
     parser.add_argument("--action-port", type=int, default=6002, help="ZMQ PULL port for 18-DoF actions")
     parser.add_argument("--camera-port", type=int, default=0, help="Camera port (default: 5556 for sim, 5555 for real)")
