@@ -46,13 +46,13 @@
 | **底层运控节点** | `deploy.sh` 绑定物理直连网卡 (如 `enx6c1ff724495a`) | `deploy.sh` 传入 `sim` 参数与本地模拟器通信 |
 | **仿真节点 (`run_sim_loop.py`)** | **严禁运行 / 跳过**（由物理机器人和物理世界充当实体） | **必须运行** |
 | **遥操推流 (PICO VR)** | 完全一致 (`pico_manager_thread_server.py`) | 完全一致 |
-| **数据记录器 (`run_data_exporter`)** | 完全一致，指向机器人机载 IP (`192.168.123.164:5555`) | 完全一致，指向 `localhost:5555` |
+| **数据记录器 (`run_data_exporter`)** | 完全一致，指向机器人机载 IP (`10.3.42.221:5555`) | 完全一致，指向 `localhost:5555` |
 | **手柄录制按键控制** | 完全一致 (`Left Grip + A` 启停/保存) | 完全一致 |
 | **保存文件格式** | 完全一致 (LeRobot v2.1 Parquet + MP4) | 完全一致 |
 
 ### Q2: 怎么录制视频数据？
 **视频是由上位机数据记录器 (`run_data_exporter.py`) 在后台自动订阅截帧、队列缓存并编码合成。**
-1. 上位机运行数据记录器时指定机器人的相机地址 `--camera-host 192.168.123.164 --camera-port 5555`。
+1. 上位机运行数据记录器时指定机器人的相机地址 `--camera-host 10.3.42.221 --camera-port 5555`。
 2. 记录器通过 ZMQ 持续接收机载相机推流。
 3. 当操作人员按下录制快捷键（PICO 手柄 `Left Grip + A` 或上位机键盘 `c`）触发 **START RECORDING** 时，视频帧与当前时刻的关节状态严格对齐并压入缓存队列。
 4. 当完成一次“抱箱+转身+放置”再次按下快捷键触发 **STOP RECORDING** 时，系统自动调用底层 `LeRobotDataset`（基于 PyAV / H.264 编码），将该 Episode 的图像序列直接编码写入为标准 `.mp4` 文件：
@@ -69,7 +69,7 @@
 
 ```text
        【机器人机载端 (Jetson Orin)】                           【上位机工作站 (PC / 4090)】
-           IP: 192.168.123.164                                  IP: 192.168.123.213
+           IP: 10.3.42.221                                  IP: 192.168.123.213
  ┌───────────────────────────────────────┐              ┌─────────────────────────────────────┐
  │ 机载服务 (robot_server)                │              │ PICO VR Teleop (pico_manager)       │
  │   ├─ camera_server/server.py          │              │   └─ 发布 pose (Port:5556)          │
@@ -147,7 +147,7 @@
 1. **吊架安全第一**：必须使用龙门架/顶部弹性安全绳吊住 G1 机器人的吊环，调节绳长使脚掌平稳踩实地面，在倾倒前能被拉住。
 2. **网络连通性检查**：在上位机确认网卡 IP 并 ping 通机器人：
    ```bash
-   ping -c 3 192.168.123.164
+   ping -c 3 10.3.42.221
    ```
 3. **佩戴 PICO 4 头显**：打开串流助手，进入 VR 串流界面并校准站立高度。
 
@@ -158,7 +158,7 @@
 #### 【终端 0】(机载计算机 SSH) 启动机载视觉与电机服务
 通过网线 SSH 登录 G1 机载系统（密码通常为 `123`）：
 ```bash
-ssh unitree@192.168.123.164
+ssh unitree@10.3.42.221
 cd ~/lerobot
 
 # 启动机载服务（支持 --device 指定摄像头设备号，默认 2）
@@ -194,7 +194,7 @@ cd ~/SonicStar/wbc
 source ~/GR00T-WholeBodyControl/.venv_teleop/bin/activate
 export PYTHONPATH=$PWD:$PYTHONPATH
 
-python gear_sonic/scripts/run_camera_viewer.py --camera-host 192.168.123.164 --camera-port 5555
+python gear_sonic/scripts/run_camera_viewer.py --camera-host 10.3.42.221 --camera-port 5555
 ```
 此时应能看到清晰的第一视角机载相机画面。
 
@@ -208,7 +208,7 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 python gear_sonic/scripts/run_data_exporter.py \
     --task-prompt "pick up the box, turn right, and place it on the table" \
     --dataset-name g1_rubberhand_pick_turn \
-    --camera-host 192.168.123.164 \
+    --camera-host 10.3.42.221 \
     --camera-port 5555 \
     --data-collection-frequency 50
 ```

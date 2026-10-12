@@ -1,6 +1,6 @@
 # Unitree G1 具身策略实机部署操作指南
 
-本文档结合 **SonicStar 实机部署规范**（网卡 `enx6c1ff724495a`，本机 IP `192.168.123.213`，机器人 IP `192.168.123.164`）与 **LeRobot 项目架构**，详细指导如何将已在 MuJoCo 仿真中验证的 **Unitree G1 + GrootLocomotionController + PI0.5 策略（`model/box_move_blue`）** 部署到真实物理机器人上。
+本文档结合 **SonicStar 实机部署规范**（网卡 `enx6c1ff724495a`，本机 IP `192.168.123.213`，机器人 IP `10.3.42.221`）与 **LeRobot 项目架构**，详细指导如何将已在 MuJoCo 仿真中验证的 **Unitree G1 + GrootLocomotionController + PI0.5 策略（`model/box_move_blue`）** 部署到真实物理机器人上。
 
 本文档特别支持 **两大视觉输入模式**：
 1. **模式 A（真实机载视觉）**：连接 G1 机载 RealSense 摄像头实时闭环运行。
@@ -28,7 +28,7 @@
 ## 1. 实机部署环境与网络拓扑（已确认配置）
 
 参考本套实机系统的物理配置：
-- **机器人 IP**：`192.168.123.164`（G1 内部 Jetson / 工控电脑）
+- **机器人 IP**：`10.3.42.221`（G1 内部 Jetson / 工控电脑）
 - **本机上位机 IP**：`192.168.123.213`
 - **本机机器人直连网卡**：`enx6c1ff724495a`
 - **Python 运行环境**：`/home/yichangfeng/miniforge3/envs/lerobot/bin/python`
@@ -37,7 +37,7 @@
 ```text
 ┌──────────────────────────────────────────────┐                ┌──────────────────────────────────────────────┐
 │         本机上位机 (GPU Workstation)          │                │            Unitree G1 机器人本体             │
-│        IP: 192.168.123.213                   │                │          IP: 192.168.123.164                 │
+│        IP: 192.168.123.213                   │                │          IP: 10.3.42.221                 │
 │        网卡: enx6c1ff724495a                 │                │                                              │
 │                                              │ 千兆以太网直连  │  【机载服务 run_g1_server / composed_camera】 │
 │  【lerobot-rollout 上位机推理】              │◄──────────────►│   ├─ ZMQ Port 6000 (PULL 接收 LowCmd)        │
@@ -95,7 +95,7 @@
 
 通过网线 SSH 登录 G1 机载系统：
 ```bash
-ssh unitree@192.168.123.164
+ssh unitree@10.3.42.221
 # 密码: 123
 ```
 
@@ -143,7 +143,7 @@ sudo ip addr add 192.168.123.213/24 dev enx6c1ff724495a
 sudo ip link set enx6c1ff724495a up
 
 # 测试与 G1 机器人的通信
-ping -c 3 192.168.123.164
+ping -c 3 10.3.42.221
 ```
 
 ---
@@ -170,7 +170,7 @@ ping -c 3 192.168.123.164
 在上位机打开主控制终端，根据选择的模式执行对应命令（已全面固化默认参数，仅需指定必要差异参数）：
 
 #### 模式 A：实机真实相机闭环部署（Real Camera Mode）
-连接 G1 机器人机载推流端口 `192.168.123.164:5555`：
+连接 G1 机器人机载推流端口 `10.3.42.221:5555`：
 
 ```bash
 /home/yichangfeng/miniforge3/envs/lerobot/bin/lerobot-rollout \
@@ -178,7 +178,7 @@ ping -c 3 192.168.123.164
     --task="move blue box back and forth between tables" \
     --robot.is_simulation=false \
     --robot.zero_locomotion_cmd=true \
-    --robot.cameras='{"global_view": {"type": "zmq", "server_address": "192.168.123.164", "port": 5555, "camera_name": "head_camera", "width": 640, "height": 480, "fps": 30, "warmup_s": 5}}' \
+    --robot.cameras='{"global_view": {"type": "zmq", "server_address": "10.3.42.221", "port": 5555, "camera_name": "head_camera", "width": 640, "height": 480, "fps": 30, "warmup_s": 5}}' \
     --display_data=true
 ```
 
@@ -204,7 +204,7 @@ ping -c 3 192.168.123.164
 | :--- | :--- | :--- | :--- |
 | `--robot.is_simulation` | `false` | `false` | **关闭仿真**，通过 `unitree_sdk2_socket.py` 连接物理电机 |
 | `--robot.zero_locomotion_cmd`| `true` | `true` | **默认置零移动速度**，防止机器人失稳移动（终端按 'w' 恢复行走） |
-| `--robot.cameras` | `server_address: 192.168.123.164`<br>`port: 5555` | 默认 `localhost:5556`（可省略） | 切换图像获取来源（机载 RealSense vs 本地 ZMQ 录像推流） |
+| `--robot.cameras` | `server_address: 10.3.42.221`<br>`port: 5555` | 默认 `localhost:5556`（可省略） | 切换图像获取来源（机载 RealSense vs 本地 ZMQ 录像推流） |
 | `--policy.path` | `model/box_move_blue` | `model/box_move_blue` | 训练好的 PI0.5 策略模型权重路径 |
 | `--display_data` | `true` | `true` | 实时弹出可视化窗口监控相机输入与关节动作（默认 `false`） |
 | *--strategy.type* | *base* | *base* | 默认值：`base` |
@@ -247,7 +247,7 @@ ping -c 3 192.168.123.164
 - **检查项**：
   1. 上位机网卡 `enx6c1ff724495a` 的 IP 是否为 `192.168.123.213`。
   2. G1 机载端是否已启动 `run_g1_server.py`。
-  3. 执行 `ping 192.168.123.164` 确认千兆网线物理链路正常。
+  3. 执行 `ping 10.3.42.221` 确认千兆网线物理链路正常。
 
 ### Q2: 报错 `RuntimeError: Camera 'global_view' failed to connect`
 - **检查项**：

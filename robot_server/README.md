@@ -32,12 +32,12 @@ robot_server/
 在上位机终端执行 `scp` 将本目录直接复制到机器人主目录下的 `~/lerobot`：
 ```bash
 # 在上位机执行
-scp -r robot_server unitree@192.168.123.164:~/lerobot
+scp -r robot_server unitree@10.3.42.221:~/lerobot
 ```
 
 ### 步骤 2：登录机器人并安装基础依赖
 ```bash
-ssh unitree@192.168.123.164
+ssh unitree@10.3.42.221
 # 密码: 123
 
 # 安装 Python 基础通信库（仅 pyzmq 和 opencv）

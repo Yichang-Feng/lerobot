@@ -4,7 +4,7 @@
 - **工作目录**: `/home/yichangfeng/lerobot`
 - **上位机环境**: `/home/yichangfeng/miniforge3/envs/lerobot` (Python 3.12, GPU: NVIDIA GeForce RTX 4090 D 24GB, 上位机 IP: `192.168.123.213`)
 - **多卡训练机环境**: `zhengwang@CNBESLPD260001` (Python 3.12, GPU: RTX 5090)
-- **机器人端环境**: Unitree G1 机载电脑 (`unitree@192.168.123.164`, Ubuntu 20.04, Python 3.8)
+- **机器人端环境**: Unitree G1 机载电脑 (`unitree@10.3.42.221`, Ubuntu 20.04, Python 3.8)
 
 ---
 
@@ -25,7 +25,7 @@
 ```text
 ┌──────────────────────────────────────────────┐                ┌──────────────────────────────────────────────┐
 │         本机上位机 (GPU Workstation)          │                │            Unitree G1 机器人本体             │
-│        IP: 192.168.123.213                   │                │          IP: 192.168.123.164                 │
+│        IP: 192.168.123.213                   │                │          IP: 10.3.42.221                 │
 │        网卡: enx6c1ff724495a                 │                │                                              │
 │                                              │ 千兆以太网直连  │  【机载轻量服务 robot_server】                │
 │  【lerobot-rollout / run_vla 上位机推理】    │◄──────────────►│   ├─ ZMQ Port 6002 (PULL 接收 LowCmd)        │
@@ -155,7 +155,7 @@
 ./run_vla.sh --real
 ```
 - 默认自动载入 3-Subtask 最优模型：`outputs/train/pi05_box_pick_turn_v30_subtasks/checkpoints/005000/pretrained_model`。
-- 自动连接默认机器人 IP (`192.168.123.164`)、状态端口 `6001`、动作端口 `6002`、相机端口 `5556`。
+- 自动连接默认机器人 IP (`10.3.42.221`)、状态端口 `6001`、动作端口 `6002`、相机端口 `5556`。
 
 > **IP 热切换提示**:
 > 若机器人 IP 有变化，无需退出程序：

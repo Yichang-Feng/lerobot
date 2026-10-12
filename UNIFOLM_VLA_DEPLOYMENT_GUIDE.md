@@ -136,7 +136,7 @@ cd ~/lerobot
 
 #### 常用控制参数说明：
 - `--policy.path`：指定为 `outputs/train/unifolm_vla_base`。
-- `--real`：自动将目标 IP 指向实机 `192.168.123.164`，相机端口为 `5556`。
+- `--real`：自动将目标 IP 指向实机 `10.3.42.221`，相机端口为 `5556`。
 - `--sim`：自动将目标 IP 指向本机 `localhost`（用于与 Mujoco 仿真环境联调）。
 - `--task`：自然语言任务指令（如 `"clean the table"`、`"wipe the table"`、`"fold the towel"` 等）。
 - `--auto`（默认开启）：自动监听 6000 端口，当手柄切入 VLA 模式时自动启动并带有余弦 S 曲线平滑介入，切出手柄时 0.2s 内自动释放控制权。
@@ -286,5 +286,5 @@ Unitree 灵巧手/夹爪驱动（`rt/dex1/state`）：
     --real \
     --gripper \
     --gripper-port=6004 \
-    --gripper-ip=192.168.123.164
+    --gripper-ip=10.3.42.221
 ```

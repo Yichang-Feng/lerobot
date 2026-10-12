@@ -66,7 +66,7 @@ This will launch a [MuJoCo sim instance](https://huggingface.co/lerobot/unitree-
 
 ### Connect to the Physical Robot
 
-The G1's Ethernet IP is fixed at `192.168.123.164`. Your machine must have a static IP on the same subnet: `192.168.123.x` where `x ≠ 164`.
+The G1's Ethernet IP is fixed at `10.3.42.221`. Your machine must have a static IP on the same subnet: `192.168.123.x` where `x ≠ 164`.
 
 ```bash
 # Replace 'enp131s0' with your ethernet interface name (check with `ip a`)
@@ -78,7 +78,7 @@ sudo ip link set enp131s0 up
 ### SSH into the Robot
 
 ```bash
-ssh unitree@192.168.123.164
+ssh unitree@10.3.42.221
 # Password: 123
 ```
 

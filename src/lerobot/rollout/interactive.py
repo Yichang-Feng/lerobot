@@ -259,6 +259,16 @@ class InteractiveSession:
         self._transfer_triggered: bool = False
         self._transfer_lock = threading.Lock()
         self._decided_placement_task: str | None = None
+        self._jev_mode_evaluating = threading.Lock()
+        self._last_observed_robot_mode: Any = getattr(self.robot_wrapper, "current_mode", None)
+        self._transfer_supervisor_thread: threading.Thread | None = None
+        self._transfer_supervisor_stop_event = threading.Event()
+        self._transfer_polling_thread: threading.Thread | None = None
+        self._transfer_polling_stop_event = threading.Event()
+        self._transfer_polling_active: bool = False
+        self._transfer_polling_lock = threading.Lock()
+        if hasattr(self.robot_wrapper, "register_mode_change_callback"):
+            self.robot_wrapper.register_mode_change_callback(self._on_robot_mode_changed)
 
         # Valen (Jev) Multi-Modal Decision Evaluator support
         raw_ve = getattr(ctx.runtime.cfg, "valen_evaluator", False)
@@ -373,12 +383,16 @@ class InteractiveSession:
                 self._listener.start()
                 if self._auto_mode:
                     self._start_auto_supervisor()
+                elif self._transfer_mode:
+                    self._start_transfer_supervisor()
                 try:
                     self.controller.serve()
                 finally:
                     self._listener.stop()
         finally:
             self._stop_auto_supervisor()
+            self._stop_transfer_polling()
+            self._stop_transfer_supervisor()
             self._stop_subtask_tracker()
             # Outside the muting context, so the announcement and teardown logs are visible again.
             log_say("Interactive session ended", self._play_sounds)
@@ -572,6 +586,370 @@ class InteractiveSession:
             time.sleep(0.02)
 
     # ------------------------------------------------------------------
+    # Transfer Mode Supervisor (6000 Port Mode Switch + Dual-Table JEV Perception)
+    # ------------------------------------------------------------------
+
+    def _start_transfer_supervisor(self) -> None:
+        if self._transfer_supervisor_thread is not None and self._transfer_supervisor_thread.is_alive():
+            return
+        self._transfer_supervisor_stop_event.clear()
+        self._transfer_supervisor_thread = threading.Thread(
+            target=self._transfer_supervisor_loop, daemon=True, name="TransferModeSupervisor"
+        )
+        self._transfer_supervisor_thread.start()
+
+    def _stop_transfer_supervisor(self) -> None:
+        self._transfer_supervisor_stop_event.set()
+        if self._transfer_supervisor_thread is not None:
+            self._transfer_supervisor_thread.join(timeout=1.0)
+            self._transfer_supervisor_thread = None
+
+    def _transfer_supervisor_loop(self) -> None:
+        """Monitors robot mode on port 6000 and drives level-triggered JEV perception in transfer mode."""
+        robot = self.robot_wrapper
+        from lerobot.robots.unitree_g1.unitree_g1_client import RobotMode
+
+        while not self._transfer_supervisor_stop_event.is_set():
+            if self.controller.stopped:
+                break
+
+            current_mode = getattr(robot, "current_mode", None)
+
+            # Edge trigger: Mode change notification & polling stop
+            if current_mode != self._last_observed_robot_mode:
+                old_m = self._last_observed_robot_mode
+                self._last_observed_robot_mode = current_mode
+
+                if old_m is not None:
+                    if current_mode != RobotMode.VLA:
+                        if self._transfer_polling_active:
+                            self._stop_transfer_polling()
+                        self._print(
+                            f"\n📡 [6000 端口] 机器人模式切换: {old_m} -> {current_mode} (已退出 VLA)\n"
+                            "   已暂停视觉感知与自动接管，机械臂保持安全静止。"
+                        )
+                    elif current_mode == RobotMode.VLA:
+                        self._print(
+                            "\n📡 [6000 端口] 机器人模式切换: -> VLA 控制模式 (VLA)！"
+                        )
+
+            # Level trigger: If in VLA mode, not resetting, not starting, not currently polling
+            if (
+                current_mode == RobotMode.VLA
+                and not self._is_resetting
+                and not self._is_starting
+                and not self._transfer_polling_active
+            ):
+                metrics = self._get_robot_metrics()
+                r_gripper = float(metrics.get("r_gripper", 5.0))
+
+                # Table 2: Phase 2 (navigating wait) or holding bottle with gripper closed
+                is_table_2 = (self._current_phase == 2) or (
+                    self._captured_gripper_val is not None and r_gripper <= 3.8
+                )
+
+                if is_table_2:
+                    if self._current_phase == 2 and not self._nav_done_event.is_set():
+                        self._start_transfer_polling(table=2)
+                else:
+                    if self._current_phase == 0 and not self.controller.running:
+                        self._start_transfer_polling(table=1)
+
+            time.sleep(0.08)
+
+    def _on_robot_mode_changed(self, old_mode: Any, new_mode: Any, raw_preview: str) -> None:
+        """Callback invoked immediately when UnitreeG1Client receives a mode change on port 6000."""
+        from lerobot.robots.unitree_g1.unitree_g1_client import RobotMode
+        if not self._transfer_mode:
+            return
+        if new_mode != RobotMode.VLA and self._transfer_polling_active:
+            self._stop_transfer_polling()
+        elif new_mode == RobotMode.VLA and not self._is_resetting and not self._is_starting:
+            metrics = self._get_robot_metrics()
+            r_gripper = float(metrics.get("r_gripper", 5.0))
+            is_table_2 = (self._current_phase == 2) or (
+                self._captured_gripper_val is not None and r_gripper <= 3.8
+            )
+            if is_table_2:
+                if self._current_phase == 2 and not self._nav_done_event.is_set():
+                    self._start_transfer_polling(table=2)
+            else:
+                if self._current_phase == 0 and not self.controller.running:
+                    self._start_transfer_polling(table=1)
+
+    def _start_transfer_polling(self, table: int) -> None:
+        """Start background JEV perception polling loop for Table 1 (bottle) or Table 2 (box)."""
+        if not hasattr(self, "_transfer_polling_lock"):
+            self._transfer_polling_lock = threading.Lock()
+        if not hasattr(self, "_transfer_polling_stop_event"):
+            self._transfer_polling_stop_event = threading.Event()
+        if not hasattr(self, "_transfer_polling_active"):
+            self._transfer_polling_active = False
+
+        with self._transfer_polling_lock:
+            if self._transfer_polling_active:
+                return
+            self._transfer_polling_active = True
+            self._transfer_polling_stop_event.clear()
+            self._transfer_polling_thread = threading.Thread(
+                target=self._transfer_polling_worker,
+                args=(table,),
+                daemon=True,
+                name=f"TransferJevPollingTable{table}",
+            )
+            self._transfer_polling_thread.start()
+
+    def _stop_transfer_polling(self) -> None:
+        """Stop active JEV perception polling loop."""
+        if hasattr(self, "_transfer_polling_stop_event"):
+            self._transfer_polling_stop_event.set()
+        if hasattr(self, "_transfer_polling_lock"):
+            with self._transfer_polling_lock:
+                self._transfer_polling_active = False
+        else:
+            self._transfer_polling_active = False
+        if getattr(self, "_transfer_polling_thread", None) is not None and self._transfer_polling_thread.is_alive():
+            if threading.current_thread() != self._transfer_polling_thread:
+                self._transfer_polling_thread.join(timeout=0.5)
+        self._transfer_polling_thread = None
+
+    def _get_live_camera_frames(self) -> tuple[Any, Any]:
+        """Fetch fresh real-time camera frames [global_view, right_wrist] from robot.
+
+        Directly queries the latest live camera buffers, guaranteeing that JEV visual
+        perception always evaluates the current real-time scene rather than a stale startup cache.
+        """
+        robot_wrapper = self.robot_wrapper
+        robot = getattr(robot_wrapper, "inner", robot_wrapper)
+        g_frame = None
+        rw_frame = None
+
+        # Method 1: Direct peek from live camera instances (fastest, zero motor/IMU overhead)
+        cams = getattr(robot, "_cameras", {})
+        if cams:
+            for g_key in ("global_view", "base_0_rgb", "camera_0", "cam_high"):
+                if g_key in cams and getattr(cams[g_key], "is_connected", True):
+                    try:
+                        g_frame = cams[g_key].read_latest()
+                        break
+                    except Exception:
+                        pass
+            for rw_key in ("right_wrist", "right_wrist_0_rgb", "camera_right_wrist", "cam_right_wrist"):
+                if rw_key in cams and getattr(cams[rw_key], "is_connected", True):
+                    try:
+                        rw_frame = cams[rw_key].read_latest()
+                        break
+                    except Exception:
+                        pass
+
+        # Method 2: If direct camera peek didn't provide both, call robot_wrapper.get_observation()
+        if g_frame is None or rw_frame is None:
+            try:
+                obs = robot_wrapper.get_observation()
+                if g_frame is None:
+                    g_frame = (
+                        obs.get("global_view")
+                        or obs.get("base_0_rgb")
+                        or obs.get("observation.images.global_view")
+                        or obs.get("observation.images.base_0_rgb")
+                    )
+                if rw_frame is None:
+                    rw_frame = (
+                        obs.get("right_wrist")
+                        or obs.get("right_wrist_0_rgb")
+                        or obs.get("observation.images.right_wrist")
+                        or obs.get("observation.images.right_wrist_0_rgb")
+                    )
+            except Exception as e:
+                logger.debug("Failed to get observation for live cameras: %s", e)
+
+        # Method 3: Fallback to cached last frames if transient packet drop occurred
+        if g_frame is None or rw_frame is None:
+            last_cams = getattr(robot, "_last_camera_frames", {})
+            if g_frame is None:
+                g_frame = last_cams.get("base_0_rgb") or last_cams.get("global_view")
+            if rw_frame is None:
+                rw_frame = last_cams.get("right_wrist_0_rgb") or last_cams.get("right_wrist")
+
+        return g_frame, rw_frame
+
+    def _transfer_polling_worker(self, table: int) -> None:
+        """Worker thread for level-triggered JEV perception polling in transfer mode."""
+        from lerobot.robots.unitree_g1.unitree_g1_client import RobotMode
+
+        rule_65 = "=" * 65
+        robot_wrapper = self.robot_wrapper
+        robot = getattr(robot_wrapper, "inner", robot_wrapper)
+        valen_client = getattr(self, "_valen_client", None)
+
+        last_heartbeat_time = 0.0
+        first_report = True
+
+        logger.info("Transfer JEV perception polling started for Table %d", table)
+
+        try:
+            while not self._transfer_polling_stop_event.is_set():
+                if self.controller.stopped or getattr(self, "_is_resetting", False):
+                    break
+
+                # 1. Mode check: must stay in VLA mode
+                current_mode = getattr(robot_wrapper, "current_mode", getattr(robot, "current_mode", None))
+                if current_mode != RobotMode.VLA:
+                    logger.info("Transfer polling exiting: robot is no longer in VLA mode (%s)", current_mode)
+                    break
+
+                # 2. State validation
+                if table == 1:
+                    if self.controller.running or getattr(self, "_is_starting", False) or self._current_phase != 0:
+                        break
+                elif table == 2:
+                    if self._current_phase != 2 or self._nav_done_event.is_set():
+                        break
+
+                now = time.time()
+
+                # 3. Retrieve fresh real-time camera frames (always live)
+                g_frame, rw_frame = self._get_live_camera_frames()
+
+                if valen_client is None:
+                    if first_report:
+                        self._print(
+                            f"\n{rule_65}\n"
+                            f"⚠️  [桌{table} JEV 未连接] Valen 服务不可用，保持当前姿态待命！\n"
+                            f"   👉 若需强制启动，请在终端手动输入 {'s' if table == 1 else 'd'} 回车。\n"
+                            f"{rule_65}"
+                        )
+                        first_report = False
+                    self._transfer_polling_stop_event.wait(1.0)
+                    continue
+
+                if g_frame is None or rw_frame is None:
+                    if first_report:
+                        self._print(
+                            f"\n{rule_65}\n"
+                            f"⚠️  [桌{table} 相机离线] 未获取到相机画面，保持当前姿态待命！\n"
+                            f"   👉 若需强制启动，请在终端手动输入 {'s' if table == 1 else 'd'} 回车。\n"
+                            f"{rule_65}"
+                        )
+                        first_report = False
+                    self._transfer_polling_stop_event.wait(1.0)
+                    continue
+
+                # 4. Perform JEV evaluation
+                if table == 1:
+                    ctx_t1 = (
+                        "The input image is horizontally stitched from two camera views: "
+                        "the left half is the third-person global overview showing Table 1; "
+                        "the right half is the right-wrist camera close-up showing the gripper in front of Table 1. "
+                        "The robot is standing in front of Table 1."
+                    )
+                    q_t1 = {
+                        "task_phase": {
+                            "type": "choice",
+                            "instructions": "Look at the tabletop in front of the robot. What object is present on the table?",
+                            "criteria": {
+                                "water_bottle_present": "There is a water bottle standing or placed on the table surface.",
+                                "no_water_bottle": "There is no water bottle on the table; only the bare table surface is present.",
+                            },
+                        }
+                    }
+                    v_res = valen_client.evaluate(
+                        g_frame, rw_frame, phase=4, custom_questions=q_t1, custom_text=ctx_t1
+                    )
+                    is_detected = False
+                    prob = 0.0
+                    if v_res.is_success:
+                        prob = v_res.probabilities.get(v_res.choice, 0.0)
+                        if v_res.choice in ("water_bottle_present", "bottle_present") and prob >= 0.50:
+                            is_detected = True
+
+                    if is_detected:
+                        self._print(
+                            f"\n{rule_65}\n"
+                            f"🤖 [桌1 JEV 判定通过] 视觉确认桌面上存在水瓶！\n"
+                            f"   ├─ 识别选项: {v_res.choice} (置信度 P={prob*100:.1f}%, 耗时: {v_res.cost_ms:.0f}ms)\n"
+                            f"   └─ 自动切入 VLA 控制模式 (启动 Phase 0 水瓶夹取，和按 's' 效果一致)...\n"
+                            f"{rule_65}"
+                        )
+                        if hasattr(robot_wrapper, "trigger_engagement_smoothing"):
+                            robot_wrapper.trigger_engagement_smoothing()
+                        self._is_starting = True
+                        if not self.controller.start():
+                            self._is_starting = False
+                        break
+                    else:
+                        if first_report:
+                            self._print(
+                                f"\n{rule_65}\n"
+                                f"⏳ [桌1 视觉感知中] 手柄处于 VLA 模式，桌面上暂未检测到水瓶。\n"
+                                f"   ├─ 识别选项: {v_res.choice} (置信度 P={prob*100:.1f}%, 耗时: {v_res.cost_ms:.0f}ms)\n"
+                                f"   └─ 机械臂保持静止待命，持续检测中... 请将水瓶摆放到桌面视野内。\n"
+                                f"{rule_65}"
+                            )
+                            first_report = False
+                            last_heartbeat_time = now
+                        elif now - last_heartbeat_time >= 3.0:
+                            last_heartbeat_time = now
+                            self._print(
+                                f"⏳ [桌1 持续感知中] 暂未检测到水瓶 ({v_res.choice}, P={prob*100:.1f}%)，保持静止等待摆放水瓶..."
+                            )
+
+                elif table == 2:
+                    v_res = valen_client.evaluate(g_frame, rw_frame, phase=2)
+                    is_detected = False
+                    prob = 0.0
+                    if v_res.is_success:
+                        prob = v_res.probabilities.get(v_res.choice, 0.0)
+                        if v_res.choice in ("place_into_box", "box_present") and prob >= 0.50:
+                            is_detected = True
+
+                    if is_detected:
+                        self._print(
+                            f"\n{rule_65}\n"
+                            f"🤖 [桌2 JEV 判定通过] 视觉确认桌面上存在目标收纳盒！\n"
+                            f"   ├─ 识别选项: {v_res.choice} (置信度 P={prob*100:.1f}%, 耗时: {v_res.cost_ms:.0f}ms)\n"
+                            f"   └─ 自动解除导航等待，开始进入 VLA 放置操作 (和按 'd' 效果一致)...\n"
+                            f"{rule_65}"
+                        )
+                        self._cmd_navdone(InteractiveCommand(name="navdone"))
+                        break
+                    else:
+                        if first_report:
+                            self._print(
+                                f"\n{rule_65}\n"
+                                f"⏳ [桌2 视觉感知中] 手柄处于 VLA 模式，桌面上暂未检测到目标盒子。\n"
+                                f"   ├─ 识别选项: {v_res.choice} (置信度 P={prob*100:.1f}%, 耗时: {v_res.cost_ms:.0f}ms)\n"
+                                f"   └─ 机械臂持续锁紧夹爪保持姿态，持续检测中... 请移动机器人对准盒子。\n"
+                                f"{rule_65}"
+                            )
+                            first_report = False
+                            last_heartbeat_time = now
+                        elif now - last_heartbeat_time >= 3.0:
+                            last_heartbeat_time = now
+                            self._print(
+                                f"⏳ [桌2 持续感知中] 暂未检测到盒子 ({v_res.choice}, P={prob*100:.1f}%)，持续锁紧水瓶等待到位..."
+                            )
+
+                # Wait before next evaluation (interruptible)
+                self._transfer_polling_stop_event.wait(0.6)
+
+        except Exception as exc:
+            logger.error("Error in transfer polling worker (table %d): %s", table, exc, exc_info=True)
+        finally:
+            with self._transfer_polling_lock:
+                self._transfer_polling_active = False
+            logger.info("Transfer JEV perception polling ended for Table %d", table)
+
+    def _handle_vla_mode_switch_transfer(self) -> None:
+        """Manual / external trigger for VLA transfer mode perception."""
+        metrics = self._get_robot_metrics()
+        r_gripper = float(metrics.get("r_gripper", 5.0))
+        is_table_2 = (self._current_phase == 2) or (
+            self._captured_gripper_val is not None and r_gripper <= 3.8
+        )
+        self._start_transfer_polling(table=2 if is_table_2 else 1)
+
+    # ------------------------------------------------------------------
     # 3-Subtask Kinematics & Automated Progression
     # ------------------------------------------------------------------
 
@@ -705,6 +1083,7 @@ class InteractiveSession:
             self._frozen_joint_state = None
             self._captured_gripper_val = None
             self._decided_placement_task = None
+            self._last_observed_robot_mode = None
             self._nav_done_event.clear()
             initial_task = getattr(self.controller, "_initial_task", None) or "pick up the water bottle from the table"
             self.controller.set_task(initial_task)
@@ -1353,10 +1732,7 @@ class InteractiveSession:
             placement_task = default_place_box_task  # fallback to box
             target_decision_str = "放蓝盒 (place_into_box)"
             if valen_client is not None:
-                robot = getattr(self.robot_wrapper, "inner", self.robot_wrapper)
-                last_cams = getattr(robot, "_last_camera_frames", {})
-                g_frame = last_cams.get("base_0_rgb") or last_cams.get("global_view")
-                rw_frame = last_cams.get("right_wrist_0_rgb") or last_cams.get("right_wrist")
+                g_frame, rw_frame = self._get_live_camera_frames()
 
                 if g_frame is not None and rw_frame is not None:
                     # phase=2 → JEV server decides: "place_into_box" or "place_on_table"
@@ -1479,10 +1855,7 @@ class InteractiveSession:
                     and now - valen_last_time >= 0.1
                 ):
                     valen_last_time = now
-                    robot = getattr(self.robot_wrapper, "inner", self.robot_wrapper)
-                    last_cams = getattr(robot, "_last_camera_frames", {})
-                    g_frame = last_cams.get("base_0_rgb") or last_cams.get("global_view")
-                    rw_frame = last_cams.get("right_wrist_0_rgb") or last_cams.get("right_wrist")
+                    g_frame, rw_frame = self._get_live_camera_frames()
                     if g_frame is not None and rw_frame is not None:
                         jev_future = jev_executor.submit(valen_client.evaluate, g_frame, rw_frame, 3)
 
@@ -1762,6 +2135,8 @@ class InteractiveSession:
         self._print("=" * 65 + "\n")
 
     def _cmd_start(self, cmd: InteractiveCommand) -> None:
+        if self._transfer_mode:
+            self._stop_transfer_polling()
         robot = self.robot_wrapper
         if robot is not None and hasattr(robot, "trigger_engagement_smoothing"):
             robot.trigger_engagement_smoothing()
@@ -1873,12 +2248,17 @@ class InteractiveSession:
         if not self._transfer_mode:
             self._print("Transfer mode is not active — /navdone has no effect.")
             return
-        if self._current_phase != 2:
+        if self._current_phase == 0 and not self.controller.running:
+            self._print("👉 [Transfer] 在桌1收到手动 'd' 指令，启动桌1水瓶视觉检测...")
+            self._start_transfer_polling(table=1)
+            return
+        elif self._current_phase != 2:
             self._print(
                 f"⚠️  /navdone received but current transfer phase is {self._current_phase} (expected 2: NAVIGATING). "
                 "Signal stored; it will unblock the next Phase 2 wait if one occurs."
             )
         else:
+            self._stop_transfer_polling()
             if getattr(self, "_transfer_table_b_restore_pose", True):
                 self._print(
                     "✅ [Transfer] 导航完成信号已接收！\n"
@@ -1894,11 +2274,14 @@ class InteractiveSession:
     def _cmd_reset(self, cmd: InteractiveCommand) -> None:
         self._is_starting = False
         self._is_resetting = True
+        if self._transfer_mode:
+            self._stop_transfer_polling()
         self._stop_subtask_tracker()
         if self._transfer_mode:
             # Also clear transfer-specific state so a re-run starts fresh
             self._nav_done_event.set()   # unblock any waiting post_homing_fn
             self._reset_transfer_state()
+            self._last_observed_robot_mode = None
         if self._subtasks_enabled:
             self._current_phase = 0
             self._lift_sustained_seconds = 0.0
@@ -1938,6 +2321,8 @@ class InteractiveSession:
         return "Available commands:\n" + "\n".join(lines)
 
     def _render_banner(self) -> str:
+        robot = self.robot_wrapper
+        mode_port = getattr(robot, "mode_port", getattr(getattr(self.ctx, "runtime", None), "cfg", None).mode_port if hasattr(getattr(self.ctx, "runtime", None), "cfg") else 6000)
         subtask_info = ""
         if self._subtasks_enabled:
             total_phases = len(self._subtask_list)
@@ -1959,13 +2344,14 @@ class InteractiveSession:
         transfer_info = ""
         if self._transfer_mode:
             transfer_info = (
-                "Task Mode: WATER BOTTLE TRANSFER (跨桌水瓶转运)\n"
-                "  • 阶段流程: 桌A夹水瓶 → 自动夹紧回默认位 → 导航至桌B(输入 'd' 回车) → 恢复姿态 → 桌B放置\n"
-                "  • 快捷指令: 's' 启动推理 | 'd' 导航到达桌B | 'r' 复位 | 'q' 退出\n"
+                "Task Mode: WATER BOTTLE TRANSFER (跨桌水瓶转运 - JEV双桌感知与自动进入模式)\n"
+                f"  • 自动监听 {mode_port} 端口: 手柄切入 VLA 模式时自动触发 JEV 视觉感知，无需手动按 'd'！\n"
+                "    ├─ 桌1 (夹爪未抓): JEV 视觉确认桌上有水瓶 -> 自动切入 VLA 夹取 (Phase 0)\n"
+                "    └─ 桌2 (夹爪持瓶): JEV 视觉确认桌上有目标盒子 -> 自动切入 VLA 放置 (Phase 4)\n"
+                "    └─ 若未检测到目标，机械臂严格保持当前姿态与夹持力！\n"
+                "  • 快捷指令: 'd' 强制确认/跳过等待 | 's' 启动 | 'r' 复位 | 'q' 退出\n"
             )
         mode_info = ""
-        robot = self.robot_wrapper
-        mode_port = getattr(robot, "mode_port", getattr(getattr(self.ctx, "runtime", None), "cfg", None).mode_port if hasattr(getattr(self.ctx, "runtime", None), "cfg") else 6000)
         if self._auto_mode:
             mode_info = (
                 "Deploy Mode: AUTO (★ 自动模式已激活)\n"

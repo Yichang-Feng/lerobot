@@ -111,6 +111,10 @@ class ThreadSafeRobot:
         if hasattr(self._robot, "trigger_engagement_smoothing"):
             self._robot.trigger_engagement_smoothing()
 
+    def register_mode_change_callback(self, callback: Any) -> None:
+        if hasattr(self._robot, "register_mode_change_callback"):
+            self._robot.register_mode_change_callback(callback)
+
     @property
     def right_gripper_position(self) -> float:
         return getattr(self._robot, "right_gripper_position", 5.0)

@@ -456,6 +456,14 @@ class UnitreeG1Client(Robot):
         # Camera frame cache to ensure observations remain complete even during transient packet drops
         self._last_camera_frames: dict[str, Any] = {}
         self._last_sent_action: dict[str, float] = {}
+        self._mode_change_callbacks: list[Any] = []
+
+    def register_mode_change_callback(self, callback: Any) -> None:
+        """Register a callback invoked when robot mode changes on mode_port.
+        Signature: callback(old_mode: RobotMode, new_mode: RobotMode, raw_preview: str)
+        """
+        if callback not in self._mode_change_callbacks:
+            self._mode_change_callbacks.append(callback)
 
     @property
     def right_gripper_position(self) -> float:
@@ -871,6 +879,13 @@ class UnitreeG1Client(Robot):
                                 self._has_sent_action_since_idle = False
                                 with self._engagement_lock:
                                     self._engagement_smoothing_active = False
+
+                            # Notify registered mode change callbacks
+                            for cb in list(self._mode_change_callbacks):
+                                try:
+                                    cb(old_mode, new_mode, raw_preview)
+                                except Exception as exc:
+                                    logger.warning("Error in mode change callback: %s", exc)
             except zmq.ContextTerminated:
                 break
             except (zmq.ZMQError, OSError):
