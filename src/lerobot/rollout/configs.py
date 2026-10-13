@@ -341,11 +341,17 @@ class RolloutConfig:
     record: bool = False
     record_diagnostics: bool = False
     diagnostics_dir: str | None = None
+    record_dir: str | None = None
 
     def __post_init__(self):
         """Validate config invariants and load the policy config from ``--policy.path``."""
-        if self.record:
+        if self.record or self.record_dir:
+            self.record = True
             self.record_diagnostics = True
+            if not self.record_dir and self.diagnostics_dir:
+                self.record_dir = self.diagnostics_dir
+            if not self.diagnostics_dir and self.record_dir:
+                self.diagnostics_dir = self.record_dir
 
         if self.interpolation_multiplier < 1:
             raise ValueError(f"interpolation_multiplier must be >= 1, got {self.interpolation_multiplier}")

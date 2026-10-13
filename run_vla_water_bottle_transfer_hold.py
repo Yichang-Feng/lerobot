@@ -32,13 +32,23 @@ run_vla_water_bottle_transfer_hold.py
   'q' (回车) : 安全停止并退出 (/stop)
   (直接回车) : 即时查看当前转运阶段与夹爪角度状态
 
-使用示例:
+使用示例 (常规运行):
   python run_vla_water_bottle_transfer_hold.py \\
       --robot_ip=10.3.42.221 \\
       --policy.path=outputs/train/pi05_lora_5090_g1_pick_put_dex1_subtasks/merged_model \\
       --valen_evaluator=true \\
       --valen_ip=0.0.0.0 \\
       --valen_port=5559
+
+使用示例 (无UI纯后台 + 全程高精度录制对齐):
+  ./run_dex1_water_bottle_transfer_hold.sh \\
+      --robot_ip=10.3.42.221 \\
+      --policy.path=outputs/train/pi05_lora_5090_g1_pick_put_dex1_subtasks/merged_model \\
+      --valen_evaluator=true \\
+      --valen_ip=0.0.0.0 \\
+      --valen_port=5559 \\
+      --record=true \\
+      --display_data=false
 """
 
 import argparse
@@ -106,6 +116,8 @@ def main() -> None:
                         default="pick up the water bottle from the table and place it into the blue box")
     parser.add_argument("--subtask_homing_duration", type=float, default=2.5, help="回默认位置插值时长 (s)")
     parser.add_argument("--transfer_hud", action="store_true", default=False, help="是否打印 1.5s 周期性 HUD (默认关闭，保持终端整洁)")
+    parser.add_argument("--record", default="false", help="是否开启全程数据录制 (三路相机MP4+29关节NPY/CSV+手柄模式+JEV判定，默认 false)")
+    parser.add_argument("--record_dir", default="", help="录制数据保存目录 (留空自动在 outputs/recordings/ 生成带时间戳目录)")
 
     args, unknown_args = parser.parse_known_args()
 
@@ -201,6 +213,13 @@ def main() -> None:
     ]
     if arm_only_flag:
         base_cmd.append("--robot.arm_only=true")
+
+    record_enabled = args.record.lower() in ("true", "1", "yes")
+    if record_enabled:
+        base_cmd.append("--record=true")
+        if args.record_dir:
+            base_cmd.append(f"--record_dir={args.record_dir}")
+
     base_cmd += unknown_args
 
     print("=" * 80)
@@ -208,6 +227,9 @@ def main() -> None:
     print(f" 模型路径 : {policy_path.resolve()}")
     print(f" 机器人IP : {robot_ip} (状态: {args.state_port}, 动作: {args.action_port})")
     print(f" 视觉机位 : 全局主摄({args.camera_port}) | 左腕({args.left_wrist_port}) | 右腕({args.right_wrist_port})")
+    if record_enabled:
+        rec_dir_str = args.record_dir if args.record_dir else "outputs/recordings/<timestamp> (自动生成)"
+        print(f" 全程录制 : 启用 [3路相机MP4 + 29关节NPY/CSV + 手柄状态 + JEV判定] -> {rec_dir_str}")
     if valen_enabled:
         print(f" 决策大脑 : Valen JEV ({args.valen_ip}:{args.valen_port})")
     print(" 控制机制 :")

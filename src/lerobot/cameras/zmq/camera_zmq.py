@@ -127,6 +127,7 @@ class ZMQCamera(Camera):
         try:
             self.context = zmq.Context()
             self.socket = self.context.socket(zmq.SUB)
+            self.socket.setsockopt(zmq.LINGER, 0)
             self.socket.setsockopt_string(zmq.SUBSCRIBE, "")
             self.socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
             self.socket.setsockopt(zmq.CONFLATE, True)
@@ -134,19 +135,28 @@ class ZMQCamera(Camera):
             self._connected = True
 
             # Auto-detect or synchronize resolution from incoming stream
-            temp_frame = self._read_from_hardware()
-            h, w = temp_frame.shape[:2]
-            if self.width is None or self.height is None:
-                self.height = h
-                self.width = w
-                logger.info(f"{self} resolution detected: {w}x{h}")
-            elif (w, h) != (self.width, self.height):
-                logger.info(
-                    f"{self} configured for {self.width}x{self.height}, but incoming stream is {w}x{h}. "
-                    f"Syncing camera resolution to actual stream {w}x{h}."
-                )
-                self.width = w
-                self.height = h
+            if warmup:
+                temp_frame = self._read_from_hardware()
+                h, w = temp_frame.shape[:2]
+                if self.width is None or self.height is None:
+                    self.height = h
+                    self.width = w
+                    logger.info(f"{self} resolution detected: {w}x{h}")
+                elif (w, h) != (self.width, self.height):
+                    logger.info(
+                        f"{self} configured for {self.width}x{self.height}, but incoming stream is {w}x{h}. "
+                        f"Syncing camera resolution to actual stream {w}x{h}."
+                    )
+                    self.width = w
+                    self.height = h
+            elif self.width is None or self.height is None:
+                try:
+                    temp_frame = self._read_from_hardware()
+                    h, w = temp_frame.shape[:2]
+                    self.height = h
+                    self.width = w
+                except Exception:
+                    pass
 
             self._start_read_thread()
             logger.info(f"{self} connected.")
@@ -170,11 +180,35 @@ class ZMQCamera(Camera):
         """Clean up ZMQ resources."""
         self._connected = False
         if self.socket:
-            self.socket.close()
+            self.socket.close(linger=0)
             self.socket = None
         if self.context:
             self.context.term()
             self.context = None
+
+    def _reconnect_socket(self) -> None:
+        """Close and recreate ZMQ SUB socket to ensure clean reconnection when remote publisher restarts."""
+        try:
+            if self.socket is not None:
+                self.socket.close(linger=0)
+                self.socket = None
+        except Exception:
+            pass
+
+        if self.context is None or getattr(self.context, "closed", False):
+            self.context = zmq.Context()
+
+        try:
+            self.socket = self.context.socket(zmq.SUB)
+            self.socket.setsockopt(zmq.LINGER, 0)
+            self.socket.setsockopt_string(zmq.SUBSCRIBE, "")
+            self.socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
+            self.socket.setsockopt(zmq.CONFLATE, True)
+            self.socket.connect(f"tcp://{self.server_address}:{self.port}")
+            self._connected = True
+            logger.info("🔄 [%s] ZMQ Socket 已重建重连至 tcp://%s:%d", self, self.server_address, self.port)
+        except Exception as e:
+            logger.debug("Failed to reconnect %s: %s", self, e)
 
     @staticmethod
     def find_cameras() -> list[dict[str, Any]]:
@@ -186,12 +220,19 @@ class ZMQCamera(Camera):
     def _read_from_hardware(self) -> NDArray[Any]:
         """
         Reads a single frame directly from the ZMQ socket.
+        Drains any queued backlogs to guarantee processing the freshest frame.
         """
         if not self.is_connected or self.socket is None:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         try:
             message = self.socket.recv_string()
+            # Drain any further pending messages in non-blocking mode to keep only the newest
+            while True:
+                try:
+                    message = self.socket.recv_string(zmq.NOBLOCK)
+                except zmq.Again:
+                    break
         except zmq.Again as e:
             raise TimeoutError(f"{self} timeout after {self.timeout_ms}ms") from e
 
@@ -252,36 +293,52 @@ class ZMQCamera(Camera):
     def _read_loop(self) -> None:
         """
         Internal loop run by the background thread for asynchronous reading.
+        Resilient: does not terminate when remote camera server restarts.
         """
         stop_event = self.stop_event
         if stop_event is None:
             raise RuntimeError(f"{self}: stop_event is not initialized.")
 
         failure_count = 0
+        last_warn_time = 0.0
         while not stop_event.is_set():
             try:
                 frame = self._read_from_hardware()
                 capture_time = time.perf_counter()
 
+                h, w = frame.shape[:2]
+                if self.width != w or self.height != h:
+                    self.width = w
+                    self.height = h
+
                 with self.frame_lock:
                     self.latest_frame = frame
                     self.latest_timestamp = capture_time
                 self.new_frame_event.set()
-                failure_count = 0
+
+                if failure_count > 0:
+                    logger.info("✅ [%s] 视频流已恢复接收 (经 %d 次重试后正常拉流)", self, failure_count)
+                    failure_count = 0
 
             except DeviceNotConnectedError:
                 break
             except (TimeoutError, Exception) as e:
-                # If we haven't received the first frame yet, keep waiting without killing the thread
-                if self.latest_frame is None:
-                    time.sleep(0.1)
-                    continue
-                if failure_count <= 10:
-                    failure_count += 1
-                    logger.warning(f"Read error: {e}")
-                else:
-                    logger.error(f"{self} exceeded maximum consecutive read failures (10).")
-                    break
+                failure_count += 1
+                now = time.time()
+                if now - last_warn_time >= 3.0:
+                    last_warn_time = now
+                    logger.warning(
+                        "⚠️ [%s] 相机读帧失败 (%s, 连续失败 %d 次)，保持重试并尝试重新建立连接...",
+                        self,
+                        e,
+                        failure_count,
+                    )
+
+                # 每连续失败 3 次 (例如远端推流服务重启)，主动重置并重建 ZMQ Socket
+                if failure_count % 3 == 0:
+                    self._reconnect_socket()
+
+                time.sleep(0.05)
 
     def _start_read_thread(self) -> None:
         if self.stop_event is not None:

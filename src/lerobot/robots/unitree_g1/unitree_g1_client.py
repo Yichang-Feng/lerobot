@@ -455,6 +455,7 @@ class UnitreeG1Client(Robot):
 
         # Camera frame cache to ensure observations remain complete even during transient packet drops
         self._last_camera_frames: dict[str, Any] = {}
+        self._last_camera_timestamps: dict[str, float] = {}
         self._last_sent_action: dict[str, float] = {}
         self._mode_change_callbacks: list[Any] = []
 
@@ -1304,26 +1305,49 @@ class UnitreeG1Client(Robot):
         obs["imu.rpy.yaw"] = rpy[2]
 
         # 3. Read camera image frames
+        now_ts = time.time()
         for cam_name, cam in self._cameras.items():
+            thread_dead = hasattr(cam, "thread") and (cam.thread is None or not cam.thread.is_alive())
+            not_connected = not getattr(cam, "is_connected", False) or thread_dead
+            if not_connected:
+                # Watchdog: auto-heal disconnected camera or dead reader thread
+                if now_ts - getattr(self, f"_last_cam_reconnect_{cam_name}", 0.0) > 3.0:
+                    setattr(self, f"_last_cam_reconnect_{cam_name}", now_ts)
+                    logger.warning("🔄 [UnitreeG1Client] 相机 [%s] 线程未运行或已断连，尝试自愈重连...", cam_name)
+                    try:
+                        if hasattr(cam, "disconnect"):
+                            cam.disconnect()
+                        if hasattr(cam, "connect"):
+                            cam.connect(warmup=False)
+                    except Exception as rec_err:
+                        logger.debug("Auto-heal reconnect for %s failed: %s", cam_name, rec_err)
+
             try:
                 if getattr(cam, "is_connected", True):
                     if getattr(cam, "use_rgb", True):
                         frame = cam.read_latest()
                         obs[cam_name] = frame
                         self._last_camera_frames[cam_name] = frame
+                        self._last_camera_timestamps[cam_name] = now_ts
                     if getattr(cam, "use_depth", False):
                         depth_frame = cam.read_latest_depth()
                         obs[f"{cam_name}_depth"] = depth_frame
                         self._last_camera_frames[f"{cam_name}_depth"] = depth_frame
+                        self._last_camera_timestamps[f"{cam_name}_depth"] = now_ts
             except Exception as e:
-                # If reading latest frame fails or times out momentarily, reuse last valid frame to prevent dropping observation
-                if cam_name in self._last_camera_frames:
+                # If reading latest frame fails or times out momentarily, only reuse if frame is fresh (< 1.0s)
+                last_ts = self._last_camera_timestamps.get(cam_name, 0.0)
+                frame_age = now_ts - last_ts
+                if cam_name in self._last_camera_frames and frame_age <= 1.0:
                     obs[cam_name] = self._last_camera_frames[cam_name]
-                    logger.debug("Camera %s read failed (%s); reusing previous valid frame.", cam_name, e)
+                    logger.debug("Camera %s read failed (%s); reusing previous valid frame (age=%.2fs).", cam_name, e, frame_age)
                 else:
-                    logger.debug("Failed to read camera %s: %s", cam_name, e)
+                    if now_ts - getattr(self, f"_last_stale_warn_{cam_name}", 0.0) > 3.0:
+                        setattr(self, f"_last_stale_warn_{cam_name}", now_ts)
+                        logger.warning("⚠️ [UnitreeG1Client] 相机 [%s] 掉线/读帧失败 (超 %.1fs)，暂停提供过时历史帧以防误判！", cam_name, frame_age)
                 if getattr(cam, "use_depth", False) and f"{cam_name}_depth" in self._last_camera_frames:
-                    obs[f"{cam_name}_depth"] = self._last_camera_frames[f"{cam_name}_depth"]
+                    if frame_age <= 1.0:
+                        obs[f"{cam_name}_depth"] = self._last_camera_frames[f"{cam_name}_depth"]
 
         # 4. Parse Gripper state (if enabled)
         if self.config.enable_gripper:
