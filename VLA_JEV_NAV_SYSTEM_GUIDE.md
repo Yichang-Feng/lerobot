@@ -981,857 +981,176 @@ python dataset_tools/replay_recorded_session.py --export_mosaic outputs/replay_m
 
 ### 6.5 图形化控制台与多机监控前端 (PySide6 VLA Viewer)
 
-#### 1. 前端设计与核心功能
-为简化操作员在长程多工位实验中的交互负担，系统提供了专用的桌面端图形监控界面 `vla_viewer.py`（基于 PySide6 构建）：
-- **3 路高清视频实时回显**：直接基于 ZMQ SUB 订阅机载 Orin 的 5556（头部全局主摄）、5557（左腕）、5558（右腕）视频流，零侵入原有控制流，具备帧率（FPS）与延迟实时监控；
-- **遥测数据与工位状态 HUD**：订阅 6001 端口，实时监控双臂 29 轴物理关节状态与夹爪开合度；
-- **主程序子进程生命周期托管**：一键启动/停止 `run_dex1_water_bottle_transfer_hold.sh`，控制台日志流式高亮输出（保留 ANSI 彩色高亮）；
-- **全键盘快捷键一键触发**：界面集成 `s`（强制抓取）、`d`（确认到达）、`r`（彻底重置）、`Enter`（查询状态）、`q`（安全退出）物理按键映射与快捷按钮。
+系统提供了专用的桌面端图形监控与全流程交互界面 [vla_viewer.py](./vla_viewer.py) 与数据层核心 [vla_io.py](./vla_io.py)（基于 PySide6 + pyzmq 构建），专为 Unitree G1 Dex-1 真实环境下的长程多工位（VLA 操作 + JEV 语义判定 + 底盘导航）闭环演示设计。
 
-#### 2. 启动方式
+#### 1. 核心设计与架构规范
+
+界面采用**数据层与展示层彻底分离**的模块化设计，遵循**“录制原始数据，展示端实时解析”**的核心原则：
+
+```
+                    ┌── 相机 ×3 (5555/5557/5558)
+                    ├── 机器人状态 (6001)
+                    ├── JEV 判定广播 (5560)
+                    ├── 主程序管道 stdout/stderr
+                    └── 操作员指令 (stdin)
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      Hub 数据中枢 (vla_io.py)               │
+│   - 非阻塞 ZMQ 订阅队列 (SubThread)                         │
+│   - 媒体时间统一对齐与插值                                  │
+└──────────────┬──────────────────────────────┬───────────────┘
+               │ (Live 实时驱动)               │ (后台写入)
+               ▼                              ▼
+┌─────────────────────────────┐  ┌────────────────────────────┐
+│   MainWindow 界面 (30Hz)    │  │   Recorder 原始会话录制器    │
+│   - 三路相机 4:3 动态纠偏   │  │   - meta.json / events.jsonl   │
+│   - PhaseFlow 状态机连线图  │  │   - cam*.mjpg / idx 精准索引   │
+│   - JEV 概率柱状图 & 耗时   │  │   - jev.mjpg 视觉输入帧        │
+│   - ANSI 彩色控制台输出     │  └─────────────┬──────────────┘
+│   - 遥测 HUD & 夹爪动量条   │                │
+└──────────────▲──────────────┘                │ (离线回放 / 导出)
+               │                               ▼
+┌──────────────┴──────────────────────────────────────────────┐
+│                    Player 回放播放器 (vla_io.py)             │
+│   - 支持交互式进度拖动、快进快退、离线无头批量导出 MP4 视频  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 2. 界面布局与核心组件
+
+界面默认采用 **12:9（1440×1080）影视级高信息密度演示布局**（预留右侧 1/4 区域供后期画中画拼接外部实拍成片）：
+
+1. **顶部三路高清视频流（4:3 等比排列）**：
+   - 包含**左腕视角**、**头部全局主视**、**右腕视角**。
+   - 自动检测机载 OpenCV BGR 编码并转为标准 RGB 真实色彩显示。
+   - 具备 1 秒心跳检测：当某路相机断流时自动覆盖暗色“无信号”安全遮罩。
+2. **左下侧：指令控制与日志控制台**：
+   - **动态字号指令输入框 (`PromptEdit`)**：字号自适应，回车即可将文本或任务快速注入主程序 stdin。
+   - **一键生命周期管理**：提供 `▶ 启动 VLA`、`■ 停止` 与 `⟲ Reset 复位 (快捷键 r)` 控制按钮。
+   - **彩色高亮控制台**：3000 行环形缓冲，原生保留 ANSI 颜色高亮，支持流式平滑渲染。
+3. **右下侧：三合一决策与遥测 HUD 面板**：
+   - **有限状态机流转卡 (`PhaseFlow`)**：以拓扑节点连线直观呈现当前工位流转（`待命` → `识别水瓶` → `抓取水瓶` → `导航转运` → `识别收纳盒` → `放置水瓶` → `复位完成`），当前阶段带呼吸光晕高亮。
+   - **JEV 视觉多模态判断卡**：直连 `valen_remote_service.py` 的 5560 端口 PUB 广播（`[JSON, JPEG]`），实时展示判定问题、各候选概率分布条（`OptionBars`）、推理耗时（ms）与连续达标命中计数；若未启用直连端口则自动降级解析主程序 stdout 规则日志。
+   - **机器人硬件遥测卡**：实时监听 6001 端口广播，显示相机链路在线数、遥测频率（Hz）、操作模式徽章（`VLA` / `NAV` / `GAMEPAD`）、左右夹爪开合度实时动量条及关键臂部关节角度。
+
+---
+
+#### 3. 运行指南
+
+##### 1) 真机联调运行（一键启动并自动录制）
 ```bash
 conda activate lerobot
 cd ~/lerobot
-python vla_viewer.py --robot_ip=10.3.42.221
+
+# 启动界面（默认连接 10.3.42.221，点击「▶ 启动」后自动开启录制）
+python vla_viewer.py
+
+# 指定机器人 IP 与自定义头部相机推流端口
+python vla_viewer.py --robot-ip=10.3.42.221 --head-port=5556
+
+# 无边框录屏模式（固定 1440x1080 贴左上角，适合 OBS / 录屏软件截取）
+python vla_viewer.py --frameless
+
+# 自定义窗口分辨率（默认自适应屏幕工作区高度）
+python vla_viewer.py --size 1200x900
 ```
 
-#### 3. 前端完整源码 (`vla_viewer.py`)
-```python
-"""
-G1 Dex-1 VLA 控制台（PySide6）
-
-集成方式（主程序零改动）：
-  1. 相机：直接订阅机载 Orin 的 ZMQ PUB 端口 5555 / 5557 / 5558（PUB 支持多个订阅者，不影响主程序）
-  2. 机器人状态：订阅 6001 端口（模式 / 关节广播）
-  3. 主程序：界面用 QProcess 启动 run_dex1_water_bottle_transfer_hold.sh，
-     - stdout/stderr 实时显示在「程序输出」（保留 ANSI 颜色）
-     - 按钮 s / d / r / 回车 / q 直接写入主程序 stdin，等同于在终端里敲键
-
-运行：
-  pip install PySide6 pyzmq
-  python vla_viewer.py                 # 连接真机（参数见 CONFIG 或命令行）
-  python vla_viewer.py --mock          # 本地模拟（先另开终端运行 python mock_robot.py）
-"""
-import argparse
-import base64
-import html
-import json
-import os
-import re
-import sys
-import threading
-import time
-from collections import deque
-
-# 自动处理 Conda/虚拟环境下 Qt xcb 插件与系统 libxkbcommon 的 ABI 冲突（避免段错误）
-if __name__ == "__main__" and sys.argv and sys.argv[0] != "-c":
-    _env_lib = os.path.join(sys.prefix, "lib")
-    _current_ld = os.environ.get("LD_LIBRARY_PATH", "")
-    if os.path.isdir(_env_lib) and _env_lib not in _current_ld.split(":") and not os.environ.get("_VLA_REEXEC"):
-        os.environ["_VLA_REEXEC"] = "1"
-        os.environ["LD_LIBRARY_PATH"] = f"{_env_lib}:{_current_ld}".strip(":")
-        os.execv(sys.executable, [sys.executable] + sys.argv)
-
-import zmq
-from PySide6.QtCore import Qt, QTimer, QProcess, QProcessEnvironment
-from PySide6.QtGui import QImage, QPixmap, QFont, QTextCursor
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QLabel, QPushButton, QPlainTextEdit, QLineEdit,
-    QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QSplitter, QFrame, QCheckBox,
-)
-
-def _detect_conda_sh():
-    for candidate in [
-        "~/miniforge3/etc/profile.d/conda.sh",
-        "~/miniconda3/etc/profile.d/conda.sh",
-        "~/anaconda3/etc/profile.d/conda.sh",
-        "/opt/conda/etc/profile.d/conda.sh",
-    ]:
-        if os.path.exists(os.path.expanduser(candidate)):
-            return candidate
-    return "~/miniforge3/etc/profile.d/conda.sh"
-
-_conda_sh = _detect_conda_sh()
-_project_dir = os.path.dirname(os.path.abspath(__file__))
-
-# ============================================================
-# 配置（也可用命令行参数覆盖）
-# ============================================================
-DEFAULT_ROBOT_IP = "192.168.31.248"
-
-CONFIG = dict(
-    robot_ip=DEFAULT_ROBOT_IP,
-    cameras=[
-        ("头部相机 · base_0_rgb", 5556),
-        ("左腕相机 · left_wrist_0_rgb", 5557),
-        ("右腕相机 · right_wrist_0_rgb", 5558),
-    ],
-    state_port=6001,
-    mode_port=6000,
-    # 主程序启动命令（通过 bash -lc 执行，可以 source conda）
-    # --display_data=false：关闭 Rerun，画面统一由本界面显示
-    main_cmd=(
-        f"source {_conda_sh} && conda activate lerobot && cd {_project_dir} && "
-        "./run_dex1_water_bottle_transfer_hold.sh "
-        f"--robot_ip={DEFAULT_ROBOT_IP} "
-        "--policy.path=outputs/train/pi05_lora_5090_g1_pick_put_dex1_subtasks/merged_model "
-        "--valen_evaluator=true --valen_ip=0.0.0.0 --valen_port=5559 "
-        "--display_data=false"
-    ),
-)
-
-# 主程序键盘命令（文档 6.2 节）
-QUICK_CMDS = [
-    ("开始抓取  s", "s", "旁路 JEV，直接开始 Phase 0 桌1抓取"),
-    ("到达桌2  d", "d", "旁路 JEV，解除 Phase 2 阻塞，接管桌2放置"),
-    ("彻底重置  r", "r", "打断轮询，Phase 归零，机械臂回位"),
-    ("查询状态  ↵", "", "输出当前阶段、夹爪弧度、肩部角度"),
-]
-
-UI_FPS = 30
-
-
-# ============================================================
-# 图像解码：兼容 原始 JPEG / base64 JPEG / JSON 包裹 / multipart
-# ============================================================
-def _is_img(b):
-    return b[:3] == b"\xff\xd8\xff" or b[:4] == b"\x89PNG"
-
-
-def _b64(s):
-    try:
-        b = base64.b64decode(s, validate=False)
-    except Exception:
-        return None
-    return b if _is_img(b) else None
-
-
-def _extract_img_bytes_from_obj(obj):
-    """递归从 JSON 对象（如 {'images': {'cam_name': '<base64>'}}）中提取图像数据"""
-    if isinstance(obj, str):
-        if len(obj) > 100:
-            b = _b64(obj.encode())
-            if b:
-                return b
-        return None
-    elif isinstance(obj, dict):
-        if "images" in obj and isinstance(obj["images"], dict):
-            for v in obj["images"].values():
-                b = _extract_img_bytes_from_obj(v)
-                if b:
-                    return b
-        for v in obj.values():
-            b = _extract_img_bytes_from_obj(v)
-            if b:
-                return b
-    elif isinstance(obj, list):
-        for v in obj:
-            b = _extract_img_bytes_from_obj(v)
-            if b:
-                return b
-    return None
-
-
-def find_image_bytes(parts):
-    for data in reversed(parts):
-        if _is_img(data):
-            return data
-        s = data.strip()
-        if s.startswith(b"{"):
-            try:
-                obj = json.loads(s)
-            except Exception:
-                obj = None
-            if obj is not None:
-                b = _extract_img_bytes_from_obj(obj)
-                if b:
-                    return b
-        b = _b64(s)
-        if b:
-            return b
-        if b" " in s[:64]:  # "topic <base64>" 形式
-            b = _b64(s.split(b" ", 1)[1])
-            if b:
-                return b
-    return None
-
-
-# ============================================================
-# ZMQ 接收线程：只保留最新一帧，界面定时拉取
-# ============================================================
-class Receiver(threading.Thread):
-    def __init__(self, ctx, addr):
-        super().__init__(daemon=True)
-        self.ctx, self.addr = ctx, addr
-        self.lock = threading.Lock()
-        self.stamps = deque()
-        self.running = True
-        self.error = None
-        self.last_rx = 0.0
-
-    def rate(self):
-        now = time.time()
-        with self.lock:
-            while self.stamps and now - self.stamps[0] > 1.0:
-                self.stamps.popleft()
-            return len(self.stamps)
-
-    def handle(self, parts):
-        raise NotImplementedError
-
-    def run(self):
-        sock = self.ctx.socket(zmq.SUB)
-        sock.setsockopt(zmq.RCVHWM, 4)
-        sock.setsockopt(zmq.LINGER, 0)
-        sock.setsockopt_string(zmq.SUBSCRIBE, "")
-        sock.connect(self.addr)
-        poller = zmq.Poller()
-        poller.register(sock, zmq.POLLIN)
-        while self.running:
-            if not poller.poll(200):
-                continue
-            parts = None
-            while True:  # 取走所有积压，只处理最新一条
-                try:
-                    parts = sock.recv_multipart(zmq.NOBLOCK)
-                except zmq.Again:
-                    break
-            if parts is None:
-                continue
-            try:
-                self.handle(parts)
-            except Exception as e:
-                self.error = f"{type(e).__name__}: {e}"
-        sock.close()
-
-
-class CameraReceiver(Receiver):
-    def __init__(self, ctx, addr):
-        super().__init__(ctx, addr)
-        self.image = None
-
-    def handle(self, parts):
-        data = find_image_bytes(parts)
-        if data is None:
-            p = parts[-1]
-            self.error = f"无法解析图像（{len(p)} bytes，开头 {p[:12]!r}）"
-            return
-        img = QImage.fromData(data)
-        if img.isNull():
-            self.error = "图像解码失败"
-            return
-        # 相机源端采用 OpenCV BGR 编码，调换红蓝通道恢复正常 RGB 色彩
-        img = img.rgbSwapped()
-        with self.lock:
-            self.image = img
-            self.stamps.append(time.time())
-        self.last_rx = time.time()
-        self.error = None
-
-    def latest(self):
-        with self.lock:
-            return self.image
-
-
-class StateReceiver(Receiver):
-    """6001 状态广播；格式未定，尽量从 JSON 里找模式字段"""
-
-    def __init__(self, ctx, addr):
-        super().__init__(ctx, addr)
-        self.state = None
-
-    def handle(self, parts):
-        raw = parts[-1]
-        try:
-            obj = json.loads(raw)
-        except Exception:
-            obj = {"_raw_bytes": len(raw)}
-        with self.lock:
-            self.state = obj
-            self.stamps.append(time.time())
-        self.last_rx = time.time()
-
-    def latest(self):
-        with self.lock:
-            return self.state
-
-
-def parse_mode_string(raw_str):
-    """规范化模式名称 (VLA / NAV / GAMEPAD)"""
-    s = str(raw_str).strip().lower()
-    if "vla" in s:
-        return "VLA"
-    if "nav" in s or "daohang" in s:
-        return "NAV"
-    if "gamepad" in s or "manual" in s or "teleop" in s or "shoubing" in s or "joystick" in s:
-        return "GAMEPAD"
-    return s.upper() if s else "UNKNOWN"
-
-
-class ModeReceiver(Receiver):
-    """6000 模式广播监听（PUB/SUB: {'state':'gamepad'/'vla'/'nav'} 等）"""
-
-    def __init__(self, ctx, addr):
-        super().__init__(ctx, addr)
-        self.mode = None
-
-    def handle(self, parts):
-        for part in reversed(parts):
-            try:
-                s = part.decode("utf-8", "ignore").strip()
-            except Exception:
-                continue
-            if not s:
-                continue
-            if "{" in s and "}" in s:
-                try:
-                    first_b = s.find("{")
-                    last_b = s.rfind("}")
-                    obj = json.loads(s[first_b : last_b + 1])
-                    if isinstance(obj, dict):
-                        for k in ("state", "mode", "robot_mode", "status", "action"):
-                            if k in obj:
-                                m = parse_mode_string(str(obj[k]))
-                                with self.lock:
-                                    self.mode = m
-                                    self.stamps.append(time.time())
-                                self.last_rx = time.time()
-                                return
-                except Exception:
-                    pass
-            m = parse_mode_string(s)
-            if m != "UNKNOWN":
-                with self.lock:
-                    self.mode = m
-                    self.stamps.append(time.time())
-                self.last_rx = time.time()
-                return
-
-    def latest(self):
-        with self.lock:
-            return self.mode
-
-
-# ============================================================
-# ANSI 彩色输出 → HTML
-# ============================================================
-ANSI_RE = re.compile(r"\x1b\[([0-9;?]*)([A-Za-z])")
-ANSI_COLORS = {30: "#8b9097", 31: "#ff6b6b", 32: "#5fd38d", 33: "#f2c94c",
-               34: "#5aa9ff", 35: "#d08bff", 36: "#4fd1d9", 37: "#e6e7ea"}
-
-
-def _esc(s):
-    return html.escape(s).replace(" ", "&nbsp;")
-
-
-def ansi_to_html(s):
-    out, pos, color, bold, open_span = [], 0, None, False, False
-    for m in ANSI_RE.finditer(s):
-        out.append(_esc(s[pos:m.start()]))
-        pos = m.end()
-        if m.group(2) != "m":
-            continue
-        codes = [int(c) for c in m.group(1).split(";") if c.isdigit()] or [0]
-        for c in codes:
-            if c == 0:
-                color, bold = None, False
-            elif c == 1:
-                bold = True
-            elif c == 22:
-                bold = False
-            elif c == 39:
-                color = None
-            elif 30 <= c <= 37:
-                color = ANSI_COLORS[c]
-            elif 90 <= c <= 97:
-                color = ANSI_COLORS[c - 60]
-        if open_span:
-            out.append("</span>")
-            open_span = False
-        if color or bold:
-            st = (f"color:{color};" if color else "") + ("font-weight:700;" if bold else "")
-            out.append(f'<span style="{st}">')
-            open_span = True
-    out.append(_esc(s[pos:]))
-    if open_span:
-        out.append("</span>")
-    return "".join(out)
-
-
-def strip_ansi(s):
-    return ANSI_RE.sub("", s)
-
-
-# ============================================================
-# 界面组件
-# ============================================================
-class CameraView(QFrame):
-    def __init__(self, title, addr):
-        super().__init__()
-        self.setObjectName("card")
-        t = QLabel(title)
-        t.setObjectName("cardTitle")
-        self.info = QLabel("连接中…")
-        self.info.setObjectName("muted")
-        head = QHBoxLayout()
-        head.addWidget(t)
-        head.addStretch()
-        head.addWidget(self.info)
-        self.view = QLabel(f"等待画面\n{addr}")
-        self.view.setAlignment(Qt.AlignCenter)
-        self.view.setObjectName("camView")
-        self.view.setMinimumSize(240, 180)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(8, 6, 8, 8)
-        lay.setSpacing(6)
-        lay.addLayout(head)
-        lay.addWidget(self.view, 1)
-
-    def update_from(self, rx: CameraReceiver):
-        img = rx.latest()
-        stale = time.time() - rx.last_rx > 1.0
-        if rx.error:
-            new_info = f"⚠ {rx.error}"
-        elif img is None:
-            new_info = "无信号"
-        else:
-            new_info = ("⚠ 已中断  " if stale else "") + f"{img.width()}×{img.height()}  {rx.rate()} fps"
-        if self.info.text() != new_info:
-            self.info.setText(new_info)
-        if img is not None:
-            pix = QPixmap.fromImage(img).scaled(self.view.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self.view.setPixmap(pix)
-
-
-class Badge(QLabel):
-    def __init__(self, text=""):
-        super().__init__(text)
-        self.setObjectName("badge")
-        self._level = "neutral"
-
-    def set(self, text, level="neutral"):
-        if self.text() == text and self._level == level:
-            return
-        self.setText(text)
-        if self._level != level:
-            self._level = level
-            self.setProperty("level", level)
-            self.style().unpolish(self)
-            self.style().polish(self)
-
-
-class MainWindow(QMainWindow):
-    def __init__(self, cfg):
-        super().__init__()
-        self.cfg = cfg
-        self._refresh_count = 0
-        self.setWindowTitle("G1 Dex-1 VLA Console")
-        self.resize(1440, 900)
-
-        # ---- ZMQ 接收 ----
-        self.ctx = zmq.Context.instance()
-        ip = cfg["robot_ip"]
-        self.cam_rx = [CameraReceiver(self.ctx, f"tcp://{ip}:{p}") for _, p in cfg["cameras"]]
-        self.state_rx = StateReceiver(self.ctx, f"tcp://{ip}:{cfg['state_port']}")
-        self.mode_rx = ModeReceiver(self.ctx, f"tcp://{ip}:{cfg.get('mode_port', 6000)}")
-        self.current_mode = "未知"
-        for r in self.cam_rx + [self.state_rx, self.mode_rx]:
-            r.start()
-
-        # ---- 相机区 ----
-        self.cams = [CameraView(n, f"tcp://{ip}:{p}") for n, p in cfg["cameras"]]
-        cam_row = QWidget()
-        g = QGridLayout(cam_row)
-        g.setContentsMargins(0, 0, 0, 0)
-        g.setSpacing(10)
-        for i, c in enumerate(self.cams):
-            g.addWidget(c, 0, i)
-
-        # ---- 状态条 ----
-        self.b_proc = Badge()
-        self.b_mode = Badge()
-        self.b_phase = Badge()
-        self.b_state = Badge()
-        status_row = QHBoxLayout()
-        for lbl, b in (("主程序", self.b_proc), ("机器人模式", self.b_mode),
-                       ("任务阶段", self.b_phase), ("6001 状态流", self.b_state)):
-            l = QLabel(lbl)
-            l.setObjectName("muted")
-            status_row.addWidget(l)
-            status_row.addWidget(b)
-            status_row.addSpacing(14)
-        status_row.addStretch()
-
-        # ---- 控制区 ----
-        ctrl = QGroupBox("控制")
-        self.btn_start = QPushButton("▶ 启动主程序")
-        self.btn_start.setObjectName("primary")
-        self.btn_stop = QPushButton("■ 退出主程序 (q)")
-        self.btn_stop.setObjectName("danger")
-        prow = QHBoxLayout()
-        prow.addWidget(self.btn_start)
-        prow.addWidget(self.btn_stop)
-
-        self.cmd_btns = []
-        qgrid = QGridLayout()
-        qgrid.setSpacing(8)
-        for i, (label, key, tip) in enumerate(QUICK_CMDS):
-            b = QPushButton(label)
-            b.setToolTip(tip)
-            b.setObjectName("cmd")
-            b.clicked.connect(lambda _=False, k=key: self.send_line(k))
-            qgrid.addWidget(b, i // 2, i % 2)
-            self.cmd_btns.append(b)
-
-        self.line = QLineEdit()
-        self.line.setObjectName("mainInput")
-        self.line.setPlaceholderText("向主程序输入指令 (s / d / r / 回车查询)...")
-        self.line.setMinimumHeight(56)
-
-        self.btn_send = QPushButton("发 送 ↵")
-        self.btn_send.setObjectName("btnSend")
-        self.btn_send.setMinimumHeight(56)
-        self.btn_send.setToolTip("向主程序 stdin 发送指令（快捷键：回车）")
-
-        lrow = QHBoxLayout()
-        lrow.addWidget(self.line, 1)
-        lrow.addWidget(self.btn_send)
-
-        self.robot_info = QPlainTextEdit()
-        self.robot_info.setReadOnly(True)
-        self.robot_info.setObjectName("mono")
-        self.robot_info.setMaximumBlockCount(30)
-        self.robot_info.setLineWrapMode(QPlainTextEdit.NoWrap)
-        self.robot_info.setFixedHeight(170)
-        self.robot_info.setPlainText("—")
-
-        safety = QLabel("硬件急停：手柄双摇杆同时按下（Damp）")
-        safety.setObjectName("warn")
-
-        cl = QVBoxLayout(ctrl)
-        cl.setSpacing(10)
-        cl.addLayout(prow)
-        cl.addLayout(qgrid)
-        cl.addLayout(lrow)
-        sep = QLabel("机器人状态 (6001)")
-        sep.setObjectName("muted")
-        cl.addWidget(sep)
-        cl.addWidget(self.robot_info)
-        cl.addWidget(safety)
-
-        # ---- 输出区 ----
-        outbox = QGroupBox("程序输出")
-        self.output = QPlainTextEdit()
-        self.output.setReadOnly(True)
-        self.output.setMaximumBlockCount(5000)
-        self.output.setObjectName("console")
-        f = QFont("DejaVu Sans Mono")
-        f.setStyleHint(QFont.Monospace)
-        f.setPointSize(10)
-        self.output.setFont(f)
-        self.chk_scroll = QCheckBox("自动滚动")
-        self.chk_scroll.setChecked(True)
-        self.btn_clear = QPushButton("清空")
-        orow = QHBoxLayout()
-        orow.addWidget(self.chk_scroll)
-        orow.addStretch()
-        orow.addWidget(self.btn_clear)
-        ol = QVBoxLayout(outbox)
-        ol.addWidget(self.output, 1)
-        ol.addLayout(orow)
-
-        bottom = QSplitter(Qt.Horizontal)
-        bottom.addWidget(ctrl)
-        bottom.addWidget(outbox)
-        bottom.setSizes([430, 1010])
-
-        bottom_wrap = QWidget()
-        bw = QVBoxLayout(bottom_wrap)
-        bw.setContentsMargins(0, 4, 0, 0)
-        bw.addLayout(status_row)
-        bw.addWidget(bottom, 1)
-
-        main_split = QSplitter(Qt.Vertical)
-        main_split.addWidget(cam_row)
-        main_split.addWidget(bottom_wrap)
-        main_split.setSizes([380, 520])
-
-        root = QWidget()
-        rl = QVBoxLayout(root)
-        rl.setContentsMargins(12, 12, 12, 12)
-        rl.addWidget(main_split)
-        self.setCentralWidget(root)
-
-        # ---- 主程序子进程 ----
-        self.proc = QProcess(self)
-        self.proc.setProcessChannelMode(QProcess.MergedChannels)
-        env = QProcessEnvironment.systemEnvironment()
-        env.insert("PYTHONUNBUFFERED", "1")    # Python 不缓冲输出
-        env.insert("FORCE_COLOR", "1")
-        self.proc.setProcessEnvironment(env)
-        self.proc.readyReadStandardOutput.connect(self.on_proc_output)
-        self.proc.stateChanged.connect(self.on_proc_state)
-        self.proc.finished.connect(self.on_proc_finished)
-        self._buf = ""
-        self._flush_timer = QTimer(self)
-        self._flush_timer.setSingleShot(True)
-        self._flush_timer.timeout.connect(self.flush_partial)
-
-        self.btn_start.clicked.connect(self.start_program)
-        self.btn_stop.clicked.connect(self.stop_program)
-        self.btn_send.clicked.connect(self.send_input)
-        self.line.returnPressed.connect(self.send_input)
-        self.btn_clear.clicked.connect(self.output.clear)
-
-        self.phase = None
-        self.on_proc_state(QProcess.NotRunning)
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.refresh)
-        self.timer.start(int(1000 / UI_FPS))
-        self.log_sys(f"相机订阅：{', '.join(r.addr for r in self.cam_rx)}")
-        self.log_sys(f"状态订阅：{self.state_rx.addr}")
-
-    # ---------------- 刷新 ----------------
-    def refresh(self):
-        self._refresh_count += 1
-        for v, r in zip(self.cams, self.cam_rx):
-            v.update_from(r)
-
-        # 状态面板更新节流到 ~10 Hz (每 3 帧一次)，避免高频刷新导致界面组件闪烁
-        if self._refresh_count % 3 == 0:
-            st = self.state_rx.latest()
-            hz = self.state_rx.rate()
-            # 模式识别优先级：6000端口最新接收 > 主程序日志识别 > 历史模式
-            mode_from_rx = self.mode_rx.latest()
-            if mode_from_rx and mode_from_rx != "UNKNOWN":
-                self.current_mode = mode_from_rx
-
-            mode_disp = self.current_mode or "未知"
-            if mode_disp == "VLA":
-                self.b_mode.set("VLA", "ok")
-            elif mode_disp in ("GAMEPAD", "NAV"):
-                self.b_mode.set(mode_disp, "info")
-            else:
-                self.b_mode.set(mode_disp, "neutral")
-
-            if st is None:
-                self.b_state.set("无数据", "bad")
-                formatted = f"当前模式: {mode_disp}\n6001 状态流: 等待数据…"
-                if self.robot_info.toPlainText() != formatted:
-                    self.robot_info.setPlainText(formatted)
-                return
-
-            self.b_state.set(f"{hz} Hz", "ok" if hz > 0 else "bad")
-            formatted = self.format_state(st, current_mode=mode_disp)
-            if self.robot_info.toPlainText() != formatted:
-                self.robot_info.setPlainText(formatted)
-
-    @staticmethod
-    def format_state(st, current_mode="未知"):
-        if not isinstance(st, dict):
-            return f"当前模式: {current_mode}\n{str(st)[:400]}"
-        lines = [f"当前模式: {current_mode}"]
-        for k, v in st.items():
-            # 过滤顶层 wireless 字段，不输出冗余无意义长字符串
-            if "wireless" in str(k).lower():
-                continue
-            if k == "data" and isinstance(v, dict):
-                lines.append("data:")
-                for sub_k, sub_v in v.items():
-                    # 过滤掉原始 wireless_remote 冗余长串信号
-                    if "wireless" in str(sub_k).lower():
-                        continue
-                    if sub_k == "motor_state" and isinstance(sub_v, list):
-                        q_list = [f"{m.get('q', 0):.2f}" for m in sub_v if isinstance(m, dict)]
-                        lines.append(f"  motor q({len(q_list)}): [{', '.join(q_list[:8])}, …]")
-                    elif isinstance(sub_v, (list, dict)):
-                        lines.append(f"  {sub_k}: {str(sub_v)[:60]}")
-                    else:
-                        lines.append(f"  {sub_k}: {sub_v}")
-                continue
-            if isinstance(v, list) and len(v) > 8:
-                v = "[" + ", ".join(f"{x:.3f}" if isinstance(x, float) else str(x) for x in v[:8]) + f", … ({len(v)})]"
-            elif isinstance(v, float):
-                v = f"{v:.3f}"
-            lines.append(f"{k}: {v}")
-        return "\n".join(lines[:12])
-
-    # ---------------- 主程序 ----------------
-    def start_program(self):
-        if self.proc.state() != QProcess.NotRunning:
-            return
-        self.log_sys(f"启动：{self.cfg['main_cmd']}")
-        self.proc.start("bash", ["-lc", self.cfg["main_cmd"]])
-
-    def stop_program(self):
-        if self.proc.state() == QProcess.NotRunning:
-            return
-        self.send_line("q")
-        # 3 秒内没优雅退出则强制结束
-        QTimer.singleShot(3000, lambda: self.proc.state() != QProcess.NotRunning and self.proc.terminate())
-        QTimer.singleShot(5000, lambda: self.proc.state() != QProcess.NotRunning and self.proc.kill())
-
-    def send_line(self, text):
-        if self.proc.state() != QProcess.Running:
-            self.log_sys("主程序未运行，命令未发送")
-            return
-        # 安全清洗：去除前后不可见字符与控制字符，保留正常单行命令输入
-        clean_text = "".join(ch for ch in str(text) if ch.isprintable() or ch == ' ').strip()
-        try:
-            self.proc.write((clean_text + "\n").encode("utf-8"))
-            display_text = clean_text if clean_text else "↵ (查询状态)"
-            self.append_html(f'<span style="color:#5aa9ff; font-size:14px; font-weight:800;">&gt;&nbsp;{_esc(display_text)}</span>')
-        except Exception as e:
-            self.log_sys(f"发送异常: {e}")
-
-    def send_input(self):
-        t = self.line.text()
-        self.line.clear()
-        self.send_line(t)
-        self.line.setFocus()
-
-    def on_proc_output(self):
-        data = bytes(self.proc.readAllStandardOutput()).decode("utf-8", "replace")
-        self._buf += data.replace("\r\n", "\n").replace("\r", "\n")
-        *lines, self._buf = self._buf.split("\n")
-        if lines:
-            html_chunks = []
-            for ln in lines:
-                plain = strip_ansi(ln)
-                m = re.search(r"Phase\s*(\d)", plain)
-                if m and m.group(1) != self.phase:
-                    self.phase = m.group(1)
-                    self.b_phase.set(f"Phase {self.phase}", "info")
-                # 动态从主程序输出捕获手柄/底盘模式切换
-                m_mode = re.search(r"模式切换:.*?->.*?\b(VLA|GAMEPAD|NAV)\b", plain, re.IGNORECASE)
-                if m_mode:
-                    self.current_mode = m_mode.group(1).upper()
-                ts = time.strftime("%H:%M:%S")
-                html_chunks.append(f'<span style="color:#5d636b;">{ts}</span>&nbsp;&nbsp;{ansi_to_html(ln)}')
-            for chunk in html_chunks:
-                self.output.appendHtml(chunk)
-            if self.chk_scroll.isChecked():
-                self.output.moveCursor(QTextCursor.End)
-        if self._buf:  # input() 提示符等不带换行的内容，稍后补刷
-            self._flush_timer.start(200)
-
-    def flush_partial(self):
-        if self._buf:
-            self.append_program_line(self._buf)
-            self._buf = ""
-
-    def append_program_line(self, ln):
-        plain = strip_ansi(ln)
-        m = re.search(r"Phase\s*(\d)", plain)
-        if m and m.group(1) != self.phase:
-            self.phase = m.group(1)
-            self.b_phase.set(f"Phase {self.phase}", "info")
-        m_mode = re.search(r"模式切换:.*?->.*?\b(VLA|GAMEPAD|NAV)\b", plain, re.IGNORECASE)
-        if m_mode:
-            self.current_mode = m_mode.group(1).upper()
-        self.append_html(ansi_to_html(ln))
-
-    def on_proc_state(self, s):
-        running = s != QProcess.NotRunning
-        self.b_proc.set("运行中" if running else "未运行", "ok" if running else "neutral")
-        self.btn_start.setEnabled(not running)
-        self.btn_stop.setEnabled(running)
-        for b in self.cmd_btns + [self.btn_send]:
-            b.setEnabled(running)
-        self.line.setEnabled(running)
-
-    def on_proc_finished(self, code, status):
-        self.flush_partial()
-        self.log_sys(f"主程序已退出（code={code}）")
-        self.phase = None
-        self.b_phase.set("—", "neutral")
-
-    # ---------------- 日志 ----------------
-    def append_html(self, body):
-        ts = time.strftime("%H:%M:%S")
-        self.output.appendHtml(f'<span style="color:#5d636b;">{ts}</span>&nbsp;&nbsp;{body}')
-        if self.chk_scroll.isChecked():
-            self.output.moveCursor(QTextCursor.End)
-
-    def log_sys(self, text):
-        self.append_html(f'<span style="color:#8b9097;">[viewer]&nbsp;{_esc(text)}</span>')
-
-    def closeEvent(self, e):
-        if self.proc.state() != QProcess.NotRunning:
-            self.proc.write(b"q\n")
-            if not self.proc.waitForFinished(3000):
-                self.proc.kill()
-                self.proc.waitForFinished(1000)
-        for r in self.cam_rx + [self.state_rx, self.mode_rx]:
-            r.running = False
-        super().closeEvent(e)
-
-
-STYLE = """
-QWidget { background:#1e1f22; color:#dcdde1; font-size:13px; }
-QGroupBox { border:1px solid #3a3c42; border-radius:8px; margin-top:14px; padding:12px 10px 10px 10px; font-weight:600; }
-QGroupBox::title { subcontrol-origin: margin; left:10px; padding:0 4px; color:#9aa0a6; }
-#card { background:#26282c; border:1px solid #3a3c42; border-radius:8px; }
-#cardTitle { background:transparent; font-weight:600; }
-#muted { background:transparent; color:#8b9097; font-size:12px; }
-#warn { background:transparent; color:#e0a040; font-size:12px; }
-#mono { background:#141518; border:1px solid #2e3035; border-radius:6px; padding:6px; color:#b8bcc2;
-        font-family:"DejaVu Sans Mono", monospace; font-size:12px; }
-#camView { background:#101113; border-radius:4px; color:#666; }
-QPlainTextEdit, QLineEdit { background:#141518; border:1px solid #3a3c42; border-radius:6px; padding:6px; }
-QPushButton { background:#33363c; border:1px solid #44474e; border-radius:6px; padding:8px 12px; }
-QPushButton:hover { background:#3d4047; }
-QPushButton:disabled { color:#5d636b; background:#2a2c30; border-color:#33363c; }
-QPushButton#primary { background:#2f6feb; border-color:#2f6feb; color:white; font-weight:600; }
-QPushButton#primary:hover { background:#4280f0; }
-QPushButton#primary:disabled { background:#24324d; border-color:#24324d; color:#7a8597; }
-QPushButton#danger { background:#8f2a2a; border-color:#a33; color:white; font-weight:600; }
-QPushButton#danger:disabled { background:#3a2626; border-color:#3a2626; color:#7a6464; }
-QPushButton#cmd { text-align:left; padding:9px 12px; }
-#badge { border-radius:10px; padding:2px 10px; font-size:12px; font-weight:600; background:#33363c; color:#b8bcc2; }
-#badge[level="ok"] { background:#1f4d33; color:#7ee2a8; }
-#badge[level="bad"] { background:#4d2323; color:#ff9a9a; }
-#badge[level="info"] { background:#1f3a5c; color:#8fc1ff; }
-#mainInput { background:#14171e; border:2px solid #388bfd; border-radius:9px; padding:12px 18px;
-            font-size:22px; font-weight:800; color:#ffffff; }
-#mainInput:focus { border:2px solid #79c0ff; background:#181d26; }
-#mainInput:disabled { background:#141518; border:1px solid #33363c; color:#5d636b; }
-#btnSend { background:#1f6feb; border:1px solid #388bfd; border-radius:9px; padding:12px 24px;
-          font-size:20px; font-weight:800; color:#ffffff; min-width:96px; }
-#btnSend:hover { background:#388bfd; }
-#btnSend:pressed { background:#1158c7; }
-#btnSend:disabled { background:#23272e; border-color:#33363c; color:#5d636b; }
-QSplitter::handle { background:transparent; }
-QCheckBox { background:transparent; }
-"""
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--robot-ip", default=CONFIG["robot_ip"])
-    ap.add_argument("--cmd", default=None, help="主程序启动命令（覆盖 CONFIG）")
-    ap.add_argument("--mock", action="store_true", help="连接本地 mock_robot.py，并启动 mock_main.py")
-    args = ap.parse_args()
-
-    cfg = dict(CONFIG)
-    cfg["robot_ip"] = args.robot_ip
-    if args.robot_ip != CONFIG["robot_ip"] and not args.cmd:
-        cfg["main_cmd"] = cfg["main_cmd"].replace(f"--robot_ip={CONFIG['robot_ip']}", f"--robot_ip={args.robot_ip}")
-    if args.mock:
-        here = os.path.dirname(os.path.abspath(__file__))
-        cfg["robot_ip"] = "127.0.0.1"
-        cfg["main_cmd"] = f"python3 -u {here}/mock_main.py"
-    if args.cmd:
-        cfg["main_cmd"] = args.cmd
-
-    app = QApplication(sys.argv)
-    app.setStyleSheet(STYLE)
-    win = MainWindow(cfg)
-    win.show()
-    sys.exit(app.exec())
-
-
-if __name__ == "__main__":
-    main()
+##### 2) 本地无真机离线开发模式
+无需机器人或模型，使用 Mock 进程生成模拟相机流与模拟 JEV 决策：
+```bash
+# 终端 1：启动 Mock 机器人推流与状态广播
+python mock_robot.py
+
+# 终端 2：启动前端连接本地模拟服务
+python vla_viewer.py --mock
+```
+
+##### 3) 交互式会话回放 (Replay)
+在独立弹出悬浮控制条中随意拖动进度、暂停快进，不污染主画面：
+```bash
+# 回放指定录制目录
+python vla_viewer.py --replay ~/vla_recordings/session_20261014_180000
+
+# 回放操作快捷键：
+#   空格键 (Space)  : 播放 / 暂停
+#   左箭头 (←)      : 快退 5 秒
+#   右箭头 (→)      : 快进 5 秒
+#   Home 键         : 快速跳转到视频起点
+#   F9 键           : 录制过程中手动开始 / 停止录制
+```
+
+##### 4) 离线无头批量导出高清 MP4 视频 (Export)
+无需连接显示器或桌面环境（自动切换为 Qt `offscreen` 无头模式），利用同一套界面渲染引擎按帧精准导出：
+```bash
+# 截取录制中的 10s 至 95s，以 30 FPS 批量渲染输出 1440x1080 MP4
+python vla_viewer.py --replay ~/vla_recordings/session_20261014_180000 \
+    --export demo_cut.mp4 \
+    --start 10 \
+    --end 95 \
+    --fps 30
+```
+
+##### 5) 录屏文件异常修复
+如因机器意外断电或被强制 `kill -9` 导致录屏视频缺少 moov atom（无法播放），可一键修复重封装：
+```bash
+python vla_viewer.py --repair-mp4 ~/vla_recordings/session_xxx/window_recording.mp4
+```
+
+---
+
+#### 4. 命令行参数全集说明
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--robot-ip`, `--robot_ip` | `10.3.42.221` | 机器人机载 Orin IP 地址 |
+| `--cmd` | `None` | 自定义主程序启动命令（覆盖默认的 `bash run_dex1_water_bottle_transfer_hold.sh`） |
+| `--jev-viz`, `--jev_viz` | `tcp://127.0.0.1:5560` | JEV 决策可视化广播地址（设为空字符串 `""` 则纯走日志解析） |
+| `--mock` | `False` | 启用本地开发模式，连接 127.0.0.1 并拉起 `mock_main.py` |
+| `--no-record`, `--no_record`| `False` | 启动主程序时不自动开启录制 |
+| `--record-dir`, `--record_dir` | `~/vla_recordings` | 原始会话录制存放主目录 |
+| `--replay` | `None` | 指定需要回放的历史会话目录路径 |
+| `--export` | `None` | 与 `--replay` 配合使用，将回放直接渲染导出为 MP4 视频 |
+| `--start` / `--end` | `0.0` / `None` | 视频导出的起止时间（单位：秒） |
+| `--fps` | `30` | 视频导出帧率 |
+| `--size` | `None` | 窗口尺寸（如 `1200x900` 或 `1440x1080`，默认自适应当前屏幕） |
+| `--frameless` | `False` | 开启无边框固定比例窗口，贴合左上角供专业录屏使用 |
+| `--head-port`, `--head_port` | `5556` | 头部相机 ZMQ 接收端口覆盖 |
+| `--repair-mp4`, `--repair_mp4` | `None` | 修复损坏或未闭合的录制 MP4 视频 |
+
+---
+
+#### 5. 录制会话目录结构规范
+
+每个录制会话会自动在 `~/vla_recordings/session_YYYYmmdd_HHMMSS/` 下生成以下结构：
 
 ```
+session_YYYYmmdd_HHMMSS/
+├── meta.json             # 基础元数据（相机端口映射、JEV 视角绑定、会话起止绝对时间戳）
+├── events.jsonl          # 毫秒级对齐事件序列 {"t": 秒, "k": log|state|jev|input|typing|proc, "d": ...}
+├── cam0.mjpg / cam0.idx  # 左腕相机原始 JPEG 流及 64 位精准二进制索引 (<t:f64, offset:u64, len:u32>)
+├── cam1.mjpg / cam1.idx  # 头部主相机原始 JPEG 流及索引
+├── cam2.mjpg / cam2.idx  # 右腕相机原始 JPEG 流及索引
+└── jev.mjpg / jev.idx    # JEV 视觉判定时模型接收到的裁切/拼接图与索引
+```
+
+这种存储模式保证了不论界面后续进行何种视觉改版（布局、字体、配色、图表），均可随时复用历史物理实验录制直接重绘导出，无需重复组织昂贵的实机实验。
+
+---
+
+#### 6. 配套 JEV 服务端配置 (`valen_remote_service.py`)
+
+为了使 `vla_viewer.py` 能获得实时的多类别概率分布与判定图，需使用支持 `--viz-port` 的 Valen 服务端：
+
+```bash
+conda activate lerobot
+cd ~/valen
+
+# 启动 Valen JEV 服务（默认开启 --viz-port 5560 广播）
+python scripts/valen_remote_service.py \
+    --checkpoint models/Valen-Preview-0923 \
+    --port 5559 \
+    --viz-port 5560 \
+    --device cuda:0
+```
+- **工作机制**：在完成正常的 REP 应答后，以非阻塞方式（Zero-Copy）向 `tcp://0.0.0.0:5560` 广播 `[JSON, JPEG]` 复合帧。无订阅者或网络拥塞时自动丢帧，完全不影响主控实时控制闭环。
