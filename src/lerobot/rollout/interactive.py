@@ -1953,10 +1953,10 @@ class InteractiveSession:
             return placement_task
 
         # ── Main Phase 0 detection loop ───────────────────────────────
-        show_hud = False
-        raw_hud = getattr(self._runtime.cfg, "transfer_hud", False)
+        show_hud = True
+        raw_hud = getattr(self._runtime.cfg, "transfer_hud", None)
         if isinstance(raw_hud, str):
-            show_hud = raw_hud.lower() in ("true", "1", "yes")
+            show_hud = raw_hud.lower() not in ("false", "0", "no")
         elif isinstance(raw_hud, bool):
             show_hud = raw_hud
 
@@ -2169,12 +2169,19 @@ class InteractiveSession:
         release_count = 0
         valen_confirm_count = 0
         valen_last_time = 0.0
+        last_hud_time = 0.0
         valen_eval_interval = float(getattr(self._runtime.cfg, "valen_eval_interval_s", 0.4))
         homing_dur = float(getattr(self._runtime.cfg, "subtask_homing_duration", 2.5))
         retract_dur = 1.2
         valen_client = getattr(self, "_valen_client", None)
         task_str = str(self.controller.task or "")
         is_box_task = "box" in task_str.lower()
+        show_hud = True
+        raw_hud = getattr(self._runtime.cfg, "transfer_hud", None)
+        if isinstance(raw_hud, str):
+            show_hud = raw_hud.lower() not in ("false", "0", "no")
+        elif isinstance(raw_hud, bool):
+            show_hud = raw_hud
 
         while self._subtask_tracker_running and not self._subtask_stop_event.is_set():
             time.sleep(0.05)
@@ -2219,6 +2226,21 @@ class InteractiveSession:
                         else:
                             valen_confirm_count = max(0, valen_confirm_count - 1)
 
+                        tag = "已入盒" if v_res.choice == "bottle_in_box_completed" else ("已放回桌面" if v_res.choice == "bottle_on_table_completed" else "放置中")
+                        self._print(
+                            f"🤖 [Phase 4 JEV] 判定: {tag} ({v_res.choice}, P={prob:.2f}, {v_res.cost_ms:.0f}ms) | "
+                            f"右夹爪: {r_gripper:.2f} rad | 确认: {valen_confirm_count}/2"
+                        )
+
+            # Periodic HUD every 1.5s
+            if show_hud and now - last_hud_time >= 1.5:
+                last_hud_time = now
+                grip_str = "已松爪释放" if r_gripper >= 4.7 else ("夹持水瓶" if has_bottle else "张开待命")
+                self._print(
+                    f"📊 [Transfer Phase 4: 放置] 耗时: {now - self._phase_start_time:4.1f}s | "
+                    f"右夹爪: {r_gripper:4.2f} rad ({grip_str}) | 放手确认: {release_count}/6 | JEV确认: {valen_confirm_count}/2"
+                )
+
             # Check physical gripper release:
             # ONLY valid if the robot was confirmed holding the bottle (has_bottle is True)
             if has_bottle and r_gripper >= 4.7:
@@ -2233,9 +2255,12 @@ class InteractiveSession:
             if is_released:
                 self._transfer_completed = True
                 self._stop_transfer_polling()
-                reason = f"右夹爪已完全松开释放水瓶 (右夹爪: {r_gripper:.2f} rad >= 4.7)"
-                if latest_valen_choice:
-                    reason += f" | JEV: {latest_valen_choice}"
+                if valen_confirm_count >= 2 and r_gripper >= 4.5:
+                    reason = f"视觉确认水瓶入盒完成 (JEV: {latest_valen_choice}) 且右夹爪已松开 ({r_gripper:.2f} rad >= 4.5)"
+                else:
+                    reason = f"右夹爪已完全松开释放水瓶 (右夹爪: {r_gripper:.2f} rad >= 4.7)"
+                    if latest_valen_choice:
+                        reason += f" [JEV视觉末次参考: {latest_valen_choice}]"
 
                 rule_65 = "=" * 65
                 rule_61 = "-" * 61
