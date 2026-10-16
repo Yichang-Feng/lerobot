@@ -185,8 +185,10 @@ class ValenServer:
         port: int = 5559,
         device: str = "cuda:0",
         shm_dir: str = "/dev/shm",
+        viz_port: int = 5560,
     ):
         self.port = port
+        self.viz_port = viz_port
         self.device = device if torch.cuda.is_available() else "cpu"
         self.shm_dir = Path(shm_dir)
         self.shm_dir.mkdir(parents=True, exist_ok=True)
@@ -238,6 +240,33 @@ class ValenServer:
             logger.info("ZMQ REP socket bound to ipc://%s", ipc_path)
         except Exception as e:
             logger.warning("Failed to bind IPC socket (%s)", e)
+
+        # [VIZ] 每次判定后广播 [结果 JSON, 输入 JPEG]，供可视化界面订阅；不影响 REP 应答
+        self.viz_socket = None
+        if self.viz_port:
+            try:
+                self.viz_socket = self.zmq_context.socket(zmq.PUB)
+                self.viz_socket.setsockopt(zmq.SNDHWM, 10)
+                self.viz_socket.setsockopt(zmq.LINGER, 0)
+                self.viz_socket.bind(f"tcp://0.0.0.0:{self.viz_port}")
+                logger.info("Viz PUB socket bound to tcp://0.0.0.0:%d", self.viz_port)
+            except Exception as e:
+                self.viz_socket = None
+                logger.warning("Failed to bind viz PUB port %d (%s)", self.viz_port, e)
+
+    def _publish_viz(self, response: dict, questions: dict, img_bytes: bytes, seq: int):
+        """[VIZ] 非阻塞广播，订阅方不存在或过慢时直接丢弃。"""
+        if self.viz_socket is None:
+            return
+        try:
+            q = questions.get("task_phase") or next(iter(questions.values()), {})
+            info = dict(response, t=time.time(), seq=seq,
+                        instructions=q.get("instructions", ""), criteria=list(q.get("criteria", {}).keys()))
+            self.viz_socket.send_multipart([json.dumps(info).encode("utf-8"), img_bytes], flags=zmq.NOBLOCK)
+        except zmq.Again:
+            pass
+        except Exception as e:
+            logger.debug("viz publish failed: %s", e)
 
     def _warmup(self):
         logger.info("Warming up Valen decision head...")
@@ -349,6 +378,7 @@ class ValenServer:
 
                 self.socket.send_json(response)
                 request_count += 1
+                self._publish_viz(response, questions, img_bytes, request_count)  # [VIZ]
 
                 if phase in (2, 3) or request_count % 5 == 0 or confidence >= 0.70:
                     prob_val = probs.get(choice, 0.0)
@@ -386,6 +416,8 @@ def main():
         help="Path to Qwen3.5-2B base model directory",
     )
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to run inference on (default: cuda:0)")
+    parser.add_argument("--viz-port", type=int, default=5560,
+                        help="[VIZ] PUB port broadcasting each decision (result + input image); 0 disables")
     args = parser.parse_args()
 
     server = ValenServer(
@@ -393,6 +425,7 @@ def main():
         base_model_path=args.base_model,
         port=args.port,
         device=args.device,
+        viz_port=args.viz_port,
     )
     server.run()
 

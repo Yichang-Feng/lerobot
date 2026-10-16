@@ -3,6 +3,11 @@
 import argparse
 import json
 from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import gradio as gr
 
@@ -10,9 +15,6 @@ from valen.data.schema import validate_record
 from valen.evaluation.inference import predict
 from valen.modeling.factory import build_compiler, build_model, get_backend, normalize_model_config
 from valen.training.checkpoint import load_checkpoint
-
-
-ROOT = Path(__file__).resolve().parents[1]
 CHECKPOINT = ROOT / "models" / "Valen-Preview-0923"
 IMAGE_SUFFIXES = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 VIDEO_SUFFIXES = {".avi", ".mkv", ".mov", ".mp4", ".webm"}
